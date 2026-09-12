@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+ckpts/
+assets/voice-reference/
+outputs/
+*.log
+opencode.json
+assets

@@ -1,0 +1,36 @@
+# AuK Gradio inference environment (run.py / auk-gradio)
+#
+# PyTorch CUDA 13.0 wheels are served by the NJU mirror. The +cu130 local
+# version pins force those wheels even if the same version exists on PyPI:
+#   pip install -r requirements.txt
+--extra-index-url https://mirror.nju.edu.cn/pytorch/whl/cu130
+
+torch==2.14.0+cu130
+torchvision==0.29.0+cu130
+
+# Core model / runtime
+numpy==2.5.2
+transformers==4.57.6
+qwen-omni-utils==0.0.9
+omegaconf==2.3.1
+torchdiffeq==0.2.5
+x-transformers==2.28.4
+safetensors==0.8.0
+bitsandbytes==0.50.2
+accelerate==1.15.0
+soundfile==0.14.0
+scipy==1.18.1
+
+# Gradio UI + Prompt Enhancer
+# faster-whisper provides local ASR (CTranslate2) and Silero VAD via onnxruntime,
+# so funasr / modelscope / silero-vad / torchaudio are not needed.
+gradio==6.17.3
+PyYAML==6.0.3
+faster-whisper==1.2.1
+WeTextProcessing==1.2.0
+pyloudnorm==0.2.0
+openai==3.13.0
+tencentcloud-sdk-python-asr==3.1.172
+
+# Only needed by scripts/download_models.py (default ModelScope source)
+modelscope==1.40.0
