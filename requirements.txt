@@ -19,6 +19,7 @@ safetensors==0.8.0
 bitsandbytes==0.50.2
 accelerate==1.15.0
 soundfile==0.14.0
+audioread==3.1.0
 scipy==1.18.1
 
 # Gradio UI + Prompt Enhancer
