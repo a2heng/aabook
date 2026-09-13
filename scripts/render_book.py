@@ -90,6 +90,15 @@ def main() -> None:
     rows.sort(key=lambda row: row.order)
     cast = Cast.load(args.cast) if args.cast else None
     canonicalize_rows(rows, cast)
+    if cast is not None:
+        # rows whose speaker was unknown at build time (flagged new_role) can get a
+        # voice now that the merged cast contains them
+        for row in rows:
+            if row.voice_ref:
+                continue
+            role = cast.roles.get(row.role_id) or cast.resolve(row.role_name)
+            if role and role.voice_ref:
+                row.voice_ref = role.voice_ref
 
     chapters: OrderedDict[int, list] = OrderedDict()
     for row in rows:

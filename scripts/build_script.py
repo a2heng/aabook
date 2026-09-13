@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", required=True, help="output directory (e.g. outputs/mybook)")
     parser.add_argument("--voices", default=None, help="JSON mapping role name/alias -> reference audio path")
     parser.add_argument("--cast", default=None, help="existing cast.json to reuse (hand-editable)")
-    parser.add_argument("--refresh-cast", action="store_true", help="ignore any saved cast and re-discover")
+    parser.add_argument("--refresh-cast", action="store_true", help="ignore any saved cast (narrator-only if --cast not given)")
     parser.add_argument("--no-llm", action="store_true", help="skip the LLM (single-narrator fallback smoke test)")
     parser.add_argument("--base-url", default=None, help="OpenAI-compatible base url")
     parser.add_argument("--api-key", default=None)

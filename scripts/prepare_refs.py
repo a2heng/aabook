@@ -91,9 +91,9 @@ def prepare(src: Path, max_seconds: float, target_sr: int, *, vad: bool = True) 
     if fade:
         mono[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
     if sr != target_sr and mono.size:
-        from scipy.signal import resample_poly
-
         from math import gcd
+
+        from scipy.signal import resample_poly
 
         divisor = gcd(sr, target_sr)
         mono = resample_poly(mono, target_sr // divisor, sr // divisor).astype(np.float32)

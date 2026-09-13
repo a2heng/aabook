@@ -38,10 +38,10 @@ os.chdir(APP_ROOT)
 
 import numpy as np  # noqa: E402
 import soundfile as sf  # noqa: E402
+from prepare_refs import prepare  # noqa: E402
 
 from audiobook.renderer import RenderConfig, Renderer  # noqa: E402
 from audiobook.schema import ScriptRow  # noqa: E402
-from prepare_refs import prepare  # noqa: E402
 
 BWE_INSTRUCTION = "请对这段语音做超分辨率/带宽扩展处理，恢复被削掉的高频成分，输出宽带纯净人声。"
 TARGET_SAMPLE_RATE = 24000

@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import difflib
 import os
+import sys
 from dataclasses import dataclass, field
 
 from .cleaning import Chapter
 from .llm import LLMClient, prompt_hash
-from .schema import Cast
+from .schema import Cast, slugify
 
 PROMPT_ID = "extract.numbered.v1"
 
@@ -48,17 +49,18 @@ _MIN_CLOSE = set('”』」"')
 
 NARRATOR_LABELS = {"旁白", "旁白君", "叙述", "叙述者", "画外音", "narrator", "narration", "neutral"}
 
-NUMBERED_SYSTEM = """【角色表】（对白说话人**只能**从下表选，对号入座）
+NUMBERED_SYSTEM = """【角色表】（**仅供参考**：优先对号入座；表里没有的说话人请标注为新人）
 __ROSTER__
 
 下面原文已被代码切成最小句并逐句编号。请**只给引号句（“…”／「…」）指定说话人**，只输出 JSON：
-{"speakers":{"3":"高文","4":"赫蒂"}}
+{"speakers":{"3":"高文","4":"赫蒂","6":"*神秘人"}}
 
 规则：
 1. 输出里**只出现引号句的编号**。旁白叙述、归属/引述短语（如“低声说道：”“瑞贝卡突然喊道，”）属旁白，**不要列出**。
-2. 每个引号句都必须给一个角色表里的名字：**不能漏、不能留空、不能写“未知”**。只要是人发出的声音（说话、喊叫、惊呼、痛呼、嘟囔……，哪怕只有一两个字），就根据上下文、身份、称谓**选最可能的说话人**（对号入座）。
-3. 只有**确定不是人说话**的引号（书名/术语/引文，如“第一王朝”）才写 "旁白"。
-4. 相邻不同说话人要分别标；别名对齐（姑妈=赫蒂·塞西尔）。
+2. 每个引号句都必须给说话人。**优先**从角色表对号入座（别名对齐，如 姑妈=赫蒂·塞西尔）。
+3. **角色表里没有的说话人**：用 `*` 前缀写出原文中的称呼/代号来标注新人物，如 `"*神秘人"`、`"*老管家"`。**不要留空、不要写“未知”**。
+4. 只有**确定不是人说话**的引文（书名/术语，如“第一王朝”）才写 "旁白"。
+5. 只要是人发出的声音（说话、喊叫、惊呼、痛呼、嘟囔……，哪怕一两个字）都要标；相邻不同说话人分别标。
 
 【完整示例】
 编号文本：
@@ -76,14 +78,13 @@ __ROSTER__
 12 棺中传来一声痛呼：
 13 “卧槽谁砸我手！”
 输出：
-{"speakers":{"3":"高文","4":"赫蒂","6":"瑞贝卡","8":"瑞贝卡","10":"旁白","13":"高文"}}
+{"speakers":{"3":"高文","4":"赫蒂","6":"瑞贝卡","8":"瑞贝卡","10":"旁白","13":"*棺中人"}}
 
 示例说明：
 - 旁白句 1、2、5、7、9、11、12（叙述与归属短语）**不列出**，代码自动算旁白。
-- 编号 3 的说话人由前面“高文…说道”判断=高文；4 由后面“赫蒂回答”判断=赫蒂。
-- 编号 6、8 由中间“瑞贝卡突然喊道”判断=瑞贝卡（相邻两句同一人也要各标一次）。
-- 编号 10 是术语、不是台词 → 写 "旁白"。
-- 编号 13 是棺中的人发出的痛呼 → 高文（对号入座，绝不能留空/未知）。
+- 编号 3=高文、4=赫蒂、6/8=瑞贝卡，均由上下文判断（相邻同人也要各标一次）。
+- 编号 10 是术语、不是台词 → "旁白"。
+- 编号 13 棺中那人不在角色表 → 用 `*棺中人` 标注新人。
 """
 
 
@@ -183,6 +184,10 @@ def strip_quotes(text: str | None) -> str:
     return "".join(char for char in (text or "") if char not in _QUOTE_CHARS).strip()
 
 
+def _has_content(text: str) -> bool:
+    return any(char.isalnum() for char in text)
+
+
 def _append_unit(
     units: list[Unit],
     kind: str,
@@ -195,7 +200,7 @@ def _append_unit(
     system_hash: str = "",
 ) -> None:
     text = text.strip()
-    if not text:
+    if not _has_content(text):
         return
     spoken = strip_quotes(text)
     flags = list(flags or [])
@@ -240,7 +245,7 @@ def _minimal_units(text: str) -> list[dict]:
             start = index + 1
     if start < len(text):
         units.append({"start": start, "end": len(text), "inside": inside})
-    return [unit for unit in units if text[unit["start"] : unit["end"]].strip()]
+    return [unit for unit in units if _has_content(text[unit["start"] : unit["end"]])]
 
 
 def _parse_labels(payload) -> dict[int, str] | None:
@@ -282,14 +287,14 @@ def _looks_non_speech(span: str) -> bool:
     return not span.rstrip().rstrip("”』」\"'").endswith(("！", "？", "…"))
 
 
-def _numbered_extract(
-    client: LLMClient, chapter: Chapter, cast: Cast, system: str, system_hash: str, thinking: bool
-) -> list[Unit]:
-    units = _minimal_units(chapter.text)
-    listing = "\n".join(f"{index} {chapter.text[unit['start'] : unit['end']].strip()}" for index, unit in enumerate(units, 1))
-    quoted_ids = [str(index) for index, unit in enumerate(units, 1) if unit["inside"]]
+def _label_window(
+    client: LLMClient, system: str, chapter: Chapter, units: list[dict], start: int, size: int, thinking: bool
+) -> dict[int, str]:
+    """Label one window of units (global ids) so long chapters do not truncate."""
+    window = list(enumerate(units[start : start + size], start=start + 1))
+    listing = "\n".join(f"{index} {chapter.text[unit['start'] : unit['end']].strip()}" for index, unit in window)
+    quoted_ids = [str(index) for index, unit in window if unit["inside"]]
     user = f"编号文本：\n{listing}\n\n需要标注说话人的引号句编号（一个都不能漏）：{', '.join(quoted_ids)}\n\n只输出 JSON。"
-    labels: dict[int, str] | None = None
     last_error: Exception | None = None
     for attempt in (thinking, not thinking, thinking):
         try:
@@ -299,9 +304,32 @@ def _numbered_extract(
             continue
         labels = _parse_labels(payload)
         if labels is not None:
-            break
-    if labels is None:
-        raise RuntimeError(f"numbered extraction failed: {last_error}")
+            return labels
+    print(f"[extract] WARN window {start + 1}..{start + len(window)} -> no labels: {last_error}", file=sys.stderr)
+    return {}
+
+
+def _label_range(
+    client: LLMClient, system: str, chapter: Chapter, units: list[dict], start: int, size: int, thinking: bool
+) -> dict[int, str]:
+    """Label a range; on failure split it in half so only the bad sub-range degrades."""
+    labels = _label_window(client, system, chapter, units, start, size, thinking)
+    if labels or size <= 24:
+        return labels
+    mid = start + size // 2
+    left = _label_range(client, system, chapter, units, start, mid - start, thinking)
+    right = _label_range(client, system, chapter, units, mid, start + size - mid, thinking)
+    return {**left, **right}
+
+
+def _numbered_extract(
+    client: LLMClient, chapter: Chapter, cast: Cast, system: str, system_hash: str, thinking: bool
+) -> list[Unit]:
+    units = _minimal_units(chapter.text)
+    window_size = int(os.environ.get("AUDIOBOOK_EXTRACT_MAX_UNITS", "100"))
+    labels: dict[int, str] = {}
+    for start in range(0, len(units), window_size):
+        labels.update(_label_range(client, system, chapter, units, start, window_size, thinking))
     narrator = cast.narrator()
     result: list[Unit] = []
     for index, unit in enumerate(units, 1):
@@ -313,7 +341,22 @@ def _numbered_extract(
             _append_unit(result, "narration", narrator.role_id, narrator.name, span, system_hash=system_hash)
             continue
         role = None if marked_narration else cast.resolve(label or "")
-        if role is None:
+        new_name = label.lstrip("*").strip() if label and label.startswith("*") else ""
+        if role is not None:
+            _append_unit(result, "dialogue", role.role_id, role.name, span, system_hash=system_hash)
+        elif new_name:
+            # the model annotated a speaker outside the (reference) roster: keep the name
+            _append_unit(
+                result,
+                "dialogue",
+                slugify(new_name),
+                new_name,
+                span,
+                flags=["new_role"],
+                confidence=0.5,
+                system_hash=system_hash,
+            )
+        else:
             _append_unit(
                 result,
                 "dialogue",
@@ -324,8 +367,6 @@ def _numbered_extract(
                 confidence=0.3,
                 system_hash=system_hash,
             )
-        else:
-            _append_unit(result, "dialogue", role.role_id, role.name, span, system_hash=system_hash)
     return result
 
 

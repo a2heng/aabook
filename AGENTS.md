@@ -11,7 +11,10 @@
 - 直接跑源码：`PYTHONPATH=third_party/AuK/src:. .venv/bin/python ...`（无需 `pip install -e .`）。
 - ckpts 与 `assets/voice-reference` 在外层；demo 音频在子模块 `third_party/AuK/assets`（`app.infer_gradio.submodule_path`）。
 - **有声书流水线（`audiobook/` + `scripts/`）**：小说 TXT → `script.csv` → 逐段渲染 → 母带。详见 `docs/audiobook-workflow.md`。
-  - 前端：`cleaning`（清洗/引号修复）、`cast`（抽样发现 + 确定性/LLM 合并）、`extract`（引号边界切句段 + 标签法抽取）、`agent`（单次批量兜底歧义行）、`canonical`（role 归一）、`stats`（角色分布，只计会说话者）、`pipeline`；CLI `scripts/build_script.py`、`scripts/role_stats.py`。
+  - **全流程入口**：`scripts/run_book.py <txt> --book <name>`（prepare→roster→script→merge→render→report，可续跑，自动起停本地 LLM）；`scripts/build_book.py` 为清洗切章+逐章剧本。
+  - **适用范围**：目前只在一部中文网文（本地示例语料）上验证过；换小说需重写"人物脚本"提示词（`scripts/finalize_roster.py` 的 `CLASSIFY/ENRICH/MERGE_SYSTEM` 与 `audiobook/extract.py::NUMBERED_SYSTEM` 的示例）并重建人物字典，其它阶段通用。
+  - 预处理：`cleaning`（编码/引号/去页码）+ `textnorm.clean_for_llm`（**通用字符白名单**：只留 L/N/P/M 类别，LLM 前生效）。站点广告/元数据在输入 txt 层一次性删除。
+  - 前端：`namefinder`+`roster`+`finalize_roster`（**人物字典**：频率发现 → 分批 LLM 筛人名 → `scan_names` 全书复扫 → `roster.json`/`cast.json`）、`extract`（编号法：Python 切引号感知最小句，LLM 只判引号句说话人）、`agent`（单次批量兜底）、`segment`（指针断句+声明改写）、`canonical`（role 归一）、`stats`（角色分布，只计会说话者）、`pipeline`；CLI `scripts/finalize_roster.py`、`scripts/build_script.py`、`scripts/role_stats.py`。旧的 `cast.discover_cast` 抽样发现与各人名/断句实验脚本已删除（记录见 `docs/prep-experiments.md`）；无 `--cast` 时退化为「仅旁白」。
   - 后端：`voicebank`（instruct 造参考音 → whisper ASR → 克隆）、`renderer`（AuK `zero_shot_tts` 逐行，可续跑）、`assembler`（拼接 + -14 LUFS）；CLI `scripts/build_voicebank.py`、`scripts/render_book.py`。参考音准备：`scripts/prepare_refs.py`（24kHz 单声道、≤12s、去静音）。
   - 输出统一在 `outputs/<book>/`；LLM 缓存 `.cache/llm/`；两者均已 gitignore。
   - 局域网浏览/试听：`scripts/serve_files.py`，systemd `auk-files.service`（`:8899`）。
@@ -49,7 +52,7 @@
 - **hf-mirror 下载**：`huggingface_hub` 直连 `https://hf-mirror.com` 可用（免代理）；`HF_ENDPOINT` 在**进程启动时**读取，改了要重启脚本。大文件用 `hf_hub_download`（自带 `.incomplete` 断点续传），失败可重试续传，别删 `.incomplete`。
 - **GGUF 只下主权重**：`imatrix_*.gguf` 仅在量化时用、`mmproj-*.gguf` 是视觉投影、`config.json`/`README` 是 Hub 元数据，llama.cpp 推理都不需要。
 - **不要在正在写入的大文件上跑 `find`/`grep`/`ls -R`**：会放大 I/O 等待，看起来像卡住。
-- **AuK 克隆无法用自由指令控制情绪/风格**（实测 2026-09-13）：往 `zero_shot_tts` 指令里加"terrified/angry"等描述，模型会把指令前缀当台词念出来再接文本（ASR 可证）。克隆只能控音色（参考音）+ 时长（`gen_seconds`）；情绪/语速/音调走 `emotion_edit`/`speed_edit`/`pitch_edit` 后编辑。见 `docs/audiobook-workflow.md` §7.1、复现脚本 `scripts/instruction_probe.py`。
+- **AuK 克隆无法用自由指令控制情绪/风格**（实测 2026-09-13）：往 `zero_shot_tts` 指令里加"terrified/angry"等描述，模型会把指令前缀当台词念出来再接文本（ASR 可证）。克隆只能控音色（参考音）+ 时长（`gen_seconds`）；情绪/语速/音调走 `emotion_edit`/`speed_edit`/`pitch_edit` 后编辑。见 `docs/audiobook-workflow.md` §7.1、实验记录 `docs/prep-experiments.md`（复现脚本已清理删除）。
 - **参考音质量是克隆天花板**（实测 2026-09-13）：`assets/voice-reference/逗哥音色整理合集` 是 TTS 合成音色，克隆会放大其瑕疵（多余停顿/生硬）；VAD 去静音 + bwe + 收紧 `gen_seconds` 都无法根治。要自然必须换更高质量参考音。见 docs §6.4。
 
 ## 验证与代码风格

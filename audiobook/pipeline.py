@@ -10,7 +10,6 @@ from pathlib import Path
 
 from .agent import RoleAgent
 from .canonical import canonicalize_rows
-from .cast import discover_cast
 from .cleaning import Chapter, normalize_text, read_text, split_chapters
 from .duration import MAX_SEGMENT_SECONDS, estimate_text_duration
 from .extract import Unit, extract_chapter
@@ -20,7 +19,7 @@ from .postprocess import merge_adjacent_narration
 from .schema import Cast, ScriptRow, write_script, write_script_json, write_script_sqlite
 from .segment import segment_units
 from .stats import distribution_report
-from .textnorm import normalize_tts
+from .textnorm import clean_for_llm
 
 CONFIDENCE_THRESHOLD = 0.6
 
@@ -59,8 +58,10 @@ def _rows_for_units(chapter: Chapter, units: list[Unit], cast: Cast, model_id: s
     """
     rows: list[ScriptRow] = []
     for unit_index, unit in enumerate(units, start=1):
-        role = cast.roles.get(unit.role_id)
         tts = unit.tts_text
+        if not any(char.isalnum() for char in tts):
+            continue  # never let a punctuation-only fragment become a TTS row
+        role = cast.roles.get(unit.role_id)
         row = ScriptRow(
             order=start_order + unit_index,
             chapter_id=chapter.chapter_id,
@@ -94,6 +95,21 @@ def _rows_for_units(chapter: Chapter, units: list[Unit], cast: Cast, model_id: s
     return rows
 
 
+def build_rows(
+    chapter: Chapter,
+    cast: Cast,
+    client: LLMClient | None,
+    model_id: str,
+    start_order: int = 0,
+) -> list[ScriptRow]:
+    """Extract/agent/segment one chapter into source-aligned rows (1:1 with units)."""
+    units = extract_chapter(chapter, cast, client)
+    if client is not None:
+        RoleAgent(cast, client).run(units)
+        units = segment_units(units, cast, client)
+    return _rows_for_units(chapter, units, cast, model_id, start_order)
+
+
 def _qa_row(row: ScriptRow) -> None:
     if not row.role_id:
         row.add_flag("unresolved_role")
@@ -114,18 +130,17 @@ def _qa_report(rows: list[ScriptRow]) -> dict:
     return {"rows": len(rows), "issues": issues, "flags": flags}
 
 
-def _load_or_discover_cast(
-    chapters: list[Chapter],
+def _load_cast(
     out_dir: Path,
-    client: LLMClient | None,
     cast_source: str | Path | None,
     refresh_cast: bool,
 ) -> tuple[Cast, Path]:
     """Return the cast, persisting it to ``out_dir/cast.json``.
 
     Precedence: explicit ``cast_source`` > existing ``out_dir/cast.json`` (unless
-    ``refresh_cast``) > fresh discovery. Reusing the file keeps the cast stable
-    across runs and lets a human hand-edit roles/aliases/voice_ref.
+    ``refresh_cast``) > narrator-only fallback. The real dictionary is built by
+    ``scripts/finalize_roster.py``; reusing the file keeps the cast stable across
+    runs and lets a human hand-edit roles/aliases/voice_ref.
     """
     cast_file = out_dir / "cast.json"
     source = Path(cast_source) if cast_source else None
@@ -134,7 +149,9 @@ def _load_or_discover_cast(
     elif cast_file.exists() and not refresh_cast:
         cast = Cast.load(cast_file)
     else:
-        cast = discover_cast(chapters, client)
+        cast = Cast()
+        cast.narrator()
+        print("[cast] no cast provided -> narrator-only fallback", file=sys.stderr)
     cast.save(cast_file)
     return cast, cast_file
 
@@ -154,27 +171,24 @@ def build_script(
 
     raw = read_text(input_path)
     source = normalize_text(raw)
-    clean = normalize_tts(source)
+    clean = clean_for_llm(source)
     (out_dir / "source.txt").write_text(source, encoding="utf-8")
     (out_dir / "clean.txt").write_text(clean, encoding="utf-8")
 
     chapters = split_chapters(clean)
     _write_chapters(chapters, out_dir)
 
-    cast, cast_path = _load_or_discover_cast(chapters, out_dir, client, cast_source, refresh_cast)
+    cast, cast_path = _load_cast(out_dir, cast_source, refresh_cast)
     _assign_voices(cast, voices)
     cast.save(cast_path)
 
     resolved_model = model_id or (client.model_id if client else "none")
     rows: list[ScriptRow] = []
     for index, chapter in enumerate(chapters, start=1):
-        units = extract_chapter(chapter, cast, client)
-        if client is not None:
-            RoleAgent(cast, client).run(units)
-            units = segment_units(units, cast, client)
-        rows.extend(_rows_for_units(chapter, units, cast, resolved_model, len(rows)))
+        chapter_rows = build_rows(chapter, cast, client, resolved_model, len(rows))
+        rows.extend(chapter_rows)
         print(
-            f"[extract] {index}/{len(chapters)} {chapter.title[:24]} units={len(units)} rows={len(rows)}",
+            f"[extract] {index}/{len(chapters)} {chapter.title[:24]} rows={len(chapter_rows)} total={len(rows)}",
             file=sys.stderr,
             flush=True,
         )

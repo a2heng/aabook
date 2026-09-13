@@ -101,7 +101,7 @@
 
 - 第三章（3517 字）：提取 **25.1s**（8 调用）+ 预处理 **68.0s**（45 调用）= **93s**，产出 12.1 分钟音频，**RTF 0.128×**（预处理 93s ↔ 12min）。
 - 外推 1595 章 ≈ 41 小时；优化方向：放大提取 chunk / 预处理窗口、多单元批量、投机解码（MTP/1.7B draft）。
-- 复现：`scripts/bench_prep.py`。
+- 复现：`scripts/bench_prep.py`（实验脚本已随代码清理删除）。
 
 ## 下一步候选（待定）
 
@@ -124,7 +124,7 @@ AUDIOBOOK_LLM_BASE_URL=http://127.0.0.1:8080/v1 AUDIOBOOK_LLM_MODEL=ornith-9b AU
 
 ## Exp-07 单次输入/输出长度上限（Spark-X2.5-4B-Q8，ctx=16384）
 
-探针 `scripts/probe_llm_len.py`：整段输入 → 输出 `{"segments":[{head,role,text}]}`（含整段正文），temperature=0.3。
+探针 `scripts/probe_llm_len.py`（实验脚本已清理删除）：整段输入 → 输出 `{"segments":[{head,role,text}]}`（含整段正文），temperature=0.3。
 
 | 输入字数 | prompt_tok | 输出字数 | 输出 tok | finish | 结果 |
 | ---: | ---: | ---: | ---: | :--: | :-- |

@@ -68,6 +68,14 @@ class ExtractChapterTest(unittest.TestCase):
         self.assertEqual(units[0].kind, "dialogue")
         self.assertIn("unresolved_role", units[0].flags)
 
+    def test_star_label_marks_new_role(self):
+        chapter = Chapter(chapter_id=1, title="第一章", text="“谁在那儿？”")
+        client = FakeClient({"speakers": {"1": "*神秘人"}})
+        units = extract_chapter(chapter, make_cast(), client)  # type: ignore[arg-type]
+        self.assertEqual(units[0].kind, "dialogue")
+        self.assertEqual(units[0].role_name, "神秘人")
+        self.assertIn("new_role", units[0].flags)
+
     def test_quote_marked_narration_is_narration(self):
         chapter = Chapter(chapter_id=1, title="第一章", text="“第一王朝”的气息。")
         client = FakeClient({"speakers": {"1": "旁白"}})
