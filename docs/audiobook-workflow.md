@@ -64,6 +64,8 @@ flowchart TD
 
 ## 4. 单元粒度与分句规则（实现版）
 
+> 方案02 起，长难句切分改由 **LLM** 做（`audiobook/segment.py`）：>6s 的单元送给断句 agent，按语义切成短句；**只切分、不新增标点**（模型加的标点一律丢弃，`tts_text` 用原文切片），`raw_text` 保真；<1.5s 的碎片并回前段；校验"字序列一致"（骨架匹配，容忍标点差异），失败则回退确定性切分。`AUDIOBOOK_MAX_UNIT_SECONDS`/`AUDIOBOOK_SEGMENT_MIN_SECONDS` 可调。
+
 - `split_sentences` 以**引号深度**切句段：
   - 开放引号前 flush 叙述段；闭合引号后 flush 对白段；引号内遇到弱标点**不切**。
   - **行内引用词**（前缀非冒号/说话动词、长度 ≤20、不以强标点结尾）不拆，留在叙述里（如 `能在“面见老祖”所带来的`）。
@@ -107,12 +109,53 @@ flowchart TD
 
 **参考音规范**：用真实资产（`assets/voice-reference/`）时，统一经 `scripts/prepare_refs.py` 预处理为 **24 kHz 单声道、≤12s**（去首尾静音 + 淡出）。AuK 内部会把任意采样率重采样到 24k（`infer_auk.py`），预处理后即免重采样、更一致。参考音**不宜过长**：输出时长由 `gen_seconds` 决定，但条件张量是「参考 latent + 目标 latent」拼接，参考越长显存/计算越大、越不稳；5–12s 为宜，<3s 音色不稳。`prepare_refs.py --map ROLE=PATH … --out refs --voices voices.json` 产出 `voices.json`（角色名→wav）供 `render_book.py --voices` 使用。
 
+### 6.3 参考音优化与输出响度（实测 2026-09-13）
+
+- **AuK 无音量/响度入参**：`AukInfer.generate()` 只有 `audio/gen_seconds/nfe/cfg/seed/sway/t_grid`，没有增益或目标响度；`_load_audio` 算了 `ref_rms` 但 `_run` 未使用（注释明说 skip output RMS restore），所以克隆输出电平很低（实测参考 -13 LUFS → 克隆 **-38 LUFS**，差 ~25dB）。原生 `volume_edit` 只有 ±5/10/15dB 档位、且要多跑一次模型，达不到精确目标。
+  - **对策**：我们自己归一。`RenderConfig.target_lufs`（默认 **-16 LUFS**）在渲染每行后归一（`renderer.py`），assembler 母带同样归一；CLI `render_book.py --target-lufs`（`--no-normalize` 可关）。峰值 ceiling 0.95，短片段/测不出响度时回退峰值归一。
+- **参考音优化只能用 `improve_quality/bandwidth_extension`**（bwe，补高频/提清晰度），实测电平稳定（源 -12.95 → -13.53 LUFS），主观可接受。
+- **AuK 去混响是坏的**：`enhance_speech/dereverb` 与 `improve_quality/remove_effect`(effect=混响) 两个精确变体都把输出打到 **-42 LUFS / peak 0.04（近静音）**，不可用；所以"先去了再混回一点"没有意义。
+- **AuK 降噪收益很小**：`enhance_speech/denoise` 精确变体只把 SNR 提高 ~1.3dB（8.2→9.5），不值得为它多跑一遍模型。
+- 结论：参考音流水线 = `prepare_refs.py`（**VAD 去内部静音** + 去首尾静音 + 归一 + ≤12s）+ `optimize_refs.py`（bwe，一次性）；**不**做 AuK 降噪/去混响。
+  - VAD：Silero（`faster_whisper.vad`，需 16k）→ 取语音段拼回，去掉内部停顿（`prepare_refs.py::vad_speech_spans/remove_silence`，`--no-vad` 可关）。注意实测逗哥角色扮演这批 VAD 多判为单段（本身无内部静音），VAD 主要裁首尾、对真有停顿的素材才见效。
+  - bwe：`scripts/optimize_refs.py --in <参考目录> --out outputs/refs_bwe --voices ...`，产出可直接喂 `render_book.py --voices`；与文本/LLM 流水线解耦（文本 LLM 预处理、参考 wav AuK 预处理）。
+  - 复现实验：`scripts/instruction_probe.py`。
+
+### 6.4 语气词停顿（`了/啊`）根因实验（AuK 经验，2026-09-13）
+
+现象：`…压不住了啊！` 听起来 `了` 和 `啊` 之间像断成下一句。做了三组对照：
+
+1. **分词不是原因**：Qwen2.5-Omni tokenizer 把 `压不住了啊` 切成 `['压','不住','了','啊']`，干净。**但若中间有空格**（`了 啊`）会退化成字节回退 token（`' �'/'�'`），反而会出问题——所以**别在语气词前插空格**。
+2. **不是真静音**：词级时间戳显示 `了@5.68-5.90 啊!@5.90-6.06` 紧邻；能量检测也没有 ≥0.12s 的内部停顿。听感上的"断"是**韵律边界/拖长**，不是空白。
+3. **时长是主因**：同一句话同一参考音，`gen_seconds` 放宽到 1.1×（7.06s）会**凭空多出 4 个内部停顿**（3.66/5.44/6.50/6.89s），模型用静音填满多余时长；收紧到 0.9×（5.78s）内部停顿几乎消失。→ **不要把时长估得偏松**；`duration_rate<1` 或更准的估时能显著减少碎停顿。
+4. **参考音有影响**：`混血精灵少女` 参考音在句尾就比 `逗哥/俏皮公主` 更碎（内部停顿更多），换干净参考音（+bwe）能改善。
+
+结论：语气词/停顿不可用指令控制（见 §7.1），实际手段是「**宁可稍紧的 gen_seconds** + 干净参考音 + 文本别插空格」。复现：`scripts/instruction_probe.py`（`@倍率` 控制时长）。
+
+**收紧时长甜点 ≈ 0.80×**（扫掠 2026-09-13）：同一句在 bwe 参考音上扫 `0.90/0.85/0.80/0.75/0.70`——`0.90` 有多余停顿且丢"啊"，`0.85` 仍偶发，**`0.80`（≈5.14s）多余停顿全消、文本完整**，`0.70` 开始切字。青春男大与温暖御姐两个音色都落在 0.80。默认已设 `RenderConfig.duration_rate=0.8`、`render_book.py --duration-rate 0.8`。
+
+**重要负结果：参考音质量是天花板（2026-09-13）**。用 `逗哥音色整理合集/角色扮演`（本批是 **TTS 合成音色**）跑 bwe+VAD+收紧时长后，5 个音色（俏皮公主/傲娇女王/温暖御姐/冰山女王/青春男大）**全部仍有不自然的多余停顿**，且与 SNR 无关（低 SNR 的反而干净）。说明克隆会**放大参考音自身的瑕疵**，仅靠时长收紧/VAD/bwe 无法根治；要自然必须换**更高质量的参考音**（真人录音或更高质量的合成底）。
+
 ## 7. 情绪（进阶，二次编辑，尚未接线）
 
 - 生成期无独立情绪参数；情绪一律走 AuK `emotion_edit` 后编辑。
 - 合法值：`happy/angry/sad/fearful/surprised/disgusted/calm/excited`。
 - `equal_length` 且带系数：`sad 1.22`、`fearful 1.16`、其余 `1.06`。
 - 剧本预留：`emotion`、`emotion_multiplier`、`base_seg_id`。
+
+### 7.1 负结果：自由指令控制克隆（失败，2026-09-13）
+
+**结论：不能用"模板 + 情绪描述"自由指令控制 AuK-Flash 的克隆。**
+
+- 背景：PE 的 `zero_shot_tts` 模板固定为 `Say the following with the same voice: "{text}"`，无情绪/风格参数（`pe.config.yaml:424-438`）；`rewrite` 扩写只挂在 `instruct_tts`/`voice_edit`。想验证能否绕过 PE，自己往克隆指令里加情绪描述。
+- 方法：`scripts/instruction_probe.py`，固定参考音（`outputs/book20_out/refs/混血精灵少女.wav`）、固定 `gen_seconds=6.40s`、`seed=1234`，只改 instruction。文本：`别……先别杀我啊！比起这个你们老祖宗的棺材板要压不住了啊！`。四条指令：baseline / fearful / angry / excited。
+- 结果：**模型把指令前缀当台词念出来，再接目标文本**，不是执行控制。faster-whisper ASR 佐证：
+  - baseline：`别 先别杀我啊比起这个你们老祖宗的棺材板要压不住了`（正常）。
+  - fearful：`我怕在天空上, 把大石头放在那边先别杀我…`（开头多出指令语音）。
+  - angry：`烧定Turist Anger 别 先别杀我啊…`（念出指令里的 "Anger"）。
+  - excited：`Right 村 和 地 一个 别 先别杀我啊…`。
+- 结论：克隆只能控制**音色（参考音）+ 时长（`gen_seconds`）**；情绪/风格/语速必须走原生后编辑任务链（`emotion_edit`/`speed_edit`/`pitch_edit`），不能塞进 zero-shot 指令。
+- 复现：`.venv/bin/python scripts/instruction_probe.py --ref <ref> --text <text> --out outputs/emotion_probe`。
 
 ## 8. 剧本 Schema（`script.csv`，真源）
 
@@ -171,7 +214,7 @@ outputs/<book>/
 
 ## 13. 待办
 
-- **情绪进阶**：接 `emotion_edit`（`emotion`/`emotion_multiplier` 已在剧本预留）。
+- **情绪进阶**：只能接 `emotion_edit` 后编辑（自由指令控制克隆已证伪，见 §7.1；`emotion`/`emotion_multiplier` 已在剧本预留）。
 - **成品导出**：wav → m4a（当前为 `book.wav` + 章级 wav）。
 - **规模化**：1595 章整本跑（抽取耗时、缓存、并发/续跑）。
 - **卡司质量**：LLM 合并仍偶发漏并/错并；可加入人工校对流程与二次校验。

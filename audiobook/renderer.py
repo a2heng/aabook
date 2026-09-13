@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from .assembler import PEAK_CEILING, TARGET_LUFS, normalize_loudness
 from .duration import estimate_text_duration
 from .instructions import render_instruction
 from .schema import ScriptRow
@@ -37,9 +38,12 @@ class RenderConfig:
     seed: int = 1234
     duration_rate: float = 1.0
     min_seconds: float = 0.6
-    max_seconds: float = 20.0
+    max_seconds: float = 28.0
     nfe: int = 4
     cfg: float = 0.0
+    target_lufs: float = TARGET_LUFS
+    peak_ceiling: float = PEAK_CEILING
+    normalize_rows: bool = True
     default_voice_ref: str = DEFAULT_VOICE_REF
 
     def resolved_paths(self) -> tuple[str, str]:
@@ -61,6 +65,7 @@ def _row_key(row: ScriptRow, voice_ref: str, seconds: float, config: RenderConfi
             str(config.seed),
             config.variant,
             str(sample_rate),
+            f"{config.target_lufs:.1f}" if config.normalize_rows else "raw",
         ]
     )
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
@@ -108,12 +113,7 @@ class Renderer:
 
     def voice_for(self, row: ScriptRow, voices: dict[str, str] | None = None) -> str:
         voices = voices or {}
-        return (
-            row.voice_ref
-            or voices.get(row.role_name)
-            or voices.get(row.role_id)
-            or self.config.default_voice_ref
-        )
+        return row.voice_ref or voices.get(row.role_name) or voices.get(row.role_id) or self.config.default_voice_ref
 
     def render_rows(
         self,
@@ -140,11 +140,19 @@ class Renderer:
             array = audio.detach().to("cpu", dtype=None).float().squeeze(0).numpy()
             if not np.isfinite(array).all():
                 raise RuntimeError(f"non-finite audio for {row.seg_id}")
+            if self.config.normalize_rows:
+                array = normalize_loudness(array, sample_rate, self.config.target_lufs, self.config.peak_ceiling)
             temp = path.with_suffix(".tmp.wav")
             sf.write(str(temp), np.clip(array, -1.0, 1.0), sample_rate, subtype="FLOAT")
             os.replace(temp, path)  # atomic: a crash never leaves a half-written cache hit
             rendered[row.order] = path
         return rendered
+
+    def normalize_track(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Apply the configured loudness target to an assembled track."""
+        if not self.config.normalize_rows:
+            return audio
+        return normalize_loudness(audio, sample_rate, self.config.target_lufs, self.config.peak_ceiling)
 
 
 def voice_map_from_args(spec: list[str] | None) -> dict[str, str]:

@@ -1,54 +1,77 @@
-"""Single-pass structured extraction (Pass 1) per chapter.
+"""Numbered labelling extraction (plan-02).
 
-Label-based (variant C): Python splits the chapter into numbered sentences, the
-LLM only labels each sentence with ``kind``/``role``, and Python slices the
-original text back out. This keeps the text bit-exact (no re-typing/truncation)
-and makes the model's output tiny.
+The chapter is split by Python into *quote-aware minimal units* and numbered.
+The agent only has to answer "who says each quoted unit" (``{"speakers": {...}}``);
+everything else is derived structurally:
+
+* a unit with no quote marks is always narration -- so prose can never be
+  swallowed by the previous speaker (the dominant failure of the old approach);
+* a quoted unit the agent did not label, or labelled with an unknown name,
+  becomes dialogue with ``unresolved_role`` instead of silently disappearing;
+* boundaries, merging and source alignment are pure Python, so the script text
+  is always a verbatim slice of the novel.
 """
 
 from __future__ import annotations
 
+import difflib
 import os
-import re
 from dataclasses import dataclass, field
 
 from .cleaning import Chapter
 from .llm import LLMClient, prompt_hash
-from .schema import KINDS, Cast
+from .schema import Cast
 
-PROMPT_ID = "extract.labels.v3"
+PROMPT_ID = "extract.numbered.v1"
 
-_STRONG = set("。！？!?…")
-_OPEN = set("“『「《【")
-_CLOSE = set("”』」》】")
-_PUNCT_ONLY = set("。！？!?…，、；：,;:—～~-·")
-_INLINE_MAX = 20
-_SPEECH_TAIL = ("：", ":", "说", "道", "问", "喊", "答", "叫")
+_QUOTE_MAP = str.maketrans(
+    {
+        "“": '"',
+        "”": '"',
+        "「": '"',
+        "」": '"',
+        "『": '"',
+        "』": '"',
+        "‘": "'",
+        "’": "'",
+        "＂": '"',
+        "﹃": '"',
+        "﹄": '"',
+    }
+)
 
-SYSTEM_TEMPLATE = """你是中文小说角色标注器。正文已按"句段"编号：每个句段要么是引号外的叙述，要么是引号内的对白。
-请为每个句段标注 kind 和 role，只输出 JSON：
-{"labels":[{"i":1,"kind":"narration|dialogue|monologue","role":"角色名"}]}
+_QUOTE_CHARS = set("“”‘’「」『』\"'＂﹃﹄")
 
-判定规则：
-- 引号内（“…”）的内容是 dialogue；引号外一般是 narration。
-- 归属词是关键：对白紧邻"X说/道/问/喊/答/补充道"等时，role=X。归属词可能在对白前、对白后，或另一句段里：
-  * 归属词在后一段（如 对白“我推测是某种恶魔的亚种，” / 下一段 赫蒂说道）：对白 role=赫蒂。
-  * 归属词在同一段开头（如 赫蒂说道，“……”）：对白 role=赫蒂。
-  * 整段只有引号内容时，依据上文最近出现的说话人归属。
-- 无引号但明显是人物在说话（口语、称呼、语气词）也标 dialogue。
-- 内心独白（心想/暗想/觉得/心理活动）标 monologue，role=该人物。
-- 群像或无法确定说话人时，role=旁白。
-- "X说道，"这类只含叙述和归属词的句段是 narration/旁白。
-- 重要：凡 kind=narration 的句段，role 一律填"旁白"，不要填角色名（哪怕主语是某角色）。
-- monologue 只用于第一人称内心活动；第三人称叙述用 narration。
-- role 只能取角色表里的名字，旁白用"旁白"。
-- 只输出编号标签，不要复述正文；每个编号都要有标签。
+_SENT_BOUNDARY = set("。！？…；：，、,.!?;:")
+_MIN_OPEN = set('“『「"')
+_MIN_CLOSE = set('”』」"')
 
-【角色表】
-__CAST__
+NARRATOR_LABELS = {"旁白", "旁白君", "叙述", "叙述者", "画外音", "narrator", "narration", "neutral"}
+
+NUMBERED_SYSTEM = """【角色表】（只能从下表选说话人，对号入座；旁白不在此列）
+__ROSTER__
+
+下面原文已被代码切成最小句并逐句编号，其中**所有引号句（“…”／「…」）都必须出现在你的输出里**。只输出 JSON：
+{"speakers":{"2":"高文","3":"赫蒂","7":"旁白"}}
+
+规则：
+1. **不能漏任何引号句**：凡是引号内的话都要给一个说话人，取上表名字；别名对齐（姑妈=赫蒂·塞西尔）。
+2. 引号句若是**人在说话**（哪怕只有一两个字，如“拜伦！”“姑妈？”），必须写说话人。
+3. 引号句若**不是人说话**（书名/术语/引文，如“第一王朝”），写 "旁白"。
+4. 旁白叙述、归属/引述短语（“X说道”“X喊道，”）**不用列出**。
+5. 说话人一变就分别标；相邻两句不同人也各标各的；无法确定 → 写 "旁白"。
+
+【示例】
+编号文本：
+1 高文推开门，低声说道：
+2 “你来了。”
+3 “好久不见。”
+4 赫蒂回答。
+5 “拜伦！”瑞贝卡突然喊道。
+6 他皱眉道：“你也在这儿？”
+输出：
+{"speakers":{"2":"高文","3":"赫蒂","5":"瑞贝卡","6":"高文"}}
 """
-
-USER_TEMPLATE = "章节标题：{title}\n\n编号正文：\n{numbered}\n"
 
 
 @dataclass
@@ -61,77 +84,14 @@ class Unit:
     paragraph: int = 0
     emotion: str = ""
     confidence: float = 1.0
+    break_level: str = ""
     prompt_id: str = PROMPT_ID
     prompt_hash: str = ""
     flags: list[str] = field(default_factory=list)
 
 
-def split_sentences(text: str) -> list[tuple[int, str]]:
-    """Return ``(paragraph_index, span)`` pairs, split on quote boundaries.
-
-    Each span is either pure narration (quote depth 0) or pure dialogue (inside
-    quotes), so voice assignment never mixes the two. Weak punctuation inside a
-    quote never splits the quote.
-    """
-    sentences: list[tuple[int, str]] = []
-    for para_index, paragraph in enumerate(text.split("\n")):
-        paragraph = paragraph.strip()
-        if not paragraph:
-            continue
-        buffer = ""
-        depth = 0
-        quote_at: int | None = None
-        spans: list[str] = []
-
-        def emit(text: str) -> None:
-            span = text.strip()
-            if span:
-                spans.append(span)
-
-        for char in paragraph:
-            if char in _OPEN:
-                if depth == 0:
-                    quote_at = len(buffer)
-                depth += 1
-                buffer += char
-            elif char in _CLOSE:
-                buffer += char
-                depth = max(0, depth - 1)
-                if depth == 0 and quote_at is not None:
-                    prefix, quoted = buffer[:quote_at], buffer[quote_at:]
-                    core = quoted.strip("".join(_OPEN) + "".join(_CLOSE))
-                    opening = prefix.strip()
-                    inline = (
-                        bool(opening)
-                        and not opening.endswith(_SPEECH_TAIL)
-                        and not opening.endswith("，")
-                        and not opening.endswith(",")
-                        and len(core) <= _INLINE_MAX
-                        and (not core or core[-1] not in _STRONG)
-                    )
-                    if inline:
-                        buffer = prefix + quoted
-                    else:
-                        emit(prefix)
-                        emit(quoted)
-                        buffer = ""
-                    quote_at = None
-            else:
-                buffer += char
-                if char in _STRONG and depth == 0:
-                    emit(buffer)
-                    buffer = ""
-        emit(buffer)
-
-        for span in spans:
-            if span and all(ch in _PUNCT_ONLY for ch in span) and sentences and sentences[-1][0] == para_index:
-                sentences[-1] = (para_index, sentences[-1][1] + span)
-            else:
-                sentences.append((para_index, span))
-    return sentences
-
-
 def cast_block(cast: Cast) -> str:
+    """Full role table (id/kind/aliases) used by the role-resolution agent."""
     lines = []
     for role in cast.roles.values():
         aliases = "/".join(role.aliases) if role.aliases else "-"
@@ -139,137 +99,214 @@ def cast_block(cast: Cast) -> str:
     return "\n".join(lines)
 
 
-def build_system(cast: Cast) -> str:
-    return SYSTEM_TEMPLATE.replace("__CAST__", cast_block(cast))
-
-
-def extract_prompt_hash(cast: Cast) -> str:
-    return prompt_hash(PROMPT_ID, build_system(cast))
-
-
-def _as_label_map(payload: dict | list) -> dict[int, dict]:
-    items = payload if isinstance(payload, list) else payload.get("labels", []) if isinstance(payload, dict) else []
-    labels: dict[int, dict] = {}
-    for item in items:
-        if not isinstance(item, dict):
+def roster_block(cast: Cast) -> str:
+    """Clean reader-facing roster for the prompt (name + aliases only)."""
+    lines = []
+    for role in cast.roles.values():
+        if role.kind == "narrator":
             continue
-        try:
-            labels[int(item["i"])] = item
-        except (KeyError, TypeError, ValueError):
-            continue
-    return labels
+        aliases = "、".join(role.aliases) if role.aliases else ""
+        lines.append(f"- {role.name}（别名：{aliases}）" if aliases else f"- {role.name}")
+    lines.append("- 旁白（叙述与归属短语）")
+    return "\n".join(lines)
 
 
-def _group_units(sentences: list[tuple[int, str]], labels: dict[int, dict], cast: Cast, system_hash: str) -> list[Unit]:
-    units: list[Unit] = []
-    current: Unit | None = None
-    narrator = cast.narrator()
-    for index, (paragraph, sentence) in enumerate(sentences, start=1):
-        label = labels.get(index, {})
-        kind = str(label.get("kind") or "narration").strip().lower()
-        if kind not in KINDS:
-            kind = "narration"
-        label_role = str(label.get("role") or "").strip()
-        role = cast.resolve(label_role)
-        if kind == "narration":
-            role = narrator
-        role_id = role.role_id if role else ""
-        role_name = role.name if role else label_role
-        if current is not None and current.kind == kind and current.role_id == role_id and current.paragraph == paragraph:
-            current.raw_text += sentence
-            current.tts_text += sentence
+def build_numbered_system(cast: Cast) -> str:
+    return NUMBERED_SYSTEM.replace("__ROSTER__", roster_block(cast))
+
+
+def _thinking_default() -> bool:
+    return os.environ.get("AUDIOBOOK_EXTRACT_THINKING", "off").lower() in ("1", "on", "true", "yes")
+
+
+def _as_index(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_with_map(text: str) -> tuple[str, list[int]]:
+    """Whitespace-stripped, quote-normalized copy plus index back to ``text``."""
+    chars: list[str] = []
+    positions: list[int] = []
+    for index, char in enumerate(text):
+        if char.isspace():
             continue
-        current = Unit(
+        chars.append(char.translate(_QUOTE_MAP))
+        positions.append(index)
+    return "".join(chars), positions
+
+
+def _align(norm: str, cursor: int, needle: str) -> tuple[int, int] | None:
+    """Locate ``needle`` in ``norm`` at/after ``cursor``; exact first, fuzzy next.
+
+    The fuzzy path maps the *full* matching span (first match block -> last match
+    block) so a mid-segment paraphrase does not truncate the segment.
+    """
+    if not needle:
+        return None
+    found = norm.find(needle, cursor)
+    if found != -1:
+        return found, found + len(needle)
+    window_end = min(len(norm), cursor + len(needle) * 2 + 64)
+    window = norm[cursor:window_end]
+    if not window:
+        return None
+    matcher = difflib.SequenceMatcher(None, needle, window, autojunk=False)
+    blocks = [block for block in matcher.get_matching_blocks() if block.size > 0]
+    if not blocks:
+        return None
+    matched = sum(block.size for block in blocks)
+    if matched < max(4, int(len(needle) * 0.6)):
+        return None
+    start = cursor + blocks[0].b
+    end = cursor + blocks[-1].b + blocks[-1].size
+    return start, min(len(norm), end)
+
+
+def strip_quotes(text: str | None) -> str:
+    """Drop quote marks from the *spoken* text (role is carried by ``kind`` instead)."""
+    return "".join(char for char in (text or "") if char not in _QUOTE_CHARS).strip()
+
+
+def _append_unit(
+    units: list[Unit],
+    kind: str,
+    role_id: str,
+    role_name: str,
+    text: str,
+    *,
+    flags: list[str] | None = None,
+    confidence: float = 1.0,
+    system_hash: str = "",
+) -> None:
+    text = text.strip()
+    if not text:
+        return
+    spoken = strip_quotes(text)
+    flags = list(flags or [])
+    if units and units[-1].kind == kind and units[-1].role_id == role_id:
+        units[-1].raw_text += text
+        units[-1].tts_text += spoken
+        for flag in flags:
+            if flag not in units[-1].flags:
+                units[-1].flags.append(flag)
+        return
+    units.append(
+        Unit(
             kind=kind,
             role_id=role_id,
             role_name=role_name,
-            raw_text=sentence,
-            tts_text=sentence,
-            paragraph=paragraph,
+            raw_text=text,
+            tts_text=spoken,
+            confidence=confidence,
             prompt_hash=system_hash,
+            flags=flags,
         )
-        if role is None:
-            current.flags.append("unresolved_role")
-            current.confidence = 0.2
-        if index not in labels:
-            current.flags.append("unlabeled")
-            current.confidence = min(current.confidence, 0.3)
-        units.append(current)
-    return units
+    )
 
 
-_ATTR_RE = re.compile(
-    r"(?:说道|问道|喊道|答道|叫道|补充道|笑道|低声道|开口道|解释道|回应道|说|问|喊|答|(?<![知味通行街报大有难道])道)[，,：:。]?$"
-)
-_GROUP_RE = re.compile(
-    r"(?:所有人|众人|大家|人们|他们|她们|士兵们|骑士们|战士们|将领们|两人|三人|四人|一群人|一众人)[：:,，。]?$"
-)
+def _minimal_units(text: str) -> list[dict]:
+    """Tile ``text`` into quote-aware minimal units (span + whether inside quotes)."""
+    units: list[dict] = []
+    start = 0
+    inside = False
+    for index, char in enumerate(text):
+        if char in _MIN_OPEN and not inside:
+            if index > start:
+                units.append({"start": start, "end": index, "inside": inside})
+            start = index
+            inside = True
+        elif char in _MIN_CLOSE and inside:
+            units.append({"start": start, "end": index + 1, "inside": True})
+            start = index + 1
+            inside = False
+        elif char in _SENT_BOUNDARY and not inside:
+            units.append({"start": start, "end": index + 1, "inside": inside})
+            start = index + 1
+    if start < len(text):
+        units.append({"start": start, "end": len(text), "inside": inside})
+    return [unit for unit in units if text[unit["start"] : unit["end"]].strip()]
 
 
-def _earliest_role(text: str, cast: Cast):
-    best = None
-    best_pos = -1
-    for role in cast.roles.values():
-        for name in (role.name, *role.aliases):
-            if name and (pos := text.find(name)) != -1 and (best_pos == -1 or pos < best_pos):
-                best_pos, best = pos, role
-    return best
-
-
-def _speaker_signal(text: str, cast: Cast, *, colon: bool, comma: bool):
-    """Return ``(role, strong)`` for an attribution clause, or ``None``.
-
-    ``role`` is the narrator for group clauses ("众人"/"所有人…"). Strong
-    signals (colon introduces speech, explicit 说/道 verb) override any existing
-    label; weak signals (trailing comma) only fill in narrator rows.
-    """
-    text = text.strip()
-    if not text:
-        return None
-    if colon and text.endswith(("：", ":")):
-        strong = True
-    elif _ATTR_RE.search(text):
-        strong = True
-    elif comma and text.endswith(("，", ",")):
-        strong = False
+def _parse_labels(payload) -> dict[int, str] | None:
+    if isinstance(payload, dict):
+        raw = None
+        for key in ("speakers", "labels", "roles"):
+            if key in payload:
+                raw = payload[key]
+                break
+    elif isinstance(payload, list):
+        raw = payload
     else:
         return None
-    if _GROUP_RE.search(text):
-        return cast.narrator(), strong
-    role = _earliest_role(text, cast)
-    return (role, strong) if role is not None else None
+    if raw is None:
+        return None
+    labels: dict[int, str] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            index = _as_index(key)
+            if index is not None:
+                labels[index] = str(value).strip()
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                index = _as_index(item.get("i") or item.get("id") or item.get("index"))
+                if index is not None:
+                    labels[index] = str(item.get("role") or item.get("label") or "旁白").strip()
+            elif isinstance(item, str) and item.strip():
+                labels[len(labels) + 1] = item.strip()
+    return labels
 
 
-def _repair_speakers(units: list[Unit], cast: Cast) -> None:
-    narrator = cast.narrator()
-    for index, unit in enumerate(units):
-        if unit.kind != "dialogue":
+def _numbered_extract(
+    client: LLMClient, chapter: Chapter, cast: Cast, system: str, system_hash: str, thinking: bool
+) -> list[Unit]:
+    units = _minimal_units(chapter.text)
+    listing = "\n".join(f"{index} {chapter.text[unit['start'] : unit['end']].strip()}" for index, unit in enumerate(units, 1))
+    quoted_ids = [str(index) for index, unit in enumerate(units, 1) if unit["inside"]]
+    user = f"编号文本：\n{listing}\n\n需要标注说话人的引号句编号（一个都不能漏）：{', '.join(quoted_ids)}\n\n只输出 JSON。"
+    labels: dict[int, str] | None = None
+    last_error: Exception | None = None
+    for attempt in (thinking, not thinking, thinking):
+        try:
+            payload = client.chat_json(system, user, thinking=attempt)
+        except Exception as error:  # noqa: BLE001 - retry on malformed replies
+            last_error = error
             continue
-        neighbours = []
-        if index > 0 and units[index - 1].kind == "narration":
-            neighbours.append((units[index - 1].tts_text, True))
-        if index + 1 < len(units) and units[index + 1].kind == "narration":
-            neighbours.append((units[index + 1].tts_text, False))
-        chosen = None
-        for text, is_previous in neighbours:
-            signal = _speaker_signal(text, cast, colon=is_previous, comma=is_previous)
-            if signal is None:
-                continue
-            role, strong = signal
-            if strong or unit.role_id == narrator.role_id:
-                chosen = role
-                break
-        if chosen is not None:
-            unit.role_id = chosen.role_id
-            unit.role_name = chosen.name
-            if "role_repaired" not in unit.flags:
-                unit.flags.append("role_repaired")
+        labels = _parse_labels(payload)
+        if labels is not None:
+            break
+    if labels is None:
+        raise RuntimeError(f"numbered extraction failed: {last_error}")
+    narrator = cast.narrator()
+    result: list[Unit] = []
+    for index, unit in enumerate(units, 1):
+        span = chapter.text[unit["start"] : unit["end"]]
+        label = labels.get(index)
+        if not unit["inside"] or (label is not None and label in NARRATOR_LABELS):
+            # no quotes -> always narration; or the model marked a quote as non-speech
+            _append_unit(result, "narration", narrator.role_id, narrator.name, span, system_hash=system_hash)
+            continue
+        role = cast.resolve(label) if label else None
+        if role is None:
+            _append_unit(
+                result,
+                "dialogue",
+                narrator.role_id,
+                narrator.name,
+                span,
+                flags=["unresolved_role"],
+                confidence=0.3,
+                system_hash=system_hash,
+            )
+        else:
+            _append_unit(result, "dialogue", role.role_id, role.name, span, system_hash=system_hash)
+    return result
 
 
 def extract_chapter(chapter: Chapter, cast: Cast, client: LLMClient | None) -> list[Unit]:
-    sentences = split_sentences(chapter.text)
-    if not sentences:
-        return []
     if client is None:
         narrator = cast.narrator()
         return [
@@ -282,22 +319,5 @@ def extract_chapter(chapter: Chapter, cast: Cast, client: LLMClient | None) -> l
                 confidence=1.0,
             )
         ]
-
-    numbered = "\n".join(f"{index}. {sentence}" for index, (_para, sentence) in enumerate(sentences, start=1))
-    system = build_system(cast)
-    system_hash = extract_prompt_hash(cast)
-    user = USER_TEMPLATE.format(title=chapter.title, numbered=numbered)
-    thinking = os.environ.get("AUDIOBOOK_EXTRACT_THINKING", "off").lower() in ("1", "on", "true", "yes")
-    last_error: Exception | None = None
-    payload: dict | list | None = None
-    for attempt_thinking in (thinking, not thinking, thinking):
-        try:
-            payload = client.chat_json(system, user, thinking=attempt_thinking)
-            break
-        except Exception as error:  # noqa: BLE001 - retry on any malformed reply
-            last_error = error
-    if payload is None:
-        raise RuntimeError(f"extraction failed after retries: {last_error}")
-    units = _group_units(sentences, _as_label_map(payload), cast, system_hash)
-    _repair_speakers(units, cast)
-    return units
+    system = build_numbered_system(cast)
+    return _numbered_extract(client, chapter, cast, system, prompt_hash(PROMPT_ID, system), _thinking_default())

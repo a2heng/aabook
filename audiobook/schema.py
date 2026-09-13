@@ -234,6 +234,7 @@ class ScriptRow:
     raw_text: str = ""
     tts_text: str = ""
     punct_edited: bool = False
+    break_level: str = ""
     auk_task: str = "zero_shot_tts"
     voice_ref: str = ""
     style_desc: str = ""

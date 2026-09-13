@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .agent import RoleAgent
@@ -15,7 +16,9 @@ from .duration import MAX_SEGMENT_SECONDS, estimate_text_duration, segment_tts_t
 from .extract import Unit, extract_chapter
 from .instructions import emotion_multiplier, render_instruction
 from .llm import LLMClient
+from .postprocess import merge_adjacent_narration
 from .schema import Cast, ScriptRow, write_script, write_script_json, write_script_sqlite
+from .segment import segment_units
 from .stats import distribution_report
 
 CONFIDENCE_THRESHOLD = 0.6
@@ -66,6 +69,7 @@ def _rows_for_units(chapter: Chapter, units: list[Unit], cast: Cast, model_id: s
                 raw_text=unit.raw_text,
                 tts_text=segment.text,
                 punct_edited=segment.punct_edited,
+                break_level=unit.break_level,
                 auk_task="zero_shot_tts",
                 voice_ref=role.voice_ref if role else "",
                 style_desc=role.style_desc if role else "",
@@ -162,6 +166,7 @@ def build_script(
         units = extract_chapter(chapter, cast, client)
         if client is not None:
             RoleAgent(cast, client).run(units)
+            units = segment_units(units, cast, client)
         rows.extend(_rows_for_units(chapter, units, cast, resolved_model, len(rows)))
         print(
             f"[extract] {index}/{len(chapters)} {chapter.title[:24]} units={len(units)} rows={len(rows)}",
@@ -170,6 +175,16 @@ def build_script(
         )
 
     canonicalize_rows(rows, cast)
+
+    if os.environ.get("AUDIOBOOK_MERGE_NARRATION", "1").lower() not in ("0", "off", "false", "no"):
+        merged_dicts, merged_pairs = merge_adjacent_narration([asdict(row) for row in rows])
+        if merged_pairs:
+            rows = [ScriptRow(**item) for item in merged_dicts]
+            print(
+                f"[merge] narration merged {len(merged_pairs)} pair(s) -> {len(rows)} rows",
+                file=sys.stderr,
+                flush=True,
+            )
 
     script_path = out_dir / "script.csv"
     write_script(rows, script_path)

@@ -15,10 +15,15 @@ SECONDS_PER_LATIN_WORD = 0.40
 SECONDS_PER_STRONG_PAUSE = 0.30
 SECONDS_PER_WEAK_PAUSE = 0.12
 
-MAX_SEGMENT_SECONDS = 20.0
-# Derived caps: 20 s / 0.22 ~= 90 zh chars, with margin for punctuation.
-MAX_SEG_CHARS_ZH = 80
-MAX_SEG_WORDS_EN = 45
+# The renderer used to apply this scale (``duration_rate``) on top of the estimate.
+# It is now internalised: ``estimate_text_duration`` returns the STANDARD time that
+# goes straight to AuK as ``gen_seconds`` (unit 1, no further scaling anywhere).
+STANDARD_RATE = 0.7
+
+MAX_SEGMENT_SECONDS = 28.0
+# Derived caps (~28 s / (0.22 * 0.7) ~= 180 zh chars), with margin for punctuation.
+MAX_SEG_CHARS_ZH = 160
+MAX_SEG_WORDS_EN = 90
 
 _CJK_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]")
 _LATIN_WORD_RE = re.compile(r"[A-Za-z]+(?:['\-][A-Za-z]+)*")
@@ -44,7 +49,7 @@ def estimate_text_duration(text: str | None) -> float:
     weak = len(_WEAK_PAUSE_RE.findall(text))
     speech = cjk * SECONDS_PER_CJK_CHAR + words * SECONDS_PER_LATIN_WORD
     pauses = strong * SECONDS_PER_STRONG_PAUSE + weak * SECONDS_PER_WEAK_PAUSE
-    return speech + pauses
+    return (speech + pauses) * STANDARD_RATE
 
 
 def _greedy(pieces: list[str], max_seconds: float) -> list[str]:
@@ -69,7 +74,7 @@ def _split_oversized(chunk: str, max_seconds: float) -> list[str]:
         if estimate_text_duration(merged) <= max_seconds:
             pieces.append(merged)
         else:
-            budget = max(8, int(max_seconds / SECONDS_PER_CJK_CHAR))
+            budget = max(8, int(max_seconds / (SECONDS_PER_CJK_CHAR * STANDARD_RATE)))
             pieces.extend(merged[index : index + budget] for index in range(0, len(merged), budget))
     return pieces
 

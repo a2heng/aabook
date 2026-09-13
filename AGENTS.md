@@ -49,6 +49,8 @@
 - **hf-mirror 下载**：`huggingface_hub` 直连 `https://hf-mirror.com` 可用（免代理）；`HF_ENDPOINT` 在**进程启动时**读取，改了要重启脚本。大文件用 `hf_hub_download`（自带 `.incomplete` 断点续传），失败可重试续传，别删 `.incomplete`。
 - **GGUF 只下主权重**：`imatrix_*.gguf` 仅在量化时用、`mmproj-*.gguf` 是视觉投影、`config.json`/`README` 是 Hub 元数据，llama.cpp 推理都不需要。
 - **不要在正在写入的大文件上跑 `find`/`grep`/`ls -R`**：会放大 I/O 等待，看起来像卡住。
+- **AuK 克隆无法用自由指令控制情绪/风格**（实测 2026-09-13）：往 `zero_shot_tts` 指令里加"terrified/angry"等描述，模型会把指令前缀当台词念出来再接文本（ASR 可证）。克隆只能控音色（参考音）+ 时长（`gen_seconds`）；情绪/语速/音调走 `emotion_edit`/`speed_edit`/`pitch_edit` 后编辑。见 `docs/audiobook-workflow.md` §7.1、复现脚本 `scripts/instruction_probe.py`。
+- **参考音质量是克隆天花板**（实测 2026-09-13）：`assets/voice-reference/逗哥音色整理合集` 是 TTS 合成音色，克隆会放大其瑕疵（多余停顿/生硬）；VAD 去静音 + bwe + 收紧 `gen_seconds` 都无法根治。要自然必须换更高质量参考音。见 docs §6.4。
 
 ## 验证与代码风格
 

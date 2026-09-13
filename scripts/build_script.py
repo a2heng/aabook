@@ -93,6 +93,19 @@ def main() -> None:
         preview = ", ".join(seg_ids[:5])
         print(f"  [{flag}] {len(seg_ids)} -> {preview}")
 
+    try:
+        sys.path.insert(0, str(APP_ROOT / "scripts"))
+        from visualize_script import load_rows, render  # noqa: PLC0415
+
+        clean = Path(args.out) / "clean.txt"
+        source_text = clean.read_text(encoding="utf-8") if clean.is_file() else ""
+        report_out = Path("outputs/report.html")
+        report_out.parent.mkdir(parents=True, exist_ok=True)
+        report_out.write_text(render(load_rows(Path(result.script_path)), "AuK 预处理可视化", source_text), encoding="utf-8")
+        print(f"report   : {report_out} (固定路径，刷新浏览器即可)")
+    except Exception as error:  # noqa: BLE001 - report is best-effort
+        print(f"[warn] report render failed: {error}", file=sys.stderr)
+
 
 if __name__ == "__main__":
     main()

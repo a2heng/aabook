@@ -30,7 +30,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 os.chdir(APP_ROOT)
 
-from audiobook.assembler import assemble_chapters, assemble_rows  # noqa: E402
+from audiobook.assembler import TARGET_LUFS, assemble_chapters, assemble_rows  # noqa: E402
 from audiobook.canonical import canonicalize_rows  # noqa: E402
 from audiobook.renderer import RenderConfig, Renderer, voice_map_from_args  # noqa: E402
 from audiobook.schema import Cast, read_script  # noqa: E402
@@ -60,7 +60,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="")
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--duration-rate", type=float, default=1.0)
+    parser.add_argument("--duration-rate", type=float, default=1.0, help="extra scale on standard duration (1.0 = as-is)")
+    parser.add_argument("--max-seconds", type=float, default=28.0, help="clamp on gen_seconds (AuK quality limit ~28s)")
+    parser.add_argument("--target-lufs", type=float, default=TARGET_LUFS, help="loudness target for rows and masters")
+    parser.add_argument("--no-normalize", action="store_true", help="write raw AuK levels (no loudness normalization)")
     parser.add_argument("--limit-chapters", type=int, default=0, help="only the first N chapters")
     parser.add_argument("--limit-rows", type=int, default=0, help="only the first N rows (smoke test)")
     parser.add_argument("--no-assemble", action="store_true")
@@ -109,6 +112,9 @@ def main() -> None:
         device=args.device,
         seed=args.seed,
         duration_rate=args.duration_rate,
+        max_seconds=args.max_seconds,
+        target_lufs=args.target_lufs,
+        normalize_rows=not args.no_normalize,
     )
     from app.patches import apply_patches
 
@@ -138,18 +144,23 @@ def main() -> None:
         if not items:
             continue
         chapter_path = out_dir / "chapters" / f"ch{chapter_id:04d}.wav"
-        assemble_rows(items, chapter_path)
+        assemble_rows(items, chapter_path, normalize=not args.no_normalize, target_lufs=args.target_lufs)
         chapter_paths.append((chapter_id, chapter_path))
         print(f"[assemble] ch{chapter_id:04d}: {len(items)} rows -> {chapter_path}", flush=True)
 
     elapsed = time.perf_counter() - started
     rtf = elapsed / audio_seconds if audio_seconds else 0.0
-    print(f"[render] done {len(rendered)} rows in {elapsed:.1f}s | audio {audio_seconds/60:.1f} min | RTF {rtf:.2f}x")
+    print(f"[render] done {len(rendered)} rows in {elapsed:.1f}s | audio {audio_seconds / 60:.1f} min | RTF {rtf:.2f}x")
 
-    manifest = {"rows": len(rendered), "audio_seconds": round(audio_seconds, 1), "wall_seconds": round(elapsed, 1), "rtf": round(rtf, 3)}
+    manifest = {
+        "rows": len(rendered),
+        "audio_seconds": round(audio_seconds, 1),
+        "wall_seconds": round(elapsed, 1),
+        "rtf": round(rtf, 3),
+    }
     if chapter_paths:
         book_path = out_dir / "book.wav"
-        assemble_chapters(chapter_paths, book_path)
+        assemble_chapters(chapter_paths, book_path, normalize=not args.no_normalize, target_lufs=args.target_lufs)
         manifest["chapters"] = len(chapter_paths)
         manifest["book"] = str(book_path)
         print(f"[assemble] book -> {book_path}")
