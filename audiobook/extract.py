@@ -48,29 +48,42 @@ _MIN_CLOSE = set('”』」"')
 
 NARRATOR_LABELS = {"旁白", "旁白君", "叙述", "叙述者", "画外音", "narrator", "narration", "neutral"}
 
-NUMBERED_SYSTEM = """【角色表】（只能从下表选说话人，对号入座；旁白不在此列）
+NUMBERED_SYSTEM = """【角色表】（对白说话人**只能**从下表选，对号入座）
 __ROSTER__
 
-下面原文已被代码切成最小句并逐句编号，其中**所有引号句（“…”／「…」）都必须出现在你的输出里**。只输出 JSON：
-{"speakers":{"2":"高文","3":"赫蒂","7":"旁白"}}
+下面原文已被代码切成最小句并逐句编号。请**只给引号句（“…”／「…」）指定说话人**，只输出 JSON：
+{"speakers":{"3":"高文","4":"赫蒂"}}
 
 规则：
-1. **不能漏任何引号句**：凡是引号内的话都要给一个说话人，取上表名字；别名对齐（姑妈=赫蒂·塞西尔）。
-2. 引号句若是**人在说话**（哪怕只有一两个字，如“拜伦！”“姑妈？”），必须写说话人。
-3. 引号句若**不是人说话**（书名/术语/引文，如“第一王朝”），写 "旁白"。
-4. 旁白叙述、归属/引述短语（“X说道”“X喊道，”）**不用列出**。
-5. 说话人一变就分别标；相邻两句不同人也各标各的；无法确定 → 写 "旁白"。
+1. 输出里**只出现引号句的编号**。旁白叙述、归属/引述短语（如“低声说道：”“瑞贝卡突然喊道，”）属旁白，**不要列出**。
+2. 每个引号句都必须给一个角色表里的名字：**不能漏、不能留空、不能写“未知”**。只要是人发出的声音（说话、喊叫、惊呼、痛呼、嘟囔……，哪怕只有一两个字），就根据上下文、身份、称谓**选最可能的说话人**（对号入座）。
+3. 只有**确定不是人说话**的引号（书名/术语/引文，如“第一王朝”）才写 "旁白"。
+4. 相邻不同说话人要分别标；别名对齐（姑妈=赫蒂·塞西尔）。
 
-【示例】
+【完整示例】
 编号文本：
-1 高文推开门，低声说道：
-2 “你来了。”
-3 “好久不见。”
-4 赫蒂回答。
-5 “拜伦！”瑞贝卡突然喊道。
-6 他皱眉道：“你也在这儿？”
+1 高文推开门，
+2 低声说道：
+3 “你来了。”
+4 “好久不见。”
+5 赫蒂回答。
+6 “拜伦！”
+7 瑞贝卡突然喊道，
+8 “你也在这儿？”
+9 墙上挂着
+10 “第一王朝”
+11 的壁画。
+12 棺中传来一声痛呼：
+13 “卧槽谁砸我手！”
 输出：
-{"speakers":{"2":"高文","3":"赫蒂","5":"瑞贝卡","6":"高文"}}
+{"speakers":{"3":"高文","4":"赫蒂","6":"瑞贝卡","8":"瑞贝卡","10":"旁白","13":"高文"}}
+
+示例说明：
+- 旁白句 1、2、5、7、9、11、12（叙述与归属短语）**不列出**，代码自动算旁白。
+- 编号 3 的说话人由前面“高文…说道”判断=高文；4 由后面“赫蒂回答”判断=赫蒂。
+- 编号 6、8 由中间“瑞贝卡突然喊道”判断=瑞贝卡（相邻两句同一人也要各标一次）。
+- 编号 10 是术语、不是台词 → 写 "旁白"。
+- 编号 13 是棺中的人发出的痛呼 → 高文（对号入座，绝不能留空/未知）。
 """
 
 
@@ -260,6 +273,15 @@ def _parse_labels(payload) -> dict[int, str] | None:
     return labels
 
 
+def _looks_non_speech(span: str) -> bool:
+    """A quoted span is treated as narration only if it does not look like an utterance.
+
+    Exclamations/questions (ending in ！？… ) are always speech, so a model that
+    labels them "旁白" cannot silence them into narration.
+    """
+    return not span.rstrip().rstrip("”』」\"'").endswith(("！", "？", "…"))
+
+
 def _numbered_extract(
     client: LLMClient, chapter: Chapter, cast: Cast, system: str, system_hash: str, thinking: bool
 ) -> list[Unit]:
@@ -285,11 +307,12 @@ def _numbered_extract(
     for index, unit in enumerate(units, 1):
         span = chapter.text[unit["start"] : unit["end"]]
         label = labels.get(index)
-        if not unit["inside"] or (label is not None and label in NARRATOR_LABELS):
-            # no quotes -> always narration; or the model marked a quote as non-speech
+        marked_narration = label is not None and label in NARRATOR_LABELS
+        if not unit["inside"] or (marked_narration and _looks_non_speech(span)):
+            # no quotes, or a genuine non-speech quote (term/title) -> narration
             _append_unit(result, "narration", narrator.role_id, narrator.name, span, system_hash=system_hash)
             continue
-        role = cast.resolve(label) if label else None
+        role = None if marked_narration else cast.resolve(label or "")
         if role is None:
             _append_unit(
                 result,

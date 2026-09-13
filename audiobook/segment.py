@@ -18,16 +18,22 @@ import os
 import re
 from dataclasses import replace
 
-from .duration import estimate_text_duration
+from .duration import (
+    CHAR_BOOST,
+    MAX_SEGMENT_SECONDS,
+    SECONDS_PER_CJK_CHAR,
+    STANDARD_RATE,
+    estimate_text_duration,
+)
 from .extract import Unit, _align, _normalize_with_map, strip_quotes
 from .llm import LLMClient, prompt_hash
 from .schema import Cast
 
 PROMPT_ID = "prep.pointer.v1"
 MAX_UNIT_SECONDS = float(os.environ.get("AUDIOBOOK_MAX_UNIT_SECONDS", "0"))
-AGENT_WINDOW_SECONDS = float(os.environ.get("AUDIOBOOK_SEGMENT_WINDOW_SECONDS", "21"))
+AGENT_WINDOW_SECONDS = float(os.environ.get("AUDIOBOOK_SEGMENT_WINDOW_SECONDS", "18"))
 # Merge adjacent same-role narration up to this STANDARD length (unit 1 = gen_seconds).
-NARRATION_MERGE_SECONDS = float(os.environ.get("AUDIOBOOK_NARRATION_MERGE_SECONDS", "24.5"))
+NARRATION_MERGE_SECONDS = float(os.environ.get("AUDIOBOOK_NARRATION_MERGE_SECONDS", "18"))
 
 _SENTENCE_RE = re.compile(r"[^。！？!?…\n]+[。！？!?…]*")
 _CLAUSE_RE = re.compile(r"[^，、；：,;:]+[，、；：,;:]*")
@@ -136,6 +142,7 @@ def _windows(text: str, max_seconds: float) -> list[tuple[int, int]]:
     if not sentences:
         return [(0, len(text))]
     result: list[tuple[int, int]] = []
+    budget = max(8, int(max_seconds / (SECONDS_PER_CJK_CHAR * CHAR_BOOST * STANDARD_RATE)))
     for start, end in pack(sentences):
         if estimate_text_duration(text[start:end]) <= max_seconds:
             result.append((start, end))
@@ -144,7 +151,14 @@ def _windows(text: str, max_seconds: float) -> list[tuple[int, int]]:
         if not clauses:
             result.append((start, end))
             continue
-        result.extend((start + c_start, start + c_end) for c_start, c_end in pack(clauses))
+        for c_start, c_end in pack(clauses):
+            absolute = (start + c_start, start + c_end)
+            if estimate_text_duration(text[absolute[0] : absolute[1]]) <= max_seconds:
+                result.append(absolute)
+                continue
+            piece = text[absolute[0] : absolute[1]]
+            for index in range(0, len(piece), budget):
+                result.append((absolute[0] + index, absolute[0] + min(index + budget, len(piece))))
     return result
 
 
@@ -181,29 +195,49 @@ def _segment_unit(unit: Unit, window: str, window_offset: int, segments: list[di
     boundaries.append(len(window))
     out: list[tuple[dict, str, bool]] = []
     for index, segment in enumerate(segments):
-        source = unit.tts_text[window_offset + boundaries[index] : window_offset + boundaries[index + 1]]
+        source = unit.raw_text[window_offset + boundaries[index] : window_offset + boundaries[index + 1]]
         out.append((segment, source, failed))
     return out
+
+
+def _covers(window: str, segments: list[dict]) -> bool:
+    """True if the agent's output reconstructs the window without losing content.
+
+    ``text`` must be verbatim (alnum-equal); ``speech`` may only rewrite declarations,
+    so it must keep almost all of the content length (guards dropped clauses).
+    """
+    if not segments:
+        return False
+    text = "".join(str(segment.get("text") or "") for segment in segments)
+    if _alnum(text) != _alnum(window):
+        return False
+    speech = "".join(str(segment.get("speech") or segment.get("text") or "") for segment in segments)
+    return len(_alnum(speech)) >= 0.85 * len(_alnum(window))
 
 
 _SENT_END = "。！？!?…"
 
 
-def _merge_fragments(pieces: list[tuple[dict, str, bool]]) -> list[tuple[dict, str, bool]]:
+def _merge_fragments(pieces: list[tuple[dict, str, bool]], max_seconds: float) -> list[tuple[dict, str, bool]]:
     """Merge a fragment into the next piece so every unit is a complete expression.
 
     Pointer spans are contiguous, so the union of two adjacent raw slices is still
-    an exact source span; we only ever widen a unit, never invent text.
+    an exact source span; we only ever widen a unit, never invent text. A merge is
+    skipped when it would push the reading past ``max_seconds`` (keeps units <= cap
+    *before* any row is built, so raw_text and tts_text stay a 1:1 pair).
     """
 
     def reading(segment: dict) -> str:
         return segment.get("speech") or segment["text"]
 
+    def fits(previous: dict, segment: dict) -> bool:
+        return max_seconds <= 0 or estimate_text_duration(reading(previous) + reading(segment)) <= max_seconds
+
     merged: list[tuple[dict, str, bool]] = []
     for segment, raw, failed in pieces:
         if merged:
             previous, previous_raw, previous_failed = merged[-1]
-            if reading(previous) and reading(previous)[-1] not in _SENT_END:
+            if reading(previous) and reading(previous)[-1] not in _SENT_END and fits(previous, segment):
                 merged[-1] = (
                     {
                         "text": previous["text"] + segment["text"],
@@ -218,15 +252,18 @@ def _merge_fragments(pieces: list[tuple[dict, str, bool]]) -> list[tuple[dict, s
     if len(merged) > 1 and reading(merged[-1][0]) and reading(merged[-1][0])[-1] not in _SENT_END:
         last, last_raw, last_failed = merged.pop()
         previous, previous_raw, previous_failed = merged[-1]
-        merged[-1] = (
-            {
-                "text": previous["text"] + last["text"],
-                "speech": reading(previous) + reading(last),
-                "next": last["next"],
-            },
-            previous_raw + last_raw,
-            previous_failed or last_failed,
-        )
+        if fits(previous, last):
+            merged[-1] = (
+                {
+                    "text": previous["text"] + last["text"],
+                    "speech": reading(previous) + reading(last),
+                    "next": last["next"],
+                },
+                previous_raw + last_raw,
+                previous_failed or last_failed,
+            )
+        else:
+            merged.append((last, last_raw, last_failed))
     return merged
 
 
@@ -270,10 +307,12 @@ def _build(unit: Unit, segment: dict, raw: str, narrator, system_hash: str, *, a
     flags = [*unit.flags, "adapted"]
     if raw and _alnum(segment["text"]) != _alnum(raw):
         flags.append("source_mismatch")
+    if kind != "narration" and raw and _alnum(tts) != _alnum(raw):
+        # dialogue is verbatim: if the agent changed any word, fall back to the source
+        tts = strip_quotes(raw)
+        flags.append("dialogue_reverted")
     if raw and tts != raw:
         flags.append("rewritten")
-    if kind != "narration" and raw and _alnum(tts) != _alnum(raw):
-        flags.append("dialogue_edited")
     if anchor_failed:
         flags.append("anchor_failed")
     return replace(
@@ -327,22 +366,21 @@ def segment_units(
     verify_system = build_verify_system()
     system_hash = segment_prompt_hash()
     narrator = cast.narrator()
+    cap = max_seconds if max_seconds > 0 else MAX_SEGMENT_SECONDS
     result: list[Unit] = []
     for unit in units:
-        if max_seconds > 0 and estimate_text_duration(unit.tts_text) <= max_seconds:
-            result.append(unit)
-            continue
+        source = unit.raw_text or unit.tts_text
         pieces: list[tuple[dict, str, bool]] = []
-        for start, end in _windows(unit.tts_text, AGENT_WINDOW_SECONDS):
-            window = unit.tts_text[start:end]
+        for start, end in _windows(source, AGENT_WINDOW_SECONDS):
+            window = source[start:end]
             segments = _agent_adapt(client, system, window)
             if verify and segments:
                 segments = _agent_verify(client, verify_system, window, segments)
-            if not segments:
+            if not _covers(window, segments):
                 segments = [{"text": window, "next": ""}]
             pieces.extend(_segment_unit(unit, window, start, segments))
         result.extend(
             _build(unit, segment, raw, narrator, system_hash, anchor_failed=failed)
-            for segment, raw, failed in _merge_fragments(pieces)
+            for segment, raw, failed in _merge_fragments(pieces, cap)
         )
     return _merge_narration(result)

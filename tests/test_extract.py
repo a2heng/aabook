@@ -74,6 +74,13 @@ class ExtractChapterTest(unittest.TestCase):
         units = extract_chapter(chapter, make_cast(), client)  # type: ignore[arg-type]
         self.assertEqual([unit.kind for unit in units], ["narration"])
 
+    def test_exclamation_marked_narration_stays_dialogue(self):
+        chapter = Chapter(chapter_id=1, title="第一章", text="“祖先啊！”")
+        client = FakeClient({"speakers": {"1": "旁白"}})
+        units = extract_chapter(chapter, make_cast(), client)  # type: ignore[arg-type]
+        self.assertEqual(units[0].kind, "dialogue")
+        self.assertIn("unresolved_role", units[0].flags)
+
 
 if __name__ == "__main__":
     unittest.main()

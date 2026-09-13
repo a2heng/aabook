@@ -97,11 +97,21 @@ def main() -> None:
         sys.path.insert(0, str(APP_ROOT / "scripts"))
         from visualize_script import load_rows, render  # noqa: PLC0415
 
-        clean = Path(args.out) / "clean.txt"
-        source_text = clean.read_text(encoding="utf-8") if clean.is_file() else ""
+        out_dir = Path(args.out)
+        source_text = (out_dir / "source.txt").read_text(encoding="utf-8") if (out_dir / "source.txt").is_file() else ""
+        clean_text = (out_dir / "clean.txt").read_text(encoding="utf-8") if (out_dir / "clean.txt").is_file() else ""
+        asr_path = out_dir / "asr_check.json"
+        asr_map = (
+            {item["seg_id"]: item.get("asr", "") for item in json.loads(asr_path.read_text(encoding="utf-8"))}
+            if asr_path.is_file()
+            else {}
+        )
         report_out = Path("outputs/report.html")
         report_out.parent.mkdir(parents=True, exist_ok=True)
-        report_out.write_text(render(load_rows(Path(result.script_path)), "AuK 预处理可视化", source_text), encoding="utf-8")
+        report_out.write_text(
+            render(load_rows(Path(result.script_path)), "AuK 预处理可视化", source_text, clean_text, asr_map),
+            encoding="utf-8",
+        )
         print(f"report   : {report_out} (固定路径，刷新浏览器即可)")
     except Exception as error:  # noqa: BLE001 - report is best-effort
         print(f"[warn] report render failed: {error}", file=sys.stderr)

@@ -38,7 +38,7 @@ class RenderConfig:
     seed: int = 1234
     duration_rate: float = 1.0
     min_seconds: float = 0.6
-    max_seconds: float = 28.0
+    max_seconds: float = 20.0
     nfe: int = 4
     cfg: float = 0.0
     target_lufs: float = TARGET_LUFS

@@ -12,7 +12,7 @@ from .agent import RoleAgent
 from .canonical import canonicalize_rows
 from .cast import discover_cast
 from .cleaning import Chapter, normalize_text, read_text, split_chapters
-from .duration import MAX_SEGMENT_SECONDS, estimate_text_duration, segment_tts_text
+from .duration import MAX_SEGMENT_SECONDS, estimate_text_duration
 from .extract import Unit, extract_chapter
 from .instructions import emotion_multiplier, render_instruction
 from .llm import LLMClient
@@ -20,6 +20,7 @@ from .postprocess import merge_adjacent_narration
 from .schema import Cast, ScriptRow, write_script, write_script_json, write_script_sqlite
 from .segment import segment_units
 from .stats import distribution_report
+from .textnorm import normalize_tts
 
 CONFIDENCE_THRESHOLD = 0.6
 
@@ -50,44 +51,46 @@ def _assign_voices(cast: Cast, voices: dict[str, str] | None) -> None:
 
 
 def _rows_for_units(chapter: Chapter, units: list[Unit], cast: Cast, model_id: str, start_order: int) -> list[ScriptRow]:
+    """One ``Unit`` -> one ``ScriptRow`` (1:1).
+
+    Segmentation already happened at the source-aligned unit level, so raw_text and
+    tts_text belong to the same span; re-splitting the string here (and re-attaching
+    the whole unit raw to every part) is what used to corrupt the audit trail.
+    """
     rows: list[ScriptRow] = []
-    order = start_order
     for unit_index, unit in enumerate(units, start=1):
         role = cast.roles.get(unit.role_id)
-        segments = segment_tts_text(unit.tts_text)
-        for part_index, segment in enumerate(segments, start=1):
-            order += 1
-            suffix = "" if len(segments) == 1 else chr(ord("a") + part_index - 1)
-            row = ScriptRow(
-                order=order,
-                chapter_id=chapter.chapter_id,
-                chapter_title=chapter.title,
-                seg_id=f"ch{chapter.chapter_id:03d}_s{unit_index:04d}{suffix}",
-                kind=unit.kind,
-                role_id=unit.role_id,
-                role_name=unit.role_name,
-                raw_text=unit.raw_text,
-                tts_text=segment.text,
-                punct_edited=segment.punct_edited,
-                break_level=unit.break_level,
-                auk_task="zero_shot_tts",
-                voice_ref=role.voice_ref if role else "",
-                style_desc=role.style_desc if role else "",
-                emotion=unit.emotion,
-                emotion_multiplier=emotion_multiplier(unit.emotion),
-                target_duration_s=round(estimate_text_duration(segment.text), 3),
-                duration_source="est",
-                pe_instruction=render_instruction("zero_shot_tts", segment.text),
-                extract_conf=unit.confidence,
-                needs_pass2=unit.confidence < CONFIDENCE_THRESHOLD,
-                prompt_id=unit.prompt_id,
-                prompt_hash=unit.prompt_hash,
-                model_id=model_id,
-            )
-            for flag in unit.flags:
-                row.add_flag(flag)
-            _qa_row(row)
-            rows.append(row)
+        tts = unit.tts_text
+        row = ScriptRow(
+            order=start_order + unit_index,
+            chapter_id=chapter.chapter_id,
+            chapter_title=chapter.title,
+            seg_id=f"ch{chapter.chapter_id:03d}_s{unit_index:04d}",
+            kind=unit.kind,
+            role_id=unit.role_id,
+            role_name=unit.role_name,
+            raw_text=unit.raw_text,
+            tts_text=tts,
+            punct_edited=False,
+            break_level=unit.break_level,
+            auk_task="zero_shot_tts",
+            voice_ref=role.voice_ref if role else "",
+            style_desc=role.style_desc if role else "",
+            emotion=unit.emotion,
+            emotion_multiplier=emotion_multiplier(unit.emotion),
+            target_duration_s=round(estimate_text_duration(tts), 3),
+            duration_source="est",
+            pe_instruction=render_instruction("zero_shot_tts", tts),
+            extract_conf=unit.confidence,
+            needs_pass2=unit.confidence < CONFIDENCE_THRESHOLD,
+            prompt_id=unit.prompt_id,
+            prompt_hash=unit.prompt_hash,
+            model_id=model_id,
+        )
+        for flag in unit.flags:
+            row.add_flag(flag)
+        _qa_row(row)
+        rows.append(row)
     return rows
 
 
@@ -150,7 +153,9 @@ def build_script(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     raw = read_text(input_path)
-    clean = normalize_text(raw)
+    source = normalize_text(raw)
+    clean = normalize_tts(source)
+    (out_dir / "source.txt").write_text(source, encoding="utf-8")
     (out_dir / "clean.txt").write_text(clean, encoding="utf-8")
 
     chapters = split_chapters(clean)
@@ -180,6 +185,8 @@ def build_script(
         merged_dicts, merged_pairs = merge_adjacent_narration([asdict(row) for row in rows])
         if merged_pairs:
             rows = [ScriptRow(**item) for item in merged_dicts]
+            for index, row in enumerate(rows, start=1):
+                row.order = index  # keep #order contiguous after absorbing rows
             print(
                 f"[merge] narration merged {len(merged_pairs)} pair(s) -> {len(rows)} rows",
                 file=sys.stderr,

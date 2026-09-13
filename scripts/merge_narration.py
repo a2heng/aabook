@@ -44,12 +44,14 @@ def main() -> None:
         print(f"wrote {out_json}")
 
     sys.path.insert(0, str(APP_ROOT / "scripts"))
-    from visualize_script import render, resolve_source  # noqa: E402
+    from visualize_script import _read_or, render  # noqa: E402
 
-    source_text = resolve_source(Path(args.script), None)
+    src_dir = Path(args.script).parent
+    source_text = _read_or(src_dir / "source.txt")
+    clean_text = _read_or(src_dir / "clean.txt")
     report = Path(args.report)
     report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text(render(merged_rows, "AuK 预处理可视化（旁白合并后）", source_text), encoding="utf-8")
+    report.write_text(render(merged_rows, "AuK 预处理可视化（旁白合并后）", source_text, clean_text, {}), encoding="utf-8")
     print(f"report: {report}")
 
 

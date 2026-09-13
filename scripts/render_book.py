@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--duration-rate", type=float, default=1.0, help="extra scale on standard duration (1.0 = as-is)")
-    parser.add_argument("--max-seconds", type=float, default=28.0, help="clamp on gen_seconds (AuK quality limit ~28s)")
+    parser.add_argument("--max-seconds", type=float, default=20.0, help="clamp on gen_seconds (tightened; long rows degraded)")
     parser.add_argument("--target-lufs", type=float, default=TARGET_LUFS, help="loudness target for rows and masters")
     parser.add_argument("--no-normalize", action="store_true", help="write raw AuK levels (no loudness normalization)")
     parser.add_argument("--limit-chapters", type=int, default=0, help="only the first N chapters")

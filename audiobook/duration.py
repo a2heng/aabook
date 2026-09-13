@@ -20,10 +20,18 @@ SECONDS_PER_WEAK_PAUSE = 0.12
 # goes straight to AuK as ``gen_seconds`` (unit 1, no further scaling anywhere).
 STANDARD_RATE = 0.7
 
-MAX_SEGMENT_SECONDS = 28.0
-# Derived caps (~28 s / (0.22 * 0.7) ~= 180 zh chars), with margin for punctuation.
-MAX_SEG_CHARS_ZH = 160
-MAX_SEG_WORDS_EN = 90
+# Loosen the estimate so long/degraded rows are less likely to be cut:
+# every character/word gets +5%, and short utterances get an extra +10%.
+CHAR_BOOST = 1.05
+SHORT_SENTENCE_BOOST = 1.10
+SHORT_SENTENCE_MAX_CHARS = 12
+
+# Tightened cap: rows longer than this (standard seconds ~= <=120 syllables) showed
+# heavy ASR coverage loss, so split earlier.
+MAX_SEGMENT_SECONDS = 20.0
+# Derived caps (~20 s / (0.22 * 1.05 * 0.7) ~= 123 zh chars), with margin.
+MAX_SEG_CHARS_ZH = 120
+MAX_SEG_WORDS_EN = 70
 
 _CJK_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]")
 _LATIN_WORD_RE = re.compile(r"[A-Za-z]+(?:['\-][A-Za-z]+)*")
@@ -47,9 +55,12 @@ def estimate_text_duration(text: str | None) -> float:
     words = len(_LATIN_WORD_RE.findall(text))
     strong = len(_STRONG_PAUSE_RE.findall(text))
     weak = len(_WEAK_PAUSE_RE.findall(text))
-    speech = cjk * SECONDS_PER_CJK_CHAR + words * SECONDS_PER_LATIN_WORD
+    speech = (cjk * SECONDS_PER_CJK_CHAR + words * SECONDS_PER_LATIN_WORD) * CHAR_BOOST
     pauses = strong * SECONDS_PER_STRONG_PAUSE + weak * SECONDS_PER_WEAK_PAUSE
-    return (speech + pauses) * STANDARD_RATE
+    duration = (speech + pauses) * STANDARD_RATE
+    if cjk + words <= SHORT_SENTENCE_MAX_CHARS:
+        duration *= SHORT_SENTENCE_BOOST
+    return duration
 
 
 def _greedy(pieces: list[str], max_seconds: float) -> list[str]:
@@ -74,7 +85,7 @@ def _split_oversized(chunk: str, max_seconds: float) -> list[str]:
         if estimate_text_duration(merged) <= max_seconds:
             pieces.append(merged)
         else:
-            budget = max(8, int(max_seconds / (SECONDS_PER_CJK_CHAR * STANDARD_RATE)))
+            budget = max(8, int(max_seconds / (SECONDS_PER_CJK_CHAR * CHAR_BOOST * STANDARD_RATE)))
             pieces.extend(merged[index : index + budget] for index in range(0, len(merged), budget))
     return pieces
 
@@ -101,13 +112,13 @@ def segment_tts_text(text: str | None, max_seconds: float = MAX_SEGMENT_SECONDS)
     segments: list[Segment] = []
     for unit in _split_units(text, max_seconds):
         unit = unit.strip()
-        if not unit:
-            continue
+        if not unit or not any(char.isalnum() for char in unit):
+            continue  # drop punctuation-only fragments (e.g. a lone "。")
         if _WEAK_END_RE.search(unit):
             segments.append(Segment(_WEAK_END_RE.sub("。", unit), True))
         else:
             segments.append(Segment(unit, False))
-    return segments
+    return segments or [Segment(text, False)]
 
 
 def exceeds_cap(text: str | None) -> bool:

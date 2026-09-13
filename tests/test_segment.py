@@ -82,11 +82,12 @@ class PointerSegmentTest(unittest.TestCase):
         self.assertIn("rewritten", units[0].flags)
         self.assertNotIn("source_mismatch", units[0].flags)
 
-    def test_source_mismatch_flagged(self):
+    def test_mismatched_output_rejected_verbatim(self):
         text = "他低声说道。"
         client = FakeClient(payload(("完全不同的原文。", "", "")))
         units = seg([make_unit(text)], client, max_seconds=0.1)
-        self.assertIn("source_mismatch", units[0].flags)
+        self.assertEqual(units[0].raw_text, text)
+        self.assertNotIn("source_mismatch", units[0].flags)
 
     def test_kind_and_role_inherited(self):
         unit = make_unit("你来。", kind="dialogue", role_id="gaowen", role_name="高文")
@@ -95,11 +96,12 @@ class PointerSegmentTest(unittest.TestCase):
         self.assertEqual(units[0].kind, "dialogue")
         self.assertEqual(units[0].role_id, "gaowen")
 
-    def test_dialogue_edit_flagged(self):
-        unit = make_unit("千万不要。", kind="dialogue", role_id="gaowen", role_name="高文")
-        client = FakeClient(payload(("千万不要。", "", "千万别。")))
+    def test_dialogue_word_edit_reverted(self):
+        unit = make_unit("千万不要做出失礼之事。", kind="dialogue", role_id="gaowen", role_name="高文")
+        client = FakeClient(payload(("千万不要做出失礼之事。", "", "千万不要做出无礼之事。")))
         units = seg([unit], client, max_seconds=0.1)
-        self.assertIn("dialogue_edited", units[0].flags)
+        self.assertEqual(units[0].tts_text, "千万不要做出失礼之事。")
+        self.assertIn("dialogue_reverted", units[0].flags)
 
     def test_bad_anchor_flagged(self):
         text = "第一句。第二句。"

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 
-TTS_MAX_SECONDS = float(os.environ.get("AUDIOBOOK_TTS_MAX_SECONDS", "28"))
+TTS_MAX_SECONDS = float(os.environ.get("AUDIOBOOK_TTS_MAX_SECONDS", "20"))
 
 # Flags that mean "don't merge this row" (the text/attribution is uncertain).
 BLOCK_MERGE_FLAGS = {"source_mismatch", "anchor_failed", "over_length", "unresolved_role"}
