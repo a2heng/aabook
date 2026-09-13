@@ -54,11 +54,40 @@ def _apply_dit_bf16() -> None:
     CFMEdit.to = to
 
 
+class _DropNoise(logging.Filter):
+    """Drop the per-layer bitsandbytes quantization spam from the root log."""
+
+    _NEEDLES = ("MatMul8bitLt", "inputs will be cast")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not any(needle in message for needle in self._NEEDLES)
+
+
+def _quiet_logs() -> None:
+    # bitsandbytes logs one warning per quantized layer (thousands of lines).
+    for name in list(logging.root.manager.loggerDict):
+        if name.startswith("bitsandbytes"):
+            logging.getLogger(name).setLevel(logging.ERROR)
+    logging.getLogger("bitsandbytes").setLevel(logging.ERROR)
+
+    root = logging.getLogger()
+    if not any(isinstance(existing, _DropNoise) for existing in root.filters):
+        root.addFilter(_DropNoise())
+    try:
+        from transformers.utils import logging as hf_logging
+
+        hf_logging.set_verbosity_error()
+    except Exception:  # noqa: BLE001 - optional
+        pass
+
+
 def apply_patches() -> None:
     """Idempotently install all runtime patches."""
     global _APPLIED
     if _APPLIED:
         return
+    _quiet_logs()
     _apply_qwen_8bit()
     _apply_dit_bf16()
     _APPLIED = True

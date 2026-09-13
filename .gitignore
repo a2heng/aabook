@@ -5,6 +5,7 @@ __pycache__/
 ckpts/
 assets/voice-reference/
 outputs/
+.cache/
 *.log
 opencode.json
 assets

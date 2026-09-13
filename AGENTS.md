@@ -10,13 +10,24 @@
 - 启动 WebUI：`source .venv/bin/activate && python run.py`（`run.py` 设置 `sys.path`：`vendor` → `third_party/AuK/src` → 外层根）。
 - 直接跑源码：`PYTHONPATH=third_party/AuK/src:. .venv/bin/python ...`（无需 `pip install -e .`）。
 - ckpts 与 `assets/voice-reference` 在外层；demo 音频在子模块 `third_party/AuK/assets`（`app.infer_gradio.submodule_path`）。
+- **有声书流水线（`audiobook/` + `scripts/`）**：小说 TXT → `script.csv` → 逐段渲染 → 母带。详见 `docs/audiobook-workflow.md`。
+  - 前端：`cleaning`（清洗/引号修复）、`cast`（抽样发现 + 确定性/LLM 合并）、`extract`（引号边界切句段 + 标签法抽取）、`agent`（单次批量兜底歧义行）、`canonical`（role 归一）、`stats`（角色分布，只计会说话者）、`pipeline`；CLI `scripts/build_script.py`、`scripts/role_stats.py`。
+  - 后端：`voicebank`（instruct 造参考音 → whisper ASR → 克隆）、`renderer`（AuK `zero_shot_tts` 逐行，可续跑）、`assembler`（拼接 + -14 LUFS）；CLI `scripts/build_voicebank.py`、`scripts/render_book.py`。参考音准备：`scripts/prepare_refs.py`（24kHz 单声道、≤12s、去静音）。
+  - 输出统一在 `outputs/<book>/`；LLM 缓存 `.cache/llm/`；两者均已 gitignore。
+  - 局域网浏览/试听：`scripts/serve_files.py`，systemd `auk-files.service`（`:8899`）。
 
 ## 命令执行规约（重要：避免「卡住」）
 
 1. **禁止对长命令使用 `| head` / `| tail` 截断**。管道会缓冲输出，看起来像卡死。
    - 需要完整输出就直接输出（工具会把超长内容写入文件）。
-   - 长时间任务改为后台 + 日志 + 轮询：
-     `cmd > /tmp/opencode/xxx.log 2>&1 &`，随后用 Read 读该日志，直到出现结束标志。
+   - 长时间任务改为后台 + 日志 + 轮询，且**必须完全脱离本会话**：
+     `setsid --fork nohup cmd </dev/null > /tmp/opencode/xxx.log 2>&1 & disown`
+     随后用 Read 读该日志，直到出现结束标志。
+   - **根因**：opencode 用 `bash -c` 执行命令，**stdout/stderr 是 unix socket（不是 tty）**，工具一直读到该 socket EOF 才认为命令结束。任何后代进程只要还持有这个 socket，命令就永不「结束」→ 假死。
+   - **两个必踩的坑**：
+     1. `setsid` **必须加 `--fork`**。非交互 bash 无 job control，不加 `--fork` 时 `setsid` 直接 exec 成长任务，不会 daemonize。
+     2. 别写 `cd X && setsid ... cmd &`：`&` 会把整个 `cd && setsid ...` 变成一个**子 shell 异步列表**，子 shell 会**等它的前台子进程**（即长任务），于是子 shell 攥着 socket 不放。应在后台命令前用 `;` 或先单独 `cd`。
+   - **自检**：正确脱离后，子进程应为 `fd0=/dev/null`、`fd1=fd2=日志文件`、`ppid=1`、独立 `sid`。用 `pgrep -x <comm>` 精确定位进程；**别用 `pgrep -f <pattern>`**，它会匹配到 bash -c 包装进程自身（或当前命令行），导致看错对象。（`watch nvidia-smi` 那种是用户自己终端里的常驻命令，不是卡死，先分清。）
 2. **所有可能联网/加载大模型的命令显式加 `timeout <秒>`**，禁止给单条命令设置几十分钟的超时。
 3. **凡导入 torch / transformers / gradio 或触发模型下载，统一带上环境变量**：
    ```
@@ -30,6 +41,14 @@
 5. **模型（faster-whisper Whisper/VAD、Qwen2.5-Omni）预先下载到本地缓存**，不要让运行时懒下载；参考 `scripts/download_models.py`。
 6. **pip 安装**用后台 + 日志轮询，装完必须 `pip check`。
 7. 长任务结束/中断后，**清理遗留后台进程**（`jobs`/`kill`）。
+8. **`pkill -f <pattern>` 要小心**：pattern 会匹配到当前这条命令行自身，可能把正在执行的 shell 一起杀掉；先 `pgrep -af` 看精确 PID 再 kill。
+
+## 经验/踩坑（持续补充）
+
+- **判断「卡死」先分清性质**：多是 opencode 在等后台进程交还 stdin 管道（见规约 1），不是进程真死；先在另一个命令里 `pgrep -af` / `ps` 核实。
+- **hf-mirror 下载**：`huggingface_hub` 直连 `https://hf-mirror.com` 可用（免代理）；`HF_ENDPOINT` 在**进程启动时**读取，改了要重启脚本。大文件用 `hf_hub_download`（自带 `.incomplete` 断点续传），失败可重试续传，别删 `.incomplete`。
+- **GGUF 只下主权重**：`imatrix_*.gguf` 仅在量化时用、`mmproj-*.gguf` 是视觉投影、`config.json`/`README` 是 Hub 元数据，llama.cpp 推理都不需要。
+- **不要在正在写入的大文件上跑 `find`/`grep`/`ls -R`**：会放大 I/O 等待，看起来像卡住。
 
 ## 验证与代码风格
 
@@ -42,6 +61,7 @@
   需要格式化时用 `ruff format <files>`。
 - 不要提交密钥；`.env` 不进版本库。
 - 除非用户明确要求，不要提交 git commit。
+- **所有构建/渲染输出一律写在项目内 `outputs/`**（如 `outputs/<book>/`），不要写 `/tmp`；`outputs/` 与 `.cache/` 已在 `.gitignore`。
 
 ## 关键约定
 
