@@ -34,6 +34,7 @@ from audiobook.llm import LLMClient, config_from_env  # noqa: E402
 from audiobook.marks import (  # noqa: E402
     MARK_OPEN,
     MARK_SEP,
+    live_fragments,
     parse_marks,
     render_diff_html,
     render_html,
@@ -170,7 +171,9 @@ def resolve_label(roster: dict[str, list[str]], name: str) -> str:
     return name
 
 
-def run_turn(client, config, tools, mcp, messages, max_steps, counters, live: Live | None = None, chapter: int = 0) -> None:
+def run_turn(
+    client, config, tools, mcp, messages, max_steps, counters, live: Live | None = None, chapter: int = 0, original: str = ""
+) -> None:
     """Tool loop until the model stops calling tools. Guards against a failing retry loop."""
     errors = 0
     last_sig, repeats, fail_total = "", 0, 0
@@ -221,7 +224,7 @@ def run_turn(client, config, tools, mcp, messages, max_steps, counters, live: Li
                     "result", chapter=chapter, ok=('"ok": false' not in result and "not found" not in result), result=result[:500]
                 )
                 current = json.loads(mcp.call("get_marked", {}))["text"]
-                live.set_state(chapter, len(current), parse_marks(current))
+                live.set_state(chapter, len(current), live_fragments(original, current))
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
             if '"ok": false' in result or "not found" in result:
                 fail_total += 1
@@ -273,11 +276,16 @@ def main() -> None:
     for cid in ids:
         target = out_dir / f"ch{cid:03d}.marked.txt"
         if target.is_file() and not args.force:  # resumable: skip chapters already marked
+            if not (out_dir / f"ch{cid:03d}.json").is_file():  # backfill canvas state for the picker
+                done = target.read_text(encoding="utf-8")
+                live.set_state(
+                    cid, len(done), live_fragments((chapters / f"ch{cid:03d}.txt").read_text(encoding="utf-8"), done), done=True
+                )
             print(f"[skip] ch{cid:03d} 已存在", flush=True)
             continue
         text = (chapters / f"ch{cid:03d}.txt").read_text(encoding="utf-8")
         live.emit("chapter", chapter=cid, chars=len(text))
-        live.set_state(cid, len(text), parse_marks(text))
+        live.set_state(cid, len(text), live_fragments(text, text))
         added = maintain_roster(llm, roster, text)  # mine characters when the big text is injected
         live.emit("roster", chapter=cid, added=added, roles=len(roster))
         system = (THINK_TOKEN if THINK else "") + SYSTEM + "\n\n" + dict_text(roster, text)
@@ -296,6 +304,7 @@ def main() -> None:
             counters,
             live,
             cid,
+            text,
         )
         for _ in range(3):  # completeness: re-feed leftover quotes until none remain
             left = unmarked_quotes(json.loads(mcp.call("get_marked", {}))["text"])
@@ -318,6 +327,7 @@ def main() -> None:
                 counters,
                 live,
                 cid,
+                text,
             )
         snapshot = json.loads(mcp.call("get_marked", {}))["text"]
         for seg in parse_marks(snapshot):  # normalise any label/alias to the canonical name
@@ -333,6 +343,7 @@ def main() -> None:
         left = len(unmarked_quotes(snapshot))
         phases.append({"chapter": cid, "chars": len(snapshot), "leftover": left, "roles": len(roster)})
         print(f"[{args.mode}] ch{cid:03d} chars={len(snapshot)} leftover={left} 词条={len(roster)}", flush=True)
+        live.set_state(cid, len(snapshot), live_fragments(text, snapshot), done=True)
         live.emit("done", chapter=cid, leftover=left, roles=len(roster), summary=summary)
     (out_dir / "summary.txt").write_text(summary, encoding="utf-8")
 

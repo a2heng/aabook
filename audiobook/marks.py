@@ -88,6 +88,64 @@ def render_html(segments: list[dict], marked: str, path) -> None:
     )
 
 
+def live_fragments(original: str, current: str) -> list[dict]:
+    """Inline display fragments for the live canvas (continuous text + overlays).
+
+    Diff original vs current so every change is visible in place:
+    - ``speech``    ⦃role␟…⦄ content -> role card (marker syntax hidden);
+    - ``deleted``   characters gone from the original (struck through);
+    - ``inserted``  new characters (e.g. a comma at a breath point);
+    - ``narration`` untouched text.
+    """
+    import difflib
+
+    fragments: list[dict] = []
+    role: str | None = None
+
+    def push(kind: str, text: str) -> None:
+        if not text:
+            return
+        last = fragments[-1] if fragments else None
+        if last and last["kind"] == kind and last.get("role") == role:
+            last["text"] += text
+        else:
+            item: dict = {"kind": kind, "text": text}
+            if kind == "speech":
+                item["role"] = role or ""
+            fragments.append(item)
+
+    def scan(text: str, default: str) -> None:  # walk a current-text chunk, applying marker state
+        nonlocal role
+        index = 0
+        while index < len(text):
+            if text.startswith(MARK_OPEN, index):
+                sep = text.find(MARK_SEP, index)
+                if sep >= 0:
+                    role = text[index + 1 : sep]
+                    index = sep + 1
+                    continue
+            if text.startswith(MARK_CLOSE, index):
+                role = None
+                index += 1
+                continue
+            stops = [pos for pos in (text.find(MARK_OPEN, index), text.find(MARK_CLOSE, index)) if pos >= 0]
+            nxt = min(stops) if stops else len(text)
+            push("speech" if role else default, text[index:nxt])
+            index = nxt
+
+    matcher = difflib.SequenceMatcher(None, original, current, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            scan(current[j1:j2], "narration")
+        elif tag == "delete":
+            push("deleted", original[i1:i2])
+        else:  # insert / replace
+            if tag == "replace":
+                push("deleted", original[i1:i2])
+            scan(current[j1:j2], "inserted")
+    return fragments
+
+
 def render_diff_html(original: str, marked: str, path, title: str = "改后 / 原文对照") -> None:
     """Char-level diff: deletions struck through, insertions highlighted."""
     import difflib
