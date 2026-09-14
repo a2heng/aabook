@@ -20,6 +20,7 @@ to look for are “ ” / 『』「」; straight ASCII quotes are tolerated.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -27,6 +28,7 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_ROOT))
 
 from audiobook.marks import MARK_CLOSE, MARK_OPEN, MARK_SEP  # noqa: E402
+from audiobook.schema import Cast  # noqa: E402
 
 OPEN = "“『「"
 CLOSE = "”』」"
@@ -83,9 +85,17 @@ class ScriptServer:
         if start >= 1 and self.text[start - 1] in OPEN and end < len(self.text) and self.text[end] in CLOSE:
             start -= 1
             end += 1
+        cut = start
+        if cut >= 1 and self.text[cut - 1] == "：":  # drop ONLY a bare 「人名：」
+            k = cut - 1
+            while k > 0 and self.text[k - 1] not in "。！？\n“”‘’「」『』 \t，,；;：":
+                k -= 1
+            name = self.text[k : cut - 1]
+            if self._is_pure_name(name, role):
+                cut = k
         wrapped = f"{MARK_OPEN}{role}{MARK_SEP}{body}{MARK_CLOSE}"
-        self.text = self.text[:start] + wrapped + self.text[end:]
-        self.edits.append({"op": "speak", "role": role, "text": text})
+        self.text = self.text[:cut] + wrapped + self.text[end:]
+        self.edits.append({"op": "speak", "role": role, "text": text, "attribution": cut < start})
         return {"ok": True, "role": role, "spanned": wrapped}
 
     def _delete(self, target: str) -> dict:
@@ -122,6 +132,34 @@ class ScriptServer:
         return {"ok": True}
 
     # ---- helpers -------------------------------------------------------------
+    def _known_names(self) -> set[str]:
+        """All canonical names + labels from the dictionary (roles.json, cast.json fallback)."""
+        book = os.environ.get("AUDIOBOOK_BOOK", "dawn")
+        roles = APP_ROOT / "outputs" / book / "script" / "roles.json"
+        cache_key = str(roles)
+        if getattr(self, "_names_path", None) == cache_key:
+            return self._names_cache
+        names: set[str] = set()
+        if roles.is_file():
+            for canonical, labels in json.loads(roles.read_text(encoding="utf-8")).items():
+                names.add(canonical)
+                names.update(str(label) for label in labels)
+        else:
+            cast_path = APP_ROOT / "outputs" / book / "cast.json"
+            if cast_path.is_file():
+                cast = Cast.load(str(cast_path))
+                for item in cast.roles.values():
+                    names.add(item.name)
+                    names.update(item.aliases)
+        self._names_cache, self._names_path = names, cache_key
+        return names
+
+    def _is_pure_name(self, name: str, role: str) -> bool:
+        """True only for a bare person name (so 「高文：」 is dropped but 「赫蒂抬起头说道：」 is kept)."""
+        if not name or len(name) > 8:
+            return False
+        return name == role or name in self._known_names()
+
     def _find_index(self, needle: str) -> int:
         if not needle:
             return -1
@@ -174,7 +212,7 @@ class ScriptServer:
                 "description": (
                     "唯一改法：单条编辑。op=speak（台词，给 role，去引号；周边旁白/归因保持不动）/ "
                     "delete（只用于去掉非台词引号的引号，尽量不删字）/ "
-                    "replace（把 find 换成 replace：气口处补逗号，或补一句「XXX说道」）。"
+                    "replace（把 find 换成 replace，如气口处补逗号）。"
                 ),
                 "inputSchema": {
                     "type": "object",
