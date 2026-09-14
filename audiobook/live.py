@@ -109,7 +109,7 @@ function renderArticle(s){
 let pending=[];
 function pushChat(e){
   const row=document.createElement('div'); row.className='ev '+e.cls;
-  row.innerHTML='<span class="ico">'+e.icon+'</span>'+(e.chapter?'<span class="chap">ch'+e.chapter+'</span>':'')+e.html;
+  row.innerHTML=(e.icon?'<span class="ico">'+e.icon+'</span>':'')+(e.chapter?'<span class="chap">ch'+e.chapter+'</span>':'')+e.html;
   pending.push(row);
 }
 function flushChat(){
@@ -121,16 +121,16 @@ function flushChat(){
   while(extra-->0)chat.removeChild(chat.firstChild);
 }
 function fmtCall(a){const x=a&&a.args||{};
-  if(x.op==='speak')return '<span class="badge b-speak">speak</span><span class="role">'+esc(x.role||'?')+'</span> <code>'+esc(x.text||'')+'</code>';
-  if(x.op==='delete')return '<span class="badge b-delete">delete</span><code>'+esc(x.text||'')+'</code>';
-  if(x.op==='replace')return '<span class="badge b-replace">replace</span><code>'+esc(x.find||'')+'</code> <span class="sp">→</span> <code>'+esc(x.replace||'')+'</code>';
-  return '<span class="badge b-replace">edit</span><code>'+esc(JSON.stringify(x))+'</code>';}
+  const op=x.op||(x.role?'speak':(x.find!==undefined||x.replace!==undefined)?'replace':'delete');
+  if(op==='speak')return '<span class="badge b-speak">speak</span><span class="role">'+esc(x.role||'?')+'</span> <code>'+esc(x.text||'')+'</code>';
+  if(op==='replace')return '<span class="badge b-replace">replace</span><code>'+esc(x.find||'')+'</code> <span class="sp">→</span> <code>'+esc(x.replace||'')+'</code>';
+  return '<span class="badge b-delete">delete</span><code>'+esc(x.text||'')+'</code>';}
 function handle(e){
   if(e.type==='start'){book.textContent='· '+(e.book||'live');return;}
   if(e.type==='chapter'){current=e.chapter;if(follow)selected=e.chapter;return;}
   if(e.type==='roster'){pushChat({cls:'dict',icon:'✦',chapter:e.chapter,html:'词典 <b>+'+e.added+'</b> 标签 · 词条 '+e.roles});return;}
   if(e.type==='assistant'){pushChat({cls:'think',icon:'🧠',chapter:e.chapter,html:'<details><summary>思考</summary>'+esc(e.content)+'</details>'});return;}
-  if(e.type==='tool'){pushChat({cls:'call',icon:'✎',chapter:e.chapter,html:fmtCall(e.args)});return;}
+  if(e.type==='tool'){pushChat({cls:'call',chapter:e.chapter,html:fmtCall(e.args)});return;}
   if(e.type==='result'){pushChat({cls:'res '+(e.ok?'ok':'bad'),icon:e.ok?'✓':'✗',chapter:e.chapter,html:esc(e.result)});return;}
   if(e.type==='done'){pushChat({cls:'sum',icon:'📝',chapter:e.chapter,html:'<b>本章完成</b> <span class="sp">'+esc(e.summary||'')+'</span>'});return;}}
 function handleText(txt){
