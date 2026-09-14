@@ -4,7 +4,6 @@
 One resumable entry point over every stage; each stage can be run alone:
 
     prepare   clean + split the source txt          -> outputs/<book>/{source,clean}.txt + chapters/
-    roster    frequency -> LLM filter -> re-scan    -> outputs/<book>/roster.json + cast.json
     script    one-edit-at-a-time stage-play marking  -> outputs/<book>/script/chNNN.marked.txt (+roles.json)
     convert   marked text -> script.csv (no LLM)     -> outputs/<book>/script.csv
     render    AuK zero-shot TTS per row + assembly   -> outputs/<book>/render/{rows,chapters,book.wav}
@@ -29,8 +28,8 @@ from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 PY = str(APP_ROOT / ".venv" / "bin" / "python")
-STAGES = ("prepare", "roster", "script", "convert", "render")
-LLM_STAGES = {"roster", "script"}
+STAGES = ("prepare", "script", "convert", "render")
+LLM_STAGES = {"script"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,10 +37,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input", help="source .txt")
     parser.add_argument("--book", required=True, help="book name (outputs/<book>)")
     parser.add_argument("--out", default=None, help="override output root")
-    parser.add_argument("--voices", default="outputs/refs_bwe", help="optimized reference wav directory")
     parser.add_argument(
         "--stages",
-        default="prepare,roster,script,convert,render",
+        default="prepare,script,convert,render",
         help=f"comma list of {STAGES}",
     )
     parser.add_argument("--llm-base-url", default=os.environ.get("AUDIOBOOK_LLM_BASE_URL", "http://127.0.0.1:8080/v1"))
@@ -166,29 +164,6 @@ def main() -> None:
         _run(
             [PY, "scripts/build_book.py", args.input, "--out", str(out), "--prepare-only"],
             log_path=logs_dir / "prepare.log",
-        )
-
-    if "roster" in stages:
-        _run(
-            [
-                PY,
-                "scripts/finalize_roster.py",
-                str(out / "chapters"),
-                "--out",
-                str(out / "roster.json"),
-                "--cast-out",
-                str(out / "cast.json"),
-                "--voices",
-                args.voices,
-                "--min-count",
-                "5",
-                "--top",
-                "800",
-                "--batch",
-                "35",
-            ],
-            env=llm_env,
-            log_path=logs_dir / "roster.log",
         )
 
     if "script" in stages:

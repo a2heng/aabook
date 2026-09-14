@@ -11,22 +11,21 @@
 - 直接跑源码：`PYTHONPATH=third_party/AuK/src:. .venv/bin/python ...`（无需 `pip install -e .`）。
 - ckpts 与 `assets/voice-reference` 在外层；demo 音频在子模块 `third_party/AuK/assets`（`app.infer_gradio.submodule_path`）。
 - **有声书流水线（`audiobook/` + `scripts/`）**：小说 TXT → 舞台剧本 → `script.csv` → 逐段渲染 → 母带。详见 `docs/audiobook-workflow.md`。
-  - **完整流程（唯一入口）**：`scripts/run_book.py <txt> --book <name>`，stages=`prepare → roster → script → convert → render`（可续跑，自动起停本地 LLM）：
+  - **完整流程（唯一入口）**：`scripts/run_book.py <txt> --book <name>`，stages=`prepare → script → convert → render`（可续跑，自动起停本地 LLM）：
     1. **prepare**（`build_book.py --prepare-only`）：清洗/规范化/切章 → `outputs/<book>/{source,clean}.txt` + `chapters/chNNN.txt`。
-    2. **roster**（`finalize_roster.py`）：频率发现 → LLM 筛人名 → 全书复扫 → `roster.json`；固定前 10 主角 `main_cast.json` + 声线 → `cast.json`。
-    3. **script**（**`scripts/mark_script.py`，唯一路径**）：逐章 → 舞台剧台本（见下）。
-    4. **convert**（`scripts/marks_to_script.py --marked-dir`）：`⦃角色␟内容⦄` 机械解析（无 LLM）→ `script.csv`/`script.json`。
-    5. **render**（`scripts/render_book.py`）：AuK `zero_shot_tts` 逐行合成 + 拼接 → `outputs/<book>/render/`。
+    2. **script**（**`scripts/mark_script.py`，唯一路径**）：逐章 → 舞台剧台本；**不做频率发现、不预置人名表**，人物词典在逐章标注中**增量维护**（见下）。
+    3. **convert**（`scripts/marks_to_script.py --marked-dir`）：`⦃角色␟内容⦄` 机械解析（无 LLM）→ `script.csv`/`script.json`；cast 缺省时由 `script/roles.json` 回退构造（声线留到 TTS 阶段）。
+    4. **render**（`scripts/render_book.py`）：AuK `zero_shot_tts` 逐行合成 + 拼接 → `outputs/<book>/render/`。
   - **标记约定**：台词 = `⦃角色名␟朗读内容⦄`（罕见符号 U+2983/U+241F/U+2984，可用 `AUDIOBOOK_MARK_OPEN/CLOSE/SEP` 覆盖），标记外一律旁白；解析/渲染在 `audiobook/marks.py`。
   - **剧本标注（唯一路径，`scripts/mark_script.py`）**：
     - 模型只当「阅读文本→舞台剧台本」的编剧，**只有一个 `edit` 工具**（`op=speak/delete/replace`），逐处一次调用、定位片段 ≤6 字；**去引号、删多余「名字：」归因、气口处加逗号都由 MCP 代码机械执行**（不做语义判断）。
-    - **一对多人物词典**（规范名 → 称呼/绰号/代称等标签），**不要路人**；**每章开头先 `maintain_roster` 做人物提取/挖掘**维护词典，`speak` 的 role 一律写规范名，标注后把标签归一为规范名。次要人物不在此路人化，留到 TTS 阶段做。
+    - **一对多人物词典**（规范名 → 称呼/绰号/代称等标签），**不要路人**，也**不预置/不带入固定人名表**（冷启动为空，只从 `script/roles.json` 续跑）；**每章开头先 `maintain_roster` 做人物提取/挖掘**维护词典，`speak` 的 role 一律写规范名，标注后把标签归一为规范名；每章末落一次 `roles.json`。次要人物不在此路人化，留到 TTS 阶段做。
     - **滚动压缩（`--mode seq`）**：始终只维护**一条逻辑对话**。每章上下文 = `system`（编剧提示词 + 人物词典）+ `user`（**前情摘要** + 本章正文）；章内跑完整 tool-loop，**章末调用 `compress()`**：用「上一版摘要 + 本章出场角色（`parse_marks`）+ 本章正文」让 LLM 产出新的**滚动摘要（≤400 字，写 `summary.txt`）**，只保留对判断「谁在说话」有用的信息（新人物、身份、关系、称呼变化、剧情要点）。下一章只带两样耐久记忆：**人物词典**与**前情摘要**，上一章正文与全部工具调用丢弃。
     - **补漏**：章末 `unmarked_quotes` 找出未处理引号，回炉重标直到 0。
     - MCP 原语（仅 `set_text`/`edit`/`get_marked`）在 `scripts/script_mcp_server.py`，客户端 `audiobook/mcp.py`。
     - 产物：`outputs/<book>/script/{chNNN.marked.txt, roles.json, summary.txt, *.html(段落表+diff)}`。
   - **预处理**：`cleaning`（编码/引号/去页码）+ `textnorm.clean_for_llm`（**通用字符白名单**：只留 L/N/P/M 类别，LLM 前生效）。站点广告/元数据在输入 txt 层一次性删除。
-  - **适用范围**：目前只在一部中文网文（本地示例语料）上验证过；换小说需重写「人物脚本」提示词（`scripts/finalize_roster.py` 的 `CLASSIFY/ENRICH/MERGE_SYSTEM` 与 `scripts/mark_script.py` 的 `SYSTEM/ROSTER_SYSTEM` 示例）并重建人物词典，其它阶段通用。
+  - **适用范围**：目前只在一部中文网文（本地示例语料）上验证过；换小说需重写「人物脚本」提示词（`scripts/mark_script.py` 的 `SYSTEM/ROSTER_SYSTEM` 示例），其它阶段通用。（`finalize_roster.py`/`namefinder` 等频率发现路径已不再进入主流程。）
   - 后端：`voicebank`（instruct 造参考音 → whisper ASR → 克隆）、`renderer`（AuK `zero_shot_tts` 逐行，可续跑）、`assembler`（拼接 + -14 LUFS）；CLI `scripts/build_voicebank.py`、`scripts/render_book.py`。参考音准备：`scripts/prepare_refs.py`（24kHz 单声道、≤12s、去静音）。
   - 输出统一在 `outputs/<book>/`；LLM 缓存 `.cache/llm/`；两者均已 gitignore。
   - 局域网浏览/试听：`scripts/serve_files.py`，systemd `auk-files.service`（`:8899`）。

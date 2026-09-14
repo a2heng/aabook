@@ -14,6 +14,7 @@ Whole book (all chNNN.marked.txt in a directory -> one combined script):
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -22,7 +23,17 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_ROOT))
 
 from audiobook.marks import parse_marks, to_script_rows  # noqa: E402
-from audiobook.schema import Cast, write_script, write_script_json  # noqa: E402
+from audiobook.schema import Cast, Role, write_script, write_script_json  # noqa: E402
+
+
+def cast_from_roles(roles_path: Path) -> Cast:
+    """Build a cast from the incremental one-to-many dictionary (voices assigned later)."""
+    data = json.loads(roles_path.read_text(encoding="utf-8"))
+    cast = Cast()
+    for name, labels in data.items():
+        cast.add(Role(role_id=name, name=name, aliases=[label for label in labels if label and label != name]))
+    cast.narrator()
+    return cast
 
 CHAPTER_RE = re.compile(r"ch(\d+)")
 
@@ -36,7 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert marked text to a script")
     parser.add_argument("marked", nargs="?", help="a single marked text file")
     parser.add_argument("--marked-dir", default=None, help="directory of chNNN.marked.txt (whole book)")
-    parser.add_argument("--cast", default="outputs/dawn/cast.json")
+    parser.add_argument("--cast", default="outputs/dawn/cast.json", help="cast.json; falls back to --roles")
+    parser.add_argument("--roles", default=None, help="roles.json (the incremental dictionary) when cast.json is absent")
     parser.add_argument("--out", required=True, help="output dir (script.csv/json)")
     parser.add_argument("--chapter-id", type=int, default=0)
     parser.add_argument("--chapter-title", default="")
@@ -45,8 +57,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    cast = Cast.load(args.cast)
     out = Path(args.out)
+    cast_path = Path(args.cast)
+    roles_path = Path(args.roles) if args.roles else (Path(args.marked_dir) / "roles.json" if args.marked_dir else None)
+    if cast_path.is_file():
+        cast = Cast.load(cast_path)
+    elif roles_path and roles_path.is_file():
+        cast = cast_from_roles(roles_path)
+    else:
+        raise SystemExit(f"missing {cast_path} and no roles.json fallback")
     out.mkdir(parents=True, exist_ok=True)
 
     if args.marked_dir:

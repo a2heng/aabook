@@ -40,7 +40,6 @@ from audiobook.marks import (  # noqa: E402
     unmarked_quotes,
 )
 from audiobook.mcp import MCPClient  # noqa: E402
-from audiobook.schema import Cast  # noqa: E402
 
 SYSTEM = """你是把「阅读文本」改编成「舞台剧台本」的编剧：人物说出的台词要标出发言角色，旁白原样保留，最终交机器朗读。
 **你只有一个工具 `edit`，每次只改一处（单条 edit）**。定位片段**最多 6 个字**（能唯一确定即可）；抄整句一定失败。
@@ -82,28 +81,28 @@ def parse_args() -> argparse.Namespace:
         help="seq=reuse one annotation context across chapters; sep=fresh per chapter",
     )
     parser.add_argument("--max-steps", type=int, default=200, help="tool steps per chapter")
+    parser.add_argument("--force", action="store_true", help="redo chapters that already have a marked file")
     return parser.parse_args()
 
 
 def load_roster(book: str) -> dict[str, list[str]]:
-    """Seed the dictionary from the fixed cast (canonical -> labels)."""
-    path = APP_ROOT / "outputs" / book / "cast.json"
+    """Resume the one-to-many dictionary from ``script/roles.json`` (empty on a cold start).
+
+    No cast is preloaded: the dictionary is grown incrementally, chapter by chapter, so the
+    model can only use names it actually met in the text.
+    """
+    path = APP_ROOT / "outputs" / book / "script" / "roles.json"
     if not path.is_file():
         return {}
-    cast = Cast.load(str(path))
-    roster: dict[str, list[str]] = {}
-    for role in cast.roles.values():
-        if role.kind == "narrator":
-            continue
-        roster[role.name] = [label for label in [role.name, *role.aliases] if label]
-    return roster
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return {name: [label for label in labels if label] for name, labels in data.items()}
 
 
-def dict_text(roster: dict[str, list[str]], chapter_text: str, always: list[str]) -> str:
-    """Inline the dictionary, keeping every label that appears in this chapter (+ mains)."""
+def dict_text(roster: dict[str, list[str]], chapter_text: str) -> str:
+    """Inline only the dictionary entries whose labels appear in this chapter."""
     lines = []
     for name, labels in roster.items():
-        if name in always or any(label and label in chapter_text for label in labels):
+        if any(label and label in chapter_text for label in labels):
             lines.append(f"{name}（{'、'.join(dict.fromkeys(labels))}）")
     return "人物词典（规范名（标签…），role 只能写规范名）：\n- " + "\n- ".join(lines)
 
@@ -247,19 +246,25 @@ def main() -> None:
     chapters = APP_ROOT / "outputs" / args.book / "chapters"
     out_dir = APP_ROOT / "outputs" / args.book / "script"
     out_dir.mkdir(parents=True, exist_ok=True)
-    ids = [cid for cid in range(args.chapter, args.chapter + args.count) if (chapters / f"ch{cid:03d}.txt").is_file()]
+    if args.count > 0:
+        ids = [cid for cid in range(args.chapter, args.chapter + args.count) if (chapters / f"ch{cid:03d}.txt").is_file()]
+    else:  # count<=0 -> every chapter from `chapter` to the end
+        ids = [cid for cid in sorted(int(p.stem[2:]) for p in chapters.glob("ch*.txt")) if cid >= args.chapter]
 
     roster = load_roster(args.book)
-    always = list(roster)
     counters = {"llm_s": 0.0, "llm_calls": 0, "tool_calls": 0}
     started = time.perf_counter()
     phases: list[dict] = []
     summary = ""  # seq: one rolling conversation, compressed after every chapter
 
     for cid in ids:
+        target = out_dir / f"ch{cid:03d}.marked.txt"
+        if target.is_file() and not args.force:  # resumable: skip chapters already marked
+            print(f"[skip] ch{cid:03d} 已存在", flush=True)
+            continue
         text = (chapters / f"ch{cid:03d}.txt").read_text(encoding="utf-8")
         maintain_roster(llm, roster, text)  # mine characters when the big text is injected
-        system = (THINK_TOKEN if THINK else "") + SYSTEM + "\n\n" + dict_text(roster, text, always)
+        system = (THINK_TOKEN if THINK else "") + SYSTEM + "\n\n" + dict_text(roster, text)
         preface = f"【前情摘要】\n{summary}\n\n" if (args.mode == "seq" and summary) else ""
         mcp.call("set_text", {"text": text})
         run_turn(
@@ -302,6 +307,7 @@ def main() -> None:
             if canonical != seg["role_name"]:
                 snapshot = snapshot.replace(f"{MARK_OPEN}{seg['role_name']}{MARK_SEP}", f"{MARK_OPEN}{canonical}{MARK_SEP}")
         (out_dir / f"ch{cid:03d}.marked.txt").write_text(snapshot, encoding="utf-8")
+        (out_dir / "roles.json").write_text(json.dumps(roster, ensure_ascii=False, indent=2), encoding="utf-8")
         if args.mode == "seq":  # archive + compress the conversation before the next chapter
             summary = compress(llm, summary, text, snapshot)
         left = len(unmarked_quotes(snapshot))
