@@ -71,6 +71,12 @@ class ScriptServer:
     # ---- primitives ----------------------------------------------------------
     def _mark_speaker(self, text: str, role: str) -> dict:
         span = self._locate(text, strip=True)
+        if span is None and len(text) > 8:
+            # Long speech: the model cannot reproduce it verbatim. Anchor on the opening
+            # words and let the locator expand to the whole quoted span.
+            span = self._locate(text[:8], strip=True)
+        if span is None and len(text) > 4:
+            span = self._locate(text[:4], strip=True)
         if span is None:
             return {"ok": False, "reason": "not found", "text": text}
         start, end = span
@@ -164,6 +170,14 @@ class ScriptServer:
         if index < 0:
             return None
         start, end = index, index + len(text)
+        if self.text[start : start + 1] in OPEN:  # anchor starts at the opening quote: expand
+            close_index = -1
+            for char in CLOSE:
+                pos = self.text.find(char, end)
+                if pos >= 0 and (close_index < 0 or pos < close_index):
+                    close_index = pos
+            if close_index >= 0:
+                return start, close_index + 1
         if strip and start > 0 and self.text[start - 1] in OPEN:
             close_index = -1
             for char in CLOSE:

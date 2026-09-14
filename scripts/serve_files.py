@@ -80,8 +80,12 @@ class FileBrowser(SimpleHTTPRequestHandler):
         # Short alias: /live -> the marking live page (default book "dawn", ?book= to switch).
         parsed = urlparse(self.path)
         if parsed.path.rstrip("/") == "/live":
-            book = parse_qs(parsed.query).get("book", ["dawn"])[0]
-            target = Path(self.directory) / "outputs" / book / "script" / "live.html"
+            book = parse_qs(parsed.query).get("book", [""])[0]
+            if book:
+                target = Path(self.directory) / "outputs" / book / "script" / "live.html"
+            else:  # no book given: follow the most recently updated live page
+                pages = list((Path(self.directory) / "outputs").glob("*/script/live.html"))
+                target = max(pages, key=lambda item: item.stat().st_mtime) if pages else Path("/nonexistent")
             if target.is_file():
                 data = target.read_bytes()
                 self.send_response(HTTPStatus.OK)

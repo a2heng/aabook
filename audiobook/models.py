@@ -72,6 +72,18 @@ PROFILES: dict[str, ModelProfile] = {
         thinking_system_token="<|think|>",
         notes="12B unified, QAT UD-Q4_K_XL; MTP draft at ckpts/llm/MTP/mtp-gemma-4-12B-it-Q8_0.gguf.",
     ),
+    "gemma-4-26b-a4b": ModelProfile(
+        key="gemma-4-26b-a4b",
+        repo="unsloth/gemma-4-26B-A4B-it-qat-GGUF",
+        gguf="ckpts/llm/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
+        arch="gemma4",
+        context=131072,
+        temperature=1.0,
+        top_p=0.95,
+        top_k=64,
+        thinking_system_token="<|think|>",
+        notes="26B-A4B MoE (~4B active), QAT UD-Q4_K_XL; MTP draft at ckpts/llm/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf.",
+    ),
     "gemma-4-e2b": ModelProfile(
         key="gemma-4-e2b",
         repo="google/gemma-4-E2B-it",

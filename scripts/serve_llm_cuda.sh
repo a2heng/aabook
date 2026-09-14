@@ -31,6 +31,11 @@ SPEC="${AUDIOBOOK_LLM_SPEC-draft-mtp}"
 
 DRAFT="${AUDIOBOOK_LLM_DRAFT:-}"
 NM=${AUDIOBOOK_LLM_SPEC_DRAFT_N_MAX:-3}
+NCMOE="${AUDIOBOOK_LLM_N_CPU_MOE:-}"          # keep MoE experts of the first N layers on CPU
+BATCH="${AUDIOBOOK_LLM_B:-2048}"
+UBATCH="${AUDIOBOOK_LLM_UB:-512}"
+moe_args=()
+if [ -n "$NCMOE" ]; then moe_args=(-ncmoe "$NCMOE"); fi
 spec_args=()
 if [ -n "$SPEC" ]; then
   spec_args=(--spec-type "$SPEC" --spec-draft-n-max "$NM" --spec-draft-type-k "$KV" --spec-draft-type-v "$KV")
@@ -44,6 +49,6 @@ exec "$BIN/llama-server" \
   -m "$MODEL" --host 127.0.0.1 --port "$PORT" --jinja \
   -np 1 --ctx-checkpoints 0 --no-cache-idle-slots \
   --reasoning-format deepseek --reasoning-budget "$BUDGET" \
-  -ngl "$NGL" -c "$CTX" -b 2048 -ub 512 \
+  -ngl "$NGL" -c "$CTX" -b "$BATCH" -ub "$UBATCH" \
   -ctk "$KV" -ctv "$KV" \
-  "${draft_args[@]}" "${spec_args[@]}"
+  "${moe_args[@]}" "${draft_args[@]}" "${spec_args[@]}"
