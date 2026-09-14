@@ -33,7 +33,8 @@ header{height:52px;display:flex;gap:16px;align-items:center;padding:0 18px;borde
 .brand{font-weight:700}.brand small{color:var(--dim);font-weight:400;margin-left:8px}
 .bar{flex:1;max-width:300px;height:8px;border-radius:99px;background:#222b39;overflow:hidden}
 .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#3d7bff,#5aa9ff,#7ee0ff);transition:width .4s}
-.stat{display:flex;gap:14px;font-size:12.5px;color:var(--dim);white-space:nowrap}.stat b{color:var(--fg)}
+.stat{display:flex;gap:14px;font-size:12.5px;color:var(--dim);white-space:nowrap;font-variant-numeric:tabular-nums}
+.stat b{color:var(--fg)}.stat span{min-width:64px;display:inline-block}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok);display:inline-block}
 #main{display:grid;grid-template-columns:1fr 380px;height:calc(100vh - 52px)}
 #left{display:flex;flex-direction:column;min-width:0;min-height:0;border-right:1px solid var(--line)}
@@ -88,7 +89,12 @@ const article=document.getElementById('article'), chat=document.getElementById('
 const book=document.getElementById('book'),prog=document.getElementById('prog'),doneEl=document.getElementById('done'),
  totalEl=document.getElementById('total'),editsEl=document.getElementById('edits'),errsEl=document.getElementById('errs'),
  status=document.getElementById('status'),followBtn=document.getElementById('follow'),finfo=document.getElementById('finfo');
-let offset=0,total=0,edits=0,errs=0, follow=true, selected=null, current=null, prevSig='', seen=new Set(), idxSig='';
+let offset=0,total=0,doneCount=0,edits=0,errs=0, follow=true, selected=null, current=null, prevSig='', seen=new Set(), idxSig='';
+function setText(el,v){v=String(v);if(el.textContent!==v)el.textContent=v;}
+function updateStats(){
+  setText(totalEl,total||'?'); setText(doneEl,doneCount); setText(editsEl,edits); setText(errsEl,errs);
+  prog.style.width=(total?Math.min(100,doneCount*100/total):0)+'%';
+}
 function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 function fragHTML(f,isNew){const c=isNew?' new':'';
   if(f.kind==='speech')return '<span class="speech'+c+'"><span class="who">'+esc(f.role||'?')+'</span>'+esc(f.text)+'</span>';
@@ -124,20 +130,19 @@ function fmtCall(a){const x=a&&a.args||{};
   if(x.op==='replace')return '<span class="badge b-replace">replace</span><code>'+esc(x.find||'')+'</code> <span class="sp">→</span> <code>'+esc(x.replace||'')+'</code>';
   return '<span class="badge b-replace">edit</span><code>'+esc(JSON.stringify(x))+'</code>';}
 function handle(e){
-  if(e.type==='start'){total=e.total||0;book.textContent='· '+(e.book||'live');return;}
+  if(e.type==='start'){total=e.total||0;book.textContent='· '+(e.book||'live');updateStats();return;}
   if(e.type==='chapter'){current=e.chapter;if(follow){selected=e.chapter;}return;}
   if(e.type==='roster'){pushChat({cls:'dict',icon:'✦',chapter:e.chapter,html:'词典 <b>+'+e.added+'</b> 标签 · 词条 '+e.roles});return;}
   if(e.type==='assistant'){pushChat({cls:'think',icon:'🧠',chapter:e.chapter,html:'<details><summary>思考</summary>'+esc(e.content)+'</details>'});return;}
-  if(e.type==='tool'){pushChat({cls:'call',icon:'✎',chapter:e.chapter,html:fmtCall(e.args)});edits++;editsEl.textContent=edits;return;}
-  if(e.type==='result'){pushChat({cls:'res '+(e.ok?'ok':'bad'),icon:e.ok?'✓':'✗',chapter:e.chapter,html:esc(e.result)});if(!e.ok){errs++;errsEl.textContent=errs;}return;}
-  if(e.type==='done'){total=total||1;doneEl.textContent=(+doneEl.textContent)+1;prog.style.width=Math.min(100,(+doneEl.textContent)*100/(+ (totalEl.textContent)||1))+'%';
-    pushChat({cls:'sum',icon:'📝',chapter:e.chapter,html:'<b>本章完成</b> <span class="sp">'+esc(e.summary||'')+'</span>'});return;}}
+  if(e.type==='tool'){edits++;pushChat({cls:'call',icon:'✎',chapter:e.chapter,html:fmtCall(e.args)});updateStats();return;}
+  if(e.type==='result'){if(!e.ok)errs++;pushChat({cls:'res '+(e.ok?'ok':'bad'),icon:e.ok?'✓':'✗',chapter:e.chapter,html:esc(e.result)});updateStats();return;}
+  if(e.type==='done'){pushChat({cls:'sum',icon:'📝',chapter:e.chapter,html:'<b>本章完成</b> <span class="sp">'+esc(e.summary||'')+'</span>'});return;}}
 async function tickChat(){
   try{const r=await fetch(BASE+'live.jsonl',{headers:{'Range':'bytes='+offset+'-'},cache:'no-store'});
-    if(r.status===416){offset=0;chat.innerHTML='';edits=errs=0;editsEl.textContent=errsEl.textContent=0;}
+    if(r.status===416){offset=0;chat.innerHTML='';pending=[];edits=errs=0;}
     else if(r.status===206||offset===0){const buf=await r.arrayBuffer();offset+=buf.byteLength;
       for(const line of new TextDecoder().decode(buf).split('\n')){if(line.trim()){let e;try{e=JSON.parse(line);}catch(_){continue;}handle(e);}}
-      totalEl.textContent=total||'?';status.textContent=' live';}
+      status.textContent=' live';}
   }catch(err){status.textContent=' waiting…';}
   flushChat();
   setTimeout(tickChat,1200);
@@ -151,9 +156,8 @@ async function tickIndex(){
     if(listKey!==idxSig){idxSig=listKey;                      // rebuild ONLY when the set changes
       chs.innerHTML=ids.map(function(c){var d=idx.chapters[c]&&idx.chapters[c].done?' ✔':'';return '<option value="'+c+'">第 '+c+' 章'+d+'</option>';}).join('');}
     const want=String(selected||cur||''); if(chs.value!==want)chs.value=want;
-    const dn=ids.filter(function(c){return idx.chapters[c].done;}).length;
-    if(doneEl.textContent!=dn)doneEl.textContent=dn;
-    if(totalEl.textContent!=ids.length)totalEl.textContent=ids.length;
+    doneCount=ids.filter(function(c){return idx.chapters[c].done;}).length;   // single source of truth
+    updateStats();
   }catch(err){}
   setTimeout(tickIndex,1500);
 }
