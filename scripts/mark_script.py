@@ -50,8 +50,11 @@ SYSTEM = """你是把「小说」改编成「有声剧台本」的编剧。目�
 - 只有一个工具 `edit`，**一次一处**；改完接着下一处；**禁止一次多条、禁止输出正文**。
 - 定位片段从正文**逐字复制**、**≤6 字**、唯一即可；抄整句必然 "not found"。
 - 通读全章、心里先分清"谁说了哪句"，再逐处处理；改过的地方不要再动。
-- **倒着改（重要）**：从本章**最后一处**开始，往**前**推进（章末 → 章首）。这样前面的改动不会挪动/破坏后面要处理的文字。
-- 定位片段**不要跨越已经标好的 ⦃…⦄**；先做去引号/标台词，最后再统一加逗号。
+- **严格按这个顺序做**（每一步都从前往后扫）：
+  1）**标台词**：把人物说出的台词 speak 出来；
+  2）**去引号**：把不是台词的引号用 delete 去掉；
+  3）**加逗号**：最后统一补逗号、转听感标点（replace）。
+  不要跳步、不要边标台词边加逗号；定位片段不要跨越已标好的 ⦃…⦄。
 
 ## 二、台词怎么标（关键）
 - 人物**说出**的话（引号内）→ `edit(op="speak", text="“引号连内容”", role="规范名")`：
@@ -101,9 +104,9 @@ ROSTER_SYSTEM = """你在维护一部小说的「人物词典」：**规范名 �
 示例：{"高文·塞西尔": ["老祖宗","先祖大人"], "赫蒂": ["姑妈"]}
 """
 
-COMPRESS_SYSTEM = """你在为长篇小说的台本标注任务维护「前情摘要」（相当于把一整条对话压缩成一段）。
-给定「已有摘要」和「本章正文/出场角色」，输出更新后的滚动摘要：一段中文，尽量短（≤400 字）。
-保留对后续判断「谁在说话」有用的信息：新出场人物的身份、称呼、绰号、人物关系、称呼变化、剧情要点。不要复述全文，不要漏掉新人物。
+SUMMARY_SYSTEM = """你在为长篇小说的台本标注维护「前情摘要」（把整条阅读脉络压缩成一段）。
+给定「已有摘要」和「本章正文」，输出更新后的滚动摘要：一段中文，尽量短（≤400 字）。
+保留对判断「谁在说话」有用的信息：新出场人物的身份、人物关系、称呼与绰号、称呼变化、剧情要点。不要复述全文，不要漏掉新人物。
 """
 
 TOOLS = ["edit"]
@@ -177,24 +180,23 @@ def maintain_roster(llm: LLMClient, roster: dict[str, list[str]], chapter_text: 
     return added
 
 
-def compress(llm: LLMClient, summary: str, chapter_text: str, marked: str) -> str:
-    """Archive this chapter and fold it into a short rolling summary (context compression)."""
-    roles = sorted({seg["role_name"] for seg in parse_marks(marked) if seg["kind"] == "speech"})
+def update_summary(llm: LLMClient, summary: str, chapter_text: str) -> str:
+    """Fold this chapter into the rolling summary, AT THE CHAPTER'S START.
+
+    The result is used twice: as reading context for marking this chapter, and as the
+    rolling memory carried into the next one (reused, not recomputed).
+    """
     try:
         return llm.chat(
             [
-                {"role": "system", "content": COMPRESS_SYSTEM},
-                {
-                    "role": "user",
-                    "content": f"【已有摘要】\n{summary or '（无）'}\n\n【本章出场角色】{'、'.join(roles)}\n\n"
-                    f"【本章正文】\n{chapter_text[-4000:]}",
-                },
+                {"role": "system", "content": SUMMARY_SYSTEM},
+                {"role": "user", "content": f"【已有摘要】\n{summary or '（无）'}\n\n【本章正文】\n{chapter_text[-5000:]}"},
             ],
             max_tokens=700,
             thinking=False,
         ).strip()
     except Exception as error:  # noqa: BLE001 - summary is best-effort
-        print(f"  [compress] 失败：{str(error)[:120]}", flush=True)
+        print(f"  [summary] 失败：{str(error)[:120]}", flush=True)
         return summary
 
 
@@ -326,6 +328,8 @@ def main() -> None:
         live.set_state(cid, len(text), live_fragments(text, text))
         added = maintain_roster(llm, roster, text)  # mine characters when the big text is injected
         live.emit("roster", chapter=cid, added=added, roles=len(roster))
+        summary = update_summary(llm, summary, text)  # rolling summary: reused for marking AND next chapter
+        (out_dir / "summary.txt").write_text(summary, encoding="utf-8")
         system = (THINK_TOKEN if THINK else "") + SYSTEM + "\n\n" + dict_text(roster, text)
         preface = f"【前情摘要】\n{summary}\n\n" if (args.mode == "seq" and summary) else ""
         mcp.call("set_text", {"text": text})
@@ -376,8 +380,6 @@ def main() -> None:
                 snapshot = snapshot.replace(f"{MARK_OPEN}{seg['role_name']}{MARK_SEP}", f"{MARK_OPEN}{canonical}{MARK_SEP}")
         (out_dir / f"ch{cid:03d}.marked.txt").write_text(snapshot, encoding="utf-8")
         (out_dir / "roles.json").write_text(json.dumps(roster, ensure_ascii=False, indent=2), encoding="utf-8")
-        if args.mode == "seq":  # archive + compress the conversation before the next chapter
-            summary = compress(llm, summary, text, snapshot)
         left = len(unmarked_quotes(snapshot))
         phases.append({"chapter": cid, "chars": len(snapshot), "leftover": left, "roles": len(roster)})
         print(f"[{args.mode}] ch{cid:03d} chars={len(snapshot)} leftover={left} 词条={len(roster)}", flush=True)
