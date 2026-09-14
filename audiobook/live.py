@@ -48,8 +48,8 @@ header{height:52px;display:flex;gap:16px;align-items:center;padding:0 18px;borde
 .speech{background:#152238;border-radius:8px;padding:2px 6px;box-shadow:inset 0 0 0 1px #2b4a72}
 del{color:#ff9d9d;background:#2a1414;text-decoration:line-through;border-radius:5px;padding:1px 3px}
 ins{color:#9fe6c1;background:#122a1c;text-decoration:none;border-radius:5px;padding:1px 5px}
-.new{animation:appear .5s ease both}@keyframes appear{from{background-color:#3a4a6b}to{background-color:transparent}}
-.speech.new{animation:appear .5s ease both}del.new,ins.new{animation:appear .5s ease both}
+.new{animation:appear .65s cubic-bezier(.2,.9,.3,1.1) both}
+@keyframes appear{0%{opacity:0;filter:blur(4px)}55%{opacity:1}100%{opacity:1;filter:blur(0)}}
 #chat{overflow:hidden;min-height:0;padding:10px 12px;display:flex;flex-direction:column;justify-content:flex-end;gap:5px}
 .ev{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:5px 9px;font-size:12.5px;line-height:1.55;word-break:break-word}
 .ico{display:inline-block;width:15px;margin-right:5px;text-align:center;opacity:.9}
