@@ -33,7 +33,7 @@ header{height:46px;display:flex;gap:12px;align-items:center;padding:0 18px;borde
 .brand{font-weight:700}.brand small{color:var(--dim);font-weight:400;margin-left:8px}
 header .grow{flex:1}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}
-#main{display:grid;grid-template-columns:1fr 380px;height:calc(100vh - 46px)}
+#main{display:grid;grid-template-columns:1fr 380px;height:calc(100dvh - 46px)}
 #left{display:flex;flex-direction:column;min-width:0;min-height:0;border-right:1px solid var(--line)}
 #chbar{display:flex;gap:10px;align-items:center;padding:7px 16px;border-bottom:1px solid var(--line);font-size:12.5px;color:var(--dim)}
 #chbar select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:3px 8px;font-size:13px}
@@ -60,6 +60,16 @@ ins{color:#9fe6c1;background:#122a1c;text-decoration:none;border-radius:5px;padd
 .b-speak{background:#17345a;color:#8fc4ff}.b-delete{background:#4a2a12;color:#ffba75}.b-replace{background:#33234a;color:#c9a6ff}
 code{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d1219;border:1px solid var(--line);border-radius:5px;padding:0 4px;font-size:12px}
 .role{color:var(--accent);font-weight:600}.sp{color:var(--dim)}.chap{color:var(--accent);font-weight:700;font-size:11.5px;margin-right:6px}
+/* phone / narrow: stack vertically -- article on top, chat as a fixed-height stream below */
+@media (max-width:820px){
+  #main{grid-template-columns:1fr;grid-template-rows:1fr minmax(28dvh,38dvh)}
+  #left{border-right:none;border-bottom:1px solid var(--line)}
+  #article{padding:14px 16px 40px;font-size:16px;line-height:1.95}
+  #chat{padding:8px 10px;gap:4px}
+  .ev{font-size:12px;padding:4px 8px}
+  #chbar{gap:8px;padding:6px 12px;font-size:12px;overflow-x:auto;white-space:nowrap}
+  header{padding:0 12px}.brand{font-size:14px}
+}
 </style></head><body>
 <header>
   <div class="brand">mark_script <small id="book">· live</small></div>
