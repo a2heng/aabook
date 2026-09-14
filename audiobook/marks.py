@@ -55,7 +55,15 @@ def parse_marks(text: str) -> list[dict]:
     tail = text[pos:].strip()
     if _has_content(tail):
         segments.append({"kind": "narration", "role_name": NARRATOR, "text": tail})
-    return segments
+    # Long speech is marked in several `speak` calls; stitch adjacent same-role pieces.
+    merged: list[dict] = []
+    for segment in segments:
+        last = merged[-1] if merged else None
+        if last and last["kind"] == "speech" and segment["kind"] == "speech" and last["role_name"] == segment["role_name"]:
+            last["text"] += segment["text"]
+        else:
+            merged.append(dict(segment))
+    return merged
 
 
 _BARE_QUOTE_RE = re.compile(r"[“『「][^”』」\n]{1,80}?[”』」]")

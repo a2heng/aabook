@@ -20,7 +20,6 @@ to look for are “ ” / 『』「」; straight ASCII quotes are tolerated.
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -28,7 +27,6 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_ROOT))
 
 from audiobook.marks import MARK_CLOSE, MARK_OPEN, MARK_SEP  # noqa: E402
-from audiobook.schema import Cast  # noqa: E402
 
 OPEN = "“『「"
 CLOSE = "”』」"
@@ -70,31 +68,24 @@ class ScriptServer:
 
     # ---- primitives ----------------------------------------------------------
     def _mark_speaker(self, text: str, role: str) -> dict:
-        span = self._locate(text, strip=True)
-        if span is None and len(text) > 8:
-            # Long speech: the model cannot reproduce it verbatim. Anchor on the opening
-            # words and let the locator expand to the whole quoted span.
-            span = self._locate(text[:8], strip=True)
-        if span is None and len(text) > 4:
-            span = self._locate(text[:4], strip=True)
-        if span is None:
+        # Mark EXACTLY the given fragment -- never guess/expand (a long speech is marked in
+        # several speak calls and adjacent same-role fragments are merged downstream).
+        index = self._find_index(text)
+        if index < 0:
             return {"ok": False, "reason": "not found", "text": text}
-        start, end = span
-        inner = self.text[start:end]
-        quoted = inner[:1] in OPEN and inner[-1:] in CLOSE
-        if quoted:
-            inner = inner[1:-1]
-        cut = start
-        if quoted and start >= 1 and self.text[start - 1] == "：":
-            k = start - 1
-            while k > 0 and self.text[k - 1] not in "。！？\n“”‘’「」『』 \t，,；;：":
-                k -= 1
-            name = self.text[k : start - 1]
-            if 0 < len(name) <= 8 and self._is_known_name(name, role):
-                cut = k
-        wrapped = f"{MARK_OPEN}{role}{MARK_SEP}{inner}{MARK_CLOSE}"
-        self.text = self.text[:cut] + wrapped + self.text[end:]
-        self.edits.append({"op": "speak", "role": role, "text": text, "attribution": cut < start})
+        start, end = index, index + len(text)
+        body = self.text[start:end]
+        while body[:1] in OPEN:  # stray quote at a chunk edge -> consumed, not kept
+            body = body[1:]
+        while body[-1:] in CLOSE:
+            body = body[:-1]
+        # fragment sits fully inside a quoted span -> consume that quote pair too
+        if start >= 1 and self.text[start - 1] in OPEN and end < len(self.text) and self.text[end] in CLOSE:
+            start -= 1
+            end += 1
+        wrapped = f"{MARK_OPEN}{role}{MARK_SEP}{body}{MARK_CLOSE}"
+        self.text = self.text[:start] + wrapped + self.text[end:]
+        self.edits.append({"op": "speak", "role": role, "text": text})
         return {"ok": True, "role": role, "spanned": wrapped}
 
     def _delete(self, target: str) -> dict:
@@ -131,24 +122,6 @@ class ScriptServer:
         return {"ok": True}
 
     # ---- helpers -------------------------------------------------------------
-    def _cast(self) -> "Cast | None":
-        book = os.environ.get("AUDIOBOOK_BOOK", "dawn")
-        path = APP_ROOT / "outputs" / book / "cast.json"
-        if not path.is_file():
-            return None
-        if getattr(self, "_cast_path", None) != str(path):
-            self._cast_obj = Cast.load(str(path))
-            self._cast_path = str(path)
-        return self._cast_obj
-
-    def _is_known_name(self, name: str, role: str) -> bool:
-        if name == role or name in role or role in name:
-            return True
-        cast = self._cast()
-        if cast is None:
-            return False
-        return any(name in [item.name, *item.aliases] or name in item.name or item.name in name for item in cast.roles.values())
-
     def _find_index(self, needle: str) -> int:
         if not needle:
             return -1
@@ -199,9 +172,9 @@ class ScriptServer:
             {
                 "name": "edit",
                 "description": (
-                    "唯一改法：单条编辑。op=speak（台词，给 role，自动去引号并删掉前面多余的「人名：」）/ "
-                    "delete（去掉引号留下词；引号内只有标点则整段删；单独标点则删该标点）/ "
-                    "replace（把 find 换成 replace，如气口处补逗号）。"
+                    "唯一改法：单条编辑。op=speak（台词，给 role，去引号；周边旁白/归因保持不动）/ "
+                    "delete（只用于去掉非台词引号的引号，尽量不删字）/ "
+                    "replace（把 find 换成 replace：气口处补逗号，或补一句「XXX说道」）。"
                 ),
                 "inputSchema": {
                     "type": "object",
