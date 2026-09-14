@@ -139,7 +139,16 @@ function handle(e){
   if(e.type==='done'){pushChat({cls:'sum',icon:'📝',chapter:e.chapter,html:'<b>本章完成</b> <span class="sp">'+esc(e.summary||'')+'</span>'});return;}}
 async function tickChat(){
   try{const r=await fetch(BASE+'live.jsonl',{headers:{'Range':'bytes='+offset+'-'},cache:'no-store'});
-    if(r.status===416){offset=0;chat.innerHTML='';pending=[];edits=errs=0;}
+    if(r.status===416){                                   // offset at/超过 EOF：可能只是没新数据
+      const h=await fetch(BASE+'live.jsonl',{method:'HEAD',cache:'no-store'});
+      const size=+(h.headers.get('Content-Length')||0);
+      if(size<offset){                                    // 文件变小 -> 真的被截断（新一次运行）
+        const fb=await (await fetch(BASE+'live.jsonl',{cache:'no-store'})).arrayBuffer();
+        offset=0;chat.innerHTML='';pending=[];edits=errs=0;
+        for(const line of new TextDecoder().decode(fb).split('\n')){if(line.trim()){let e;try{e=JSON.parse(line);}catch(_){continue;}handle(e);}}
+        offset=fb.byteLength;
+      } else { offset=size; }                             // 只是没有新数据：静默等待，不清空
+    }
     else if(r.status===206||offset===0){const buf=await r.arrayBuffer();offset+=buf.byteLength;
       for(const line of new TextDecoder().decode(buf).split('\n')){if(line.trim()){let e;try{e=JSON.parse(line);}catch(_){continue;}handle(e);}}
       status.textContent=' live';}
