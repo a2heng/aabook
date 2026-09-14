@@ -42,13 +42,13 @@ header{height:52px;display:flex;gap:16px;align-items:center;padding:0 18px;borde
 #chbar .chip{font-size:11.5px;color:var(--dim);background:var(--panel2);border:1px solid var(--line);padding:1px 8px;border-radius:99px}
 #chbar button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:4px 10px;cursor:pointer;font-size:12.5px}
 #chbar button.on{background:var(--accent);color:#0b0f15;border-color:var(--accent);font-weight:700}
-#article{overflow:auto;min-height:0;padding:20px 30px 60px;flex:1;font-size:15.5px;line-height:2.05;white-space:pre-wrap;word-break:break-word;
-  background:radial-gradient(900px 400px at 30% -10%,#17203355,transparent)}
+#article{overflow:auto;min-height:0;padding:20px 30px 60px;flex:1;font-size:15.5px;line-height:2.05;white-space:pre-wrap;word-break:break-word}
 .who{display:inline-block;font-size:11.5px;font-weight:700;color:#9fd0ff;background:#16314f;border-radius:6px;padding:0 7px;margin:0 3px 0 2px;vertical-align:1px;line-height:1.7}
 .speech{background:#152238;border-radius:8px;padding:2px 6px;box-shadow:inset 0 0 0 1px #2b4a72}
 del{color:#ff9d9d;background:#2a1414;text-decoration:line-through;border-radius:5px;padding:1px 3px}
 ins{color:#9fe6c1;background:#122a1c;text-decoration:none;border-radius:5px;padding:1px 5px}
-.new{animation:appear .6s ease both}@keyframes appear{from{opacity:0;filter:blur(2px)}to{opacity:1;filter:none}}
+.new{animation:appear .5s ease both}@keyframes appear{from{background-color:#3a4a6b}to{background-color:transparent}}
+.speech.new{animation:appear .5s ease both}del.new,ins.new{animation:appear .5s ease both}
 #chat{overflow:hidden;min-height:0;padding:10px 12px;display:flex;flex-direction:column;justify-content:flex-end;gap:5px}
 .ev{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:5px 9px;font-size:12.5px;line-height:1.55;word-break:break-word}
 .ico{display:inline-block;width:15px;margin-right:5px;text-align:center;opacity:.9}
@@ -96,7 +96,7 @@ function fragHTML(f,isNew){const c=isNew?' new':'';
   if(f.kind==='inserted')return '<ins'+c+'>'+esc(f.text)+'</ins>';
   return '<span'+c+'>'+esc(f.text)+'</span>';}
 function renderArticle(s){
-  if(!s||!s.fragments)return;
+  if(!s||!s.fragments||document.hidden)return;
   const sig=JSON.stringify(s.fragments); if(sig===prevSig)return;
   if(seen.chapter!==s.chapter){seen=new Set();seen.chapter=s.chapter;}
   const top=article.scrollTop; let html='';
@@ -104,10 +104,19 @@ function renderArticle(s){
   article.innerHTML=html; article.scrollTop=top; prevSig=sig;
   finfo.textContent=(s.chars||0)+' 字 · '+(s.fragments.length)+' 片段';
 }
+let pending=[];
 function pushChat(e){
   const row=document.createElement('div'); row.className='ev '+e.cls;
   row.innerHTML='<span class="ico">'+e.icon+'</span>'+(e.chapter?'<span class="chap">ch'+e.chapter+'</span>':'')+e.html;
-  chat.appendChild(row); while(chat.childElementCount>MAXCHAT)chat.removeChild(chat.firstChild);
+  pending.push(row);
+}
+function flushChat(){                       // one batched append per tick -> no per-event jitter
+  if(!pending.length)return;
+  const frag=document.createDocumentFragment();
+  for(const row of pending)frag.appendChild(row);
+  pending=[]; chat.appendChild(frag);
+  let extra=chat.childElementCount-MAXCHAT;
+  while(extra-->0)chat.removeChild(chat.firstChild);
 }
 function fmtCall(a){const x=a&&a.args||{};
   if(x.op==='speak')return '<span class="badge b-speak">speak</span><span class="role">'+esc(x.role||'?')+'</span> <code>'+esc(x.text||'')+'</code>';
@@ -130,16 +139,21 @@ async function tickChat(){
       for(const line of new TextDecoder().decode(buf).split('\n')){if(line.trim()){let e;try{e=JSON.parse(line);}catch(_){continue;}handle(e);}}
       totalEl.textContent=total||'?';status.textContent=' live';}
   }catch(err){status.textContent=' waiting…';}
+  flushChat();
   setTimeout(tickChat,1200);
 }
 async function tickIndex(){
   try{const r=await fetch(BASE+'live_index.json?t='+Date.now(),{cache:'no-store'});
-    if(!r.ok)return; const idx=await r.json(); const sig=JSON.stringify(idx); if(sig===idxSig)return; idxSig=sig;
+    if(!r.ok)return; const idx=await r.json();
     const cur=idx.current; if(cur&&follow)selected=cur;
     const ids=Object.keys(idx.chapters||{}).map(Number).sort((a,b)=>a-b);
-    chs.innerHTML=ids.map(function(c){var d=idx.chapters[c]&&idx.chapters[c].done?' ✔':'';return '<option value="'+c+'"'+(c===selected?' selected':'')+'>第 '+c+' 章'+d+'</option>';}).join('');
-    doneEl.textContent=ids.filter(function(c){return idx.chapters[c].done;}).length;
-    totalEl.textContent=ids.length;
+    const listKey=ids.join(',');
+    if(listKey!==idxSig){idxSig=listKey;                      // rebuild ONLY when the set changes
+      chs.innerHTML=ids.map(function(c){var d=idx.chapters[c]&&idx.chapters[c].done?' ✔':'';return '<option value="'+c+'">第 '+c+' 章'+d+'</option>';}).join('');}
+    const want=String(selected||cur||''); if(chs.value!==want)chs.value=want;
+    const dn=ids.filter(function(c){return idx.chapters[c].done;}).length;
+    if(doneEl.textContent!=dn)doneEl.textContent=dn;
+    if(totalEl.textContent!=ids.length)totalEl.textContent=ids.length;
   }catch(err){}
   setTimeout(tickIndex,1500);
 }
