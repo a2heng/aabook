@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-TARGET_LUFS = -14.0
+TARGET_LUFS = -16.0
 PEAK_CEILING = 0.95
 SAME_SPEAKER_GAP = 0.25
 SPEAKER_CHANGE_GAP = 0.40
@@ -25,7 +25,9 @@ def load_mono(path: str | Path) -> tuple[np.ndarray, int]:
     return np.ascontiguousarray(data, dtype=np.float32), int(sample_rate)
 
 
-def normalize_loudness(audio: np.ndarray, sample_rate: int, target: float = TARGET_LUFS, peak: float = PEAK_CEILING) -> np.ndarray:
+def normalize_loudness(
+    audio: np.ndarray, sample_rate: int, target: float = TARGET_LUFS, peak: float = PEAK_CEILING
+) -> np.ndarray:
     output = audio.astype(np.float64)
     try:
         import pyloudnorm as pyln
@@ -57,6 +59,7 @@ def assemble_rows(
     *,
     sample_rate: int = 24000,
     normalize: bool = True,
+    target_lufs: float = TARGET_LUFS,
 ) -> np.ndarray:
     """Concatenate ``(wav_path, row)`` in order with speaker-aware gaps."""
     pieces: list[np.ndarray] = []
@@ -70,7 +73,7 @@ def assemble_rows(
         previous = row
     merged = np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)
     if normalize and merged.size:
-        merged = normalize_loudness(merged, sample_rate)
+        merged = normalize_loudness(merged, sample_rate, target_lufs)
     target = Path(out_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(target), merged, sample_rate, subtype="PCM_16")
@@ -83,6 +86,8 @@ def assemble_chapters(
     *,
     sample_rate: int = 24000,
     gap: float = 0.8,
+    normalize: bool = True,
+    target_lufs: float = TARGET_LUFS,
 ) -> np.ndarray:
     pieces: list[np.ndarray] = []
     for index, (_, path) in enumerate(chapter_paths):
@@ -91,6 +96,8 @@ def assemble_chapters(
             pieces.append(np.zeros(int(sample_rate * gap), dtype=np.float32))
         pieces.append(audio)
     merged = np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)
+    if normalize and merged.size:
+        merged = normalize_loudness(merged, sample_rate, target_lufs)
     target = Path(out_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(target), merged, sample_rate, subtype="PCM_16")

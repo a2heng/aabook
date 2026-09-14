@@ -16,6 +16,8 @@ CHAPTER_PATTERNS = (
     re.compile(r"^\s*(第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节回卷篇部])\s*(.*)$"),
     re.compile(r"^\s*(Chapter\s+[0-9IVXLC]+)\b\s*(.*)$", re.IGNORECASE),
     re.compile(r"^\s*([序楔]章|前言|序言|后记|尾声|终章|番外)\s*(.*)$"),
+    # fallback: short lines that embed a 第X卷/章/回 marker (e.g. "书名 第一卷 大厅(1)")
+    re.compile(r"^\s*(.{0,30}?第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节回卷篇部]\s*.{0,20})$"),
 )
 
 
@@ -99,4 +101,7 @@ def split_chapters(text: str) -> list[Chapter]:
         end = starts[order + 1][0] if order + 1 < len(starts) else len(lines)
         body = "\n".join(lines[start + 1 : end]).strip()
         chapters.append(Chapter(chapter_id=len(chapters) + 1, title=title, text=body))
-    return [chapter for chapter in chapters if chapter.text]
+    kept = [chapter for chapter in chapters if chapter.text]
+    for index, chapter in enumerate(kept, start=1):  # renumber so ids stay contiguous
+        chapter.chapter_id = index
+    return kept
