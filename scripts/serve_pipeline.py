@@ -132,19 +132,30 @@ def step_roster(book: str, base_url: str, model: str, profile: str) -> Iterator[
 
 def step_script(book: str, chapter_label: str, base_url: str, model: str, profile: str) -> Iterator[str]:
     chapter_id = int(chapter_label.split("·")[0].strip())
-    cmd = [
-        PY,
-        "-u",
-        "scripts/build_script.py",
-        f"outputs/{book}/chapters/ch{chapter_id:03d}.txt",
-        "--out",
-        f"outputs/{book}/ch{chapter_id:03d}",
-    ]
-    cast = APP_ROOT / f"outputs/{book}/cast.json"
-    if cast.is_file():
-        cmd += ["--cast", str(cast)]
-    for log in _stream(cmd, _llm_env(base_url, model, profile)):
+    out = APP_ROOT / "outputs" / book
+    env = {"AUDIOBOOK_BOOK": book, **_llm_env(base_url, model, profile)}
+    for log in _stream(
+        [PY, "-u", "scripts/mark_script.py", str(chapter_id), "--count", "1", "--book", book, "--mode", "seq"],
+        env=env,
+    ):
         yield log
+    marked = out / "script" / f"ch{chapter_id:03d}.marked.txt"
+    if marked.is_file():
+        for log in _stream(
+            [
+                PY,
+                "-u",
+                "scripts/marks_to_script.py",
+                str(marked),
+                "--cast",
+                str(out / "cast.json"),
+                "--out",
+                str(out / f"ch{chapter_id:03d}"),
+                "--chapter-id",
+                str(chapter_id),
+            ]
+        ):
+            yield log
 
 
 def step_render(book: str, chapter_label: str) -> Iterator[str]:
@@ -192,22 +203,11 @@ def step_asr(book: str, chapter_label: str) -> Iterator[str]:
 
 def step_report(book: str, chapter_label: str) -> Iterator[tuple[str, str]]:
     chapter_id = int(chapter_label.split("·")[0].strip())
-    out = APP_ROOT / "outputs" / book / f"ch{chapter_id:03d}"
-    report = APP_ROOT / "outputs" / "report.html"
-    cmd = [
-        PY,
-        "-u",
-        "scripts/visualize_script.py",
-        "--script",
-        str(out / "script.json"),
-        "--out",
-        str(report),
-        "--asr",
-        str(out / "asr_check.json"),
-    ]
-    for log in _stream(cmd):
-        yield log, gr.update()
-    yield "报告已生成 outputs/report.html\n", report.read_text(encoding="utf-8") if report.is_file() else ""
+    diff = APP_ROOT / "outputs" / book / "script" / f"ch{chapter_id:03d}_x1.diff.html"
+    if diff.is_file():
+        yield f"台本对照页 {diff}\n", diff.read_text(encoding="utf-8")
+    else:
+        yield f"未找到 {diff}（请先生成台本）\n", gr.update()
 
 
 def _roster_table(path: Path):

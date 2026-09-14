@@ -27,7 +27,7 @@ from finalize_roster import CONTEXT_COUNT, context_windows, looks_non_person  # 
 from audiobook.cleaning import normalize_text, read_text  # noqa: E402
 from audiobook.llm import LLMClient  # noqa: E402
 from audiobook.namefinder import scan_chapters  # noqa: E402
-from audiobook.roster import _chat, finalize, infer_gender, to_cast  # noqa: E402
+from audiobook.roster import _chat, finalize, infer_gender, load_main_names, to_cast  # noqa: E402
 from audiobook.textnorm import clean_for_llm  # noqa: E402
 
 MERGE_SYSTEM = """你是中文小说人物字典整理器。
@@ -144,7 +144,7 @@ def main() -> None:
 
     result = finalize([person for person in merged if person["chapters"]], args.voices)
     roster_path.write_text(json.dumps({"characters": result}, ensure_ascii=False, indent=2), encoding="utf-8")
-    to_cast({"characters": result}).save(cast_path)
+    to_cast({"characters": result}, load_main_names(cast_path)).save(cast_path)
     print(f"[merge] wrote {roster_path} ({len(result) - 1} people) and {cast_path}")
 
 

@@ -4,7 +4,7 @@
 
 > 状态：前端（清洗 → 人物字典 → 逐章抽取/断句 → 剧本 → 统计）与后端（voicebank → 逐段渲染 → 组装）均已实现；正在整本跑。
 > **全流程入口**：`scripts/run_book.py`（prepare → roster → script → render → report，可续跑）。
-> 各阶段 CLI：`scripts/build_book.py`（清洗切章 + 逐章剧本）、`scripts/finalize_roster.py`（人物字典）、`scripts/build_script.py`（单章/单文件）、`scripts/render_book.py`（渲染组装）、`scripts/role_stats.py`、`scripts/build_voicebank.py`、`scripts/asr_check.py`。Web 面板：`scripts/serve_pipeline.py`。
+> 各阶段 CLI：`scripts/build_book.py`（清洗切章）、`scripts/finalize_roster.py`（人物字典）、`scripts/mark_script.py`（**剧本标注唯一入口**：逐条 `edit` → 台本，产物在 `outputs/<book>/script/`）、`scripts/render_book.py`（渲染组装）、`scripts/role_stats.py`、`scripts/build_voicebank.py`、`scripts/asr_check.py`。Web 面板：`scripts/serve_pipeline.py`。
 
 > ⚠️ **适用范围**：本流水线目前只在一部**中文网文**（本地示例语料；`·`全名、大量配角、亲属/头衔称呼）上验证过。**换小说必须重写/调整"人物脚本"相关内容**：`scripts/finalize_roster.py` 的 `CLASSIFY_SYSTEM`/`ENRICH_SYSTEM`/`MERGE_SYSTEM`（人名判定与别名规则、示例），以及 `audiobook/extract.py::NUMBERED_SYSTEM` 的角色表用法与示例；然后**重建人物字典**（`--stages roster`）再跑剧本。清洗/抽取/断句/渲染等非人物逻辑是通用的。
 
@@ -77,9 +77,9 @@ flowchart TD
 11. **音色库**（`voicebank.py`）：无真人素材时，用 `style_desc` + 首句范例走 `instruct_tts` 造参考音 → faster-whisper ASR 出参考文本 → 之后 `zero_shot_tts` 克隆它。
 12. **渲染**（`renderer.py`）：`zero_shot_tts` 逐行 → `render/rows/<seg_id>__<hash>.wav`，**可续跑**（hash 命中即跳过）。
 13. **组装**（`assembler.py`）：按 kind/角色切换插入 gap，响度 -14/-16 LUFS、峰值 ≤0.95、24 kHz PCM16。
-14. **体检/报告**（`asr_check.py` + `visualize_script.py`）：拼音 coverage/score（仅观察，不自动重做）、四列对照 HTML。
+14. **体检/报告**（`asr_check.py`）：拼音 coverage/score（仅观察，不自动重做）；台本 QA 页由 `mark_script.py` 直接产出（`outputs/<book>/script/*.html`）。
 
-> 已删除的旧路径 / 实验代码（负结果与思路记录在 `docs/prep-experiments.md`）：`cast.discover_cast`（抽样发现）、人名实验（`discover_names / tag_persons / scan_persons / clean_persons / roster_miner / roster_features / build_roster`）、demo/探针/基准（`segment_demo / voice_demo / probe_llm_len / bench_prep / bench_rounds / instruction_probe`）。`build_script` 无 `--cast` 时退化为「仅旁白」。
+> 已删除的旧路径 / 实验代码（负结果与思路记录在 `docs/prep-experiments.md`）：`cast.discover_cast`（抽样发现）、人名实验（`discover_names / tag_persons / scan_persons / clean_persons / roster_miner / roster_features / build_roster`）、demo/探针/基准（`segment_demo / voice_demo / probe_llm_len / bench_prep / bench_rounds / instruction_probe`）；最新一轮：`run_levels / run_script_agent / proto_multinode / bench_model / build_script / visualize_script`（被 `mark_script.py` + `script_mcp_server.py` + `audiobook/mcp.py` 取代）。
 
 ## 4. 预处理：通用字符白名单
 

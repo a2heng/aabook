@@ -29,9 +29,15 @@ KV="${AUDIOBOOK_LLM_KV:-q8_0}"
 BUDGET="${AUDIOBOOK_LLM_THINK_BUDGET:-512}"
 SPEC="${AUDIOBOOK_LLM_SPEC-draft-mtp}"
 
+DRAFT="${AUDIOBOOK_LLM_DRAFT:-}"
+NM=${AUDIOBOOK_LLM_SPEC_DRAFT_N_MAX:-3}
 spec_args=()
 if [ -n "$SPEC" ]; then
-  spec_args=(--spec-type "$SPEC" --spec-draft-n-max 3 --spec-draft-type-k "$KV" --spec-draft-type-v "$KV")
+  spec_args=(--spec-type "$SPEC" --spec-draft-n-max "$NM" --spec-draft-type-k "$KV" --spec-draft-type-v "$KV")
+fi
+draft_args=()
+if [ -n "$DRAFT" ]; then
+  draft_args=(-md "$DRAFT")
 fi
 
 exec "$BIN/llama-server" \
@@ -40,4 +46,4 @@ exec "$BIN/llama-server" \
   --reasoning-format deepseek --reasoning-budget "$BUDGET" \
   -ngl "$NGL" -c "$CTX" -b 2048 -ub 512 \
   -ctk "$KV" -ctv "$KV" \
-  "${spec_args[@]}"
+  "${draft_args[@]}" "${spec_args[@]}"

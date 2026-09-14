@@ -65,6 +65,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-lufs", type=float, default=TARGET_LUFS, help="loudness target for rows and masters")
     parser.add_argument("--no-normalize", action="store_true", help="write raw AuK levels (no loudness normalization)")
     parser.add_argument("--limit-chapters", type=int, default=0, help="only the first N chapters")
+    parser.add_argument("--start-chapter", type=int, default=0, help="first chapter_id to render (inclusive)")
+    parser.add_argument("--end-chapter", type=int, default=0, help="last chapter_id to render (inclusive)")
     parser.add_argument("--limit-rows", type=int, default=0, help="only the first N rows (smoke test)")
     parser.add_argument("--no-assemble", action="store_true")
     return parser.parse_args()
@@ -103,6 +105,10 @@ def main() -> None:
     chapters: OrderedDict[int, list] = OrderedDict()
     for row in rows:
         chapters.setdefault(row.chapter_id, []).append(row)
+    if args.start_chapter:
+        chapters = OrderedDict((cid, chs) for cid, chs in chapters.items() if cid >= args.start_chapter)
+    if args.end_chapter:
+        chapters = OrderedDict((cid, chs) for cid, chs in chapters.items() if cid <= args.end_chapter)
     if args.limit_chapters:
         chapters = OrderedDict(list(chapters.items())[: args.limit_chapters])
     selected = [row for chapter_rows in chapters.values() for row in chapter_rows]

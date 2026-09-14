@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 from audiobook.cleaning import Chapter
-from audiobook.extract import Unit, _minimal_units, extract_chapter
+from audiobook.extract import Unit, _sentence_units, extract_chapter
 from audiobook.schema import Cast, Role
 
 
@@ -42,13 +42,21 @@ class ExtractChapterTest(unittest.TestCase):
         self.assertEqual(units[0].role_id, "narrator")
         self.assertEqual(units[0].raw_text, chapter.text)
 
-    def test_minimal_units_are_quote_aware(self):
-        units = _minimal_units("高文说：“你好。”他走了。")
-        self.assertEqual([unit["inside"] for unit in units], [False, True, False])
+    def test_sentence_units_keep_quote_with_its_attribution(self):
+        units = _sentence_units("高文说：“你好。”他走了。")
+        # a quote whose content ends a sentence closes the unit (attribution stays with it)
+        self.assertEqual(len(units), 2)
+        self.assertTrue(units[0]["has_quote"])
+        self.assertEqual(units[0]["end"], len("高文说：“你好。”"))
+        self.assertFalse(units[1]["has_quote"])
+
+    def test_sentence_units_split_at_sentence_end_only(self):
+        units = _sentence_units("他坐下，叹了口气。她走了。")
+        self.assertEqual(len(units), 2)
 
     def test_numbered_labels_map_to_units(self):
         chapter = Chapter(chapter_id=1, title="第一章", text="高文说：“你好。”")
-        client = FakeClient({"speakers": {"2": "高文"}})
+        client = FakeClient({"speakers": {"1-1": "高文"}})
         units = extract_chapter(chapter, make_cast(), client)  # type: ignore[arg-type]
         self.assertEqual([unit.kind for unit in units], ["narration", "dialogue"])
         self.assertEqual(units[1].role_name, "高文")
@@ -56,38 +64,38 @@ class ExtractChapterTest(unittest.TestCase):
 
     def test_unquoted_never_inherits_speaker(self):
         chapter = Chapter(chapter_id=1, title="第一章", text="“你来了。”他坐下。")
-        client = FakeClient({"speakers": {"1": "高文"}})
+        client = FakeClient({"speakers": {"1-1": "高文"}})
         units = extract_chapter(chapter, make_cast(), client)  # type: ignore[arg-type]
         self.assertEqual([unit.kind for unit in units], ["dialogue", "narration"])
         self.assertEqual(units[1].role_id, "narrator")
 
-    def test_numbered_quote_without_speaker_is_flagged(self):
+    def test_numbered_quote_without_speaker_becomes_passerby(self):
         chapter = Chapter(chapter_id=1, title="第一章", text="“谁在那儿？”")
         client = FakeClient({"speakers": {}})
         units = extract_chapter(chapter, make_cast(), client)  # type: ignore[arg-type]
         self.assertEqual(units[0].kind, "dialogue")
-        self.assertIn("unresolved_role", units[0].flags)
+        self.assertIn("passerby", units[0].flags)
 
-    def test_star_label_marks_new_role(self):
+    def test_unknown_speaker_bucketed_as_passerby(self):
         chapter = Chapter(chapter_id=1, title="第一章", text="“谁在那儿？”")
-        client = FakeClient({"speakers": {"1": "*神秘人"}})
+        client = FakeClient({"speakers": {"1-1": "某陌生人"}})
         units = extract_chapter(chapter, make_cast(), client)  # type: ignore[arg-type]
         self.assertEqual(units[0].kind, "dialogue")
-        self.assertEqual(units[0].role_name, "神秘人")
-        self.assertIn("new_role", units[0].flags)
+        self.assertTrue(units[0].role_id.startswith("passerby_m"))
+        self.assertIn("passerby", units[0].flags)
 
     def test_quote_marked_narration_is_narration(self):
         chapter = Chapter(chapter_id=1, title="第一章", text="“第一王朝”的气息。")
-        client = FakeClient({"speakers": {"1": "旁白"}})
+        client = FakeClient({"speakers": {"1-1": "旁白"}})
         units = extract_chapter(chapter, make_cast(), client)  # type: ignore[arg-type]
         self.assertEqual([unit.kind for unit in units], ["narration"])
 
     def test_exclamation_marked_narration_stays_dialogue(self):
         chapter = Chapter(chapter_id=1, title="第一章", text="“祖先啊！”")
-        client = FakeClient({"speakers": {"1": "旁白"}})
+        client = FakeClient({"speakers": {"1-1": "旁白"}})
         units = extract_chapter(chapter, make_cast(), client)  # type: ignore[arg-type]
         self.assertEqual(units[0].kind, "dialogue")
-        self.assertIn("unresolved_role", units[0].flags)
+        self.assertIn("passerby", units[0].flags)
 
 
 if __name__ == "__main__":

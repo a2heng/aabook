@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 from .cleaning import Chapter
 from .llm import LLMClient, prompt_hash
-from .schema import Cast, slugify
+from .schema import Cast
 
 PROMPT_ID = "extract.numbered.v1"
 
@@ -43,48 +43,43 @@ _QUOTE_MAP = str.maketrans(
 
 _QUOTE_CHARS = set("“”‘’「」『』\"'＂﹃﹄")
 
-_SENT_BOUNDARY = set("。！？…；：，、,.!?;:")
+# Coarse boundaries: only strong sentence enders split units. Weak punctuation
+# (，、；：) is kept inside a unit so quotes stay with their surrounding context
+# instead of becoming bare fragments the model mislabels as dialogue.
+_SENT_BOUNDARY = set("。！？…")
 _MIN_OPEN = set('“『「"')
 _MIN_CLOSE = set('”』」"')
 
 NARRATOR_LABELS = {"旁白", "旁白君", "叙述", "叙述者", "画外音", "narrator", "narration", "neutral"}
 
-NUMBERED_SYSTEM = """【角色表】（**仅供参考**：优先对号入座；表里没有的说话人请标注为新人）
+NUMBERED_SYSTEM = """【角色表】（主要人物 + 固定路人；对白说话人按此对号入座）
 __ROSTER__
 
-下面原文已被代码切成最小句并逐句编号。请**只给引号句（“…”／「…」）指定说话人**，只输出 JSON：
-{"speakers":{"3":"高文","4":"赫蒂","6":"*神秘人"}}
+下面按「章-句」编号（第X章-第Y句，例如 `3-2` 表示第3章第2句）；**每行是一个完整句子**，一次可能给你多章内容。
+请对**含引号（“…”／「…」）的句子**，按引号**出现顺序**给出每个引号的说话人（一个数组），只输出 JSON：
+{"speakers":{"3-1":["高文"],"3-2":["赫蒂"]}}
 
 规则：
-1. 输出里**只出现引号句的编号**。旁白叙述、归属/引述短语（如“低声说道：”“瑞贝卡突然喊道，”）属旁白，**不要列出**。
-2. 每个引号句都必须给说话人。**优先**从角色表对号入座（别名对齐，如 姑妈=赫蒂·塞西尔）。
-3. **角色表里没有的说话人**：用 `*` 前缀写出原文中的称呼/代号来标注新人物，如 `"*神秘人"`、`"*老管家"`。**不要留空、不要写“未知”**。
-4. 只有**确定不是人说话**的引文（书名/术语，如“第一王朝”）才写 "旁白"。
-5. 只要是人发出的声音（说话、喊叫、惊呼、痛呼、嘟囔……，哪怕一两个字）都要标；相邻不同说话人分别标。
+1. 只输出含引号的句子；纯叙述句（不含引号）不用列，代码自动算旁白。
+2. 数组长度=该句引号个数，按出现顺序一一对应。**引号里不是当场说的话**（只是被提到的词/称呼/术语）写 "旁白"。
+3. 是某人的话就标谁；结合上下文、称谓、身份推断。引号前的描述性称谓（如“贵族少女”“少年”“老者”）要结合上文对上表里对应的人物（用别名/描述判断），不要凭句子里恰好出现的另一个名字乱标。
+4. 推断不出的**无名人物**（士兵、路人等）才按性别用固定路人：男声 `路人男1`／`路人男2`，女声 `路人女1`／`路人女2`。**不要留空、不要写“未知”、不要编造新名字**。
+5. 人发出的声音都要标（说话、喊叫、惊呼、痛呼、嘟囔……哪怕一两个字）。
 
-【完整示例】
-编号文本：
-1 高文推开门，
-2 低声说道：
-3 “你来了。”
-4 “好久不见。”
-5 赫蒂回答。
-6 “拜伦！”
-7 瑞贝卡突然喊道，
-8 “你也在这儿？”
-9 墙上挂着
-10 “第一王朝”
-11 的壁画。
-12 棺中传来一声痛呼：
-13 “卧槽谁砸我手！”
+【示例】（第3章）
+3-1 高文推开门，低声说道：“你来了。”
+3-2 “好久不见。”赫蒂回答。
+3-3 “拜伦！”瑞贝卡突然喊道。
+3-4 瑞贝卡却不知道“老祖宗”脑海里都在想些什么，已经快哭出来了：“祖先大人……对不起……”
+3-5 一个陌生士兵喝道：“站住！什么人！”
 输出：
-{"speakers":{"3":"高文","4":"赫蒂","6":"瑞贝卡","8":"瑞贝卡","10":"旁白","13":"*棺中人"}}
+{"speakers":{"3-1":["高文"],"3-2":["赫蒂"],"3-3":["瑞贝卡"],"3-4":["旁白","瑞贝卡"],"3-5":["路人男1"]}}
 
-示例说明：
-- 旁白句 1、2、5、7、9、11、12（叙述与归属短语）**不列出**，代码自动算旁白。
-- 编号 3=高文、4=赫蒂、6/8=瑞贝卡，均由上下文判断（相邻同人也要各标一次）。
-- 编号 10 是术语、不是台词 → "旁白"。
-- 编号 13 棺中那人不在角色表 → 用 `*棺中人` 标注新人。
+说明：
+- 3-3 由“瑞贝卡突然喊道”判断=瑞贝卡。
+- 3-4 有两个引号：`“老祖宗”` 只是被提到的称呼、不是台词 → "旁白"；`“祖先大人……”` 是瑞贝卡说的 → "瑞贝卡"。
+- 3-5 无名士兵 → `路人男1`。
+- 键用原样「章-句」编号，值必须是数组。
 """
 
 
@@ -114,13 +109,15 @@ def cast_block(cast: Cast) -> str:
 
 
 def roster_block(cast: Cast) -> str:
-    """Clean reader-facing roster for the prompt (name + aliases only)."""
+    """Reader-facing roster for the prompt: name + aliases + a short description."""
     lines = []
     for role in cast.roles.values():
         if role.kind == "narrator":
             continue
         aliases = "、".join(role.aliases) if role.aliases else ""
-        lines.append(f"- {role.name}（别名：{aliases}）" if aliases else f"- {role.name}")
+        description = (role.description or "").strip()[:24]
+        tags = "；".join(part for part in [f"别名：{aliases}" if aliases else "", description] if part)
+        lines.append(f"- {role.name}（{tags}）" if tags else f"- {role.name}")
     lines.append("- 旁白（叙述与归属短语）")
     return "\n".join(lines)
 
@@ -131,6 +128,9 @@ def build_numbered_system(cast: Cast) -> str:
 
 def _thinking_default() -> bool:
     return os.environ.get("AUDIOBOOK_EXTRACT_THINKING", "off").lower() in ("1", "on", "true", "yes")
+
+
+EXTRACT_MAX_TOKENS = int(os.environ.get("AUDIOBOOK_EXTRACT_MAX_TOKENS", "2048"))
 
 
 def _as_index(value) -> int | None:
@@ -188,6 +188,17 @@ def _has_content(text: str) -> bool:
     return any(char.isalnum() for char in text)
 
 
+_FEMALE_HINTS = "女她妈姐婆婶娘妃后姑姨妹"
+
+
+def _passerby_for(label: str, span: str) -> tuple[str, str]:
+    """Bucket an out-of-cast speaker into one of the fixed generic passerby roles."""
+    text = f"{label}{span}"
+    suffix = "f" if any(char in text for char in _FEMALE_HINTS) else "m"
+    bucket = sum(ord(char) for char in label) % 2 + 1
+    return f"passerby_{suffix}{bucket}", f"路人{'女' if suffix == 'f' else '男'}{bucket}"
+
+
 def _append_unit(
     units: list[Unit],
     kind: str,
@@ -225,30 +236,71 @@ def _append_unit(
     )
 
 
-def _minimal_units(text: str) -> list[dict]:
-    """Tile ``text`` into quote-aware minimal units (span + whether inside quotes)."""
-    units: list[dict] = []
+def _quote_spans(text: str) -> list[dict]:
+    """Quote-aware tiling *within* a sentence (used to split output, not the prompt)."""
+    spans: list[dict] = []
     start = 0
     inside = False
     for index, char in enumerate(text):
         if char in _MIN_OPEN and not inside:
             if index > start:
-                units.append({"start": start, "end": index, "inside": inside})
+                spans.append({"start": start, "end": index, "inside": False})
             start = index
             inside = True
         elif char in _MIN_CLOSE and inside:
-            units.append({"start": start, "end": index + 1, "inside": True})
+            spans.append({"start": start, "end": index + 1, "inside": True})
             start = index + 1
             inside = False
-        elif char in _SENT_BOUNDARY and not inside:
-            units.append({"start": start, "end": index + 1, "inside": inside})
-            start = index + 1
     if start < len(text):
-        units.append({"start": start, "end": len(text), "inside": inside})
-    return [unit for unit in units if _has_content(text[unit["start"] : unit["end"]])]
+        spans.append({"start": start, "end": len(text), "inside": inside})
+    return [span for span in spans if _has_content(text[span["start"] : span["end"]])]
 
 
-def _parse_labels(payload) -> dict[int, str] | None:
+def _sentence_units(text: str) -> list[dict]:
+    """Split into *sentences* at strong enders only; quotes are never boundaries.
+
+    A quoted sentence, its attribution and any trailing narration stay in one unit
+    so the model sees the full context instead of a bare quote fragment.
+    """
+    units: list[dict] = []
+    start = 0
+    inside = False
+    pending = False  # a strong ender was seen inside the current quote
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char in _MIN_OPEN:
+            inside = True
+        elif char in _MIN_CLOSE:
+            if inside:
+                inside = False
+                if pending:  # the quote itself ended the sentence -> close the unit here
+                    units.append({"start": start, "end": index + 1})
+                    start = index + 1
+                    pending = False
+        elif char in _SENT_BOUNDARY:
+            if inside:
+                pending = True
+            else:
+                end = index + 1
+                while end < len(text) and text[end] in _MIN_CLOSE:  # keep the closing quote
+                    end += 1
+                units.append({"start": start, "end": end})
+                start = end
+                index = end - 1
+        index += 1
+    if start < len(text):
+        units.append({"start": start, "end": len(text)})
+    result = []
+    for unit in units:
+        span = text[unit["start"] : unit["end"]]
+        if not _has_content(span):
+            continue
+        result.append({"start": unit["start"], "end": unit["end"], "has_quote": any(s["inside"] for s in _quote_spans(span))})
+    return result
+
+
+def _parse_labels(payload) -> dict[str, str | list[str]] | None:
     if isinstance(payload, dict):
         raw = None
         for key in ("speakers", "labels", "roles"):
@@ -261,21 +313,24 @@ def _parse_labels(payload) -> dict[int, str] | None:
         return None
     if raw is None:
         return None
-    labels: dict[int, str] = {}
+    labels: dict[str, str | list[str]] = {}
     if isinstance(raw, dict):
         for key, value in raw.items():
-            index = _as_index(key)
-            if index is not None:
-                labels[index] = str(value).strip()
+            labels[str(key).strip()] = _normalize_label(value)
     elif isinstance(raw, list):
         for item in raw:
             if isinstance(item, dict):
-                index = _as_index(item.get("i") or item.get("id") or item.get("index"))
-                if index is not None:
-                    labels[index] = str(item.get("role") or item.get("label") or "旁白").strip()
-            elif isinstance(item, str) and item.strip():
-                labels[len(labels) + 1] = item.strip()
+                key = item.get("id") or item.get("i") or item.get("index")
+                if key is not None:
+                    labels[str(key).strip()] = _normalize_label(item.get("role") or item.get("label") or "旁白")
     return labels
+
+
+def _normalize_label(value) -> str | list[str]:
+    """A sentence's label is either one role (str) or one role per quote (list)."""
+    if isinstance(value, list):
+        return [str(item).strip() for item in value]
+    return str(value).strip()
 
 
 def _looks_non_speech(span: str) -> bool:
@@ -288,86 +343,149 @@ def _looks_non_speech(span: str) -> bool:
 
 
 def _label_window(
-    client: LLMClient, system: str, chapter: Chapter, units: list[dict], start: int, size: int, thinking: bool
-) -> dict[int, str]:
-    """Label one window of units (global ids) so long chapters do not truncate."""
-    window = list(enumerate(units[start : start + size], start=start + 1))
-    listing = "\n".join(f"{index} {chapter.text[unit['start'] : unit['end']].strip()}" for index, unit in window)
-    quoted_ids = [str(index) for index, unit in window if unit["inside"]]
-    user = f"编号文本：\n{listing}\n\n需要标注说话人的引号句编号（一个都不能漏）：{', '.join(quoted_ids)}\n\n只输出 JSON。"
+    client: LLMClient, system: str, entries: list[dict], start: int, size: int, thinking: bool
+) -> dict[str, str | list[str]]:
+    """Label one window of numbered entries; ids are ``chapter-sentence`` (e.g. 3-2)."""
+    window = entries[start : start + size]
+    lines: list[str] = []
+    for entry in window:
+        if entry.get("header"):
+            lines.append(entry["header"])
+        lines.append(f"{entry['uid']} {entry['text']}")
+    quoted_ids = [entry["uid"] for entry in window if entry["inside"]]
+    user = (
+        f"编号文本：\n{chr(10).join(lines)}\n\n"
+        f"需要标注说话人的引号句编号（一个都不能漏）：{', '.join(quoted_ids)}\n\n只输出 JSON。"
+    )
     last_error: Exception | None = None
     for attempt in (thinking, not thinking, thinking):
         try:
-            payload = client.chat_json(system, user, thinking=attempt)
+            payload = client.chat_json(system, user, max_tokens=EXTRACT_MAX_TOKENS, thinking=attempt)
         except Exception as error:  # noqa: BLE001 - retry on malformed replies
             last_error = error
             continue
         labels = _parse_labels(payload)
         if labels is not None:
             return labels
-    print(f"[extract] WARN window {start + 1}..{start + len(window)} -> no labels: {last_error}", file=sys.stderr)
+    print(
+        f"[extract] WARN ids {window[0]['uid']}..{window[-1]['uid']} -> no labels: {last_error}",
+        file=sys.stderr,
+    )
     return {}
 
 
 def _label_range(
-    client: LLMClient, system: str, chapter: Chapter, units: list[dict], start: int, size: int, thinking: bool
-) -> dict[int, str]:
+    client: LLMClient, system: str, entries: list[dict], start: int, size: int, thinking: bool
+) -> dict[str, str | list[str]]:
     """Label a range; on failure split it in half so only the bad sub-range degrades."""
-    labels = _label_window(client, system, chapter, units, start, size, thinking)
+    size = min(size, len(entries) - start)  # clamp: never recurse on a phantom length
+    if size <= 0:
+        return {}
+    labels = _label_window(client, system, entries, start, size, thinking)
     if labels or size <= 24:
         return labels
     mid = start + size // 2
-    left = _label_range(client, system, chapter, units, start, mid - start, thinking)
-    right = _label_range(client, system, chapter, units, mid, start + size - mid, thinking)
+    left = _label_range(client, system, entries, start, mid - start, thinking)
+    right = _label_range(client, system, entries, mid, start + size - mid, thinking)
     return {**left, **right}
+
+
+def _label_entries(client: LLMClient, system: str, entries: list[dict], thinking: bool) -> dict[str, str | list[str]]:
+    window_size = int(os.environ.get("AUDIOBOOK_EXTRACT_MAX_UNITS", "100"))
+    labels: dict[str, str | list[str]] = {}
+    for start in range(0, len(entries), window_size):
+        labels.update(_label_range(client, system, entries, start, window_size, thinking))
+    return labels
+
+
+def _entry_for(span: str, inside: bool, uid: str, *, header: str = "") -> dict:
+    return {"uid": uid, "text": span.strip(), "inside": inside, "header": header}
+
+
+def _classify_units(
+    chapter: Chapter, units: list[dict], labels: dict[str, str | list[str]], cast: Cast, system_hash: str
+) -> list[Unit]:
+    """Turn per-sentence labels into source-aligned ``Unit`` rows.
+
+    A prompt unit is a whole sentence; the model labels the speaker of the quote
+    inside it. Here the sentence is split back into narration vs quoted dialogue.
+    """
+    narrator = cast.narrator()
+    result: list[Unit] = []
+    for index, unit in enumerate(units, 1):
+        label = labels.get(f"{chapter.chapter_id}-{index}")
+        sentence = chapter.text[unit["start"] : unit["end"]]
+        quote_index = 0
+        for sub in _quote_spans(sentence):
+            span = chapter.text[unit["start"] + sub["start"] : unit["start"] + sub["end"]]
+            if not sub["inside"]:
+                _append_unit(result, "narration", narrator.role_id, narrator.name, span, system_hash=system_hash)
+                continue
+            # per-quote label (list, in quote order) or a single label for the sentence
+            if isinstance(label, list):
+                sub_label = label[quote_index] if quote_index < len(label) else ""
+            else:
+                sub_label = label or ""
+            quote_index += 1
+            marked_narration = sub_label.strip() in NARRATOR_LABELS
+            if marked_narration and _looks_non_speech(span):
+                # genuine non-speech quote (term/title) -> narration
+                _append_unit(result, "narration", narrator.role_id, narrator.name, span, system_hash=system_hash)
+                continue
+            role = None if marked_narration else cast.resolve(sub_label)
+            if role is not None:
+                _append_unit(result, "dialogue", role.role_id, role.name, span, system_hash=system_hash)
+            else:
+                # out of the main cast -> fixed generic passerby (never invent a name)
+                role_id, role_name = _passerby_for(sub_label, span)
+                _append_unit(
+                    result,
+                    "dialogue",
+                    role_id,
+                    role_name,
+                    span,
+                    flags=["passerby"],
+                    confidence=0.6,
+                    system_hash=system_hash,
+                )
+    return result
 
 
 def _numbered_extract(
     client: LLMClient, chapter: Chapter, cast: Cast, system: str, system_hash: str, thinking: bool
 ) -> list[Unit]:
-    units = _minimal_units(chapter.text)
-    window_size = int(os.environ.get("AUDIOBOOK_EXTRACT_MAX_UNITS", "100"))
-    labels: dict[int, str] = {}
-    for start in range(0, len(units), window_size):
-        labels.update(_label_range(client, system, chapter, units, start, window_size, thinking))
-    narrator = cast.narrator()
-    result: list[Unit] = []
-    for index, unit in enumerate(units, 1):
-        span = chapter.text[unit["start"] : unit["end"]]
-        label = labels.get(index)
-        marked_narration = label is not None and label in NARRATOR_LABELS
-        if not unit["inside"] or (marked_narration and _looks_non_speech(span)):
-            # no quotes, or a genuine non-speech quote (term/title) -> narration
-            _append_unit(result, "narration", narrator.role_id, narrator.name, span, system_hash=system_hash)
-            continue
-        role = None if marked_narration else cast.resolve(label or "")
-        new_name = label.lstrip("*").strip() if label and label.startswith("*") else ""
-        if role is not None:
-            _append_unit(result, "dialogue", role.role_id, role.name, span, system_hash=system_hash)
-        elif new_name:
-            # the model annotated a speaker outside the (reference) roster: keep the name
-            _append_unit(
-                result,
-                "dialogue",
-                slugify(new_name),
-                new_name,
-                span,
-                flags=["new_role"],
-                confidence=0.5,
-                system_hash=system_hash,
+    units = _sentence_units(chapter.text)
+    entries = [
+        _entry_for(chapter.text[u["start"] : u["end"]], u["has_quote"], f"{chapter.chapter_id}-{index}")
+        for index, u in enumerate(units, 1)
+    ]
+    labels = _label_entries(client, system, entries, thinking)
+    return _classify_units(chapter, units, labels, cast, system_hash)
+
+
+def extract_chapters(chapters: list[Chapter], cast: Cast, client: LLMClient | None) -> list[list[Unit]]:
+    """Extract several chapters in one call (or a few windows), sharing one context."""
+    if client is None:
+        return [extract_chapter(chapter, cast, None) for chapter in chapters]
+    system = build_numbered_system(cast)
+    system_hash = prompt_hash(PROMPT_ID, system)
+    thinking = _thinking_default()
+    all_units: list[list[dict]] = []
+    entries: list[dict] = []
+    for chapter in chapters:
+        units = _sentence_units(chapter.text)
+        all_units.append(units)
+        for unit_index, unit in enumerate(units, 1):
+            entries.append(
+                _entry_for(
+                    chapter.text[unit["start"] : unit["end"]],
+                    unit["has_quote"],
+                    f"{chapter.chapter_id}-{unit_index}",
+                    header=f"【第{chapter.chapter_id}章】" if unit_index == 1 else "",
+                )
             )
-        else:
-            _append_unit(
-                result,
-                "dialogue",
-                narrator.role_id,
-                narrator.name,
-                span,
-                flags=["unresolved_role"],
-                confidence=0.3,
-                system_hash=system_hash,
-            )
-    return result
+    labels = _label_entries(client, system, entries, thinking)
+    return [_classify_units(chapter, all_units[index], labels, cast, system_hash) for index, chapter in enumerate(chapters)]
 
 
 def extract_chapter(chapter: Chapter, cast: Cast, client: LLMClient | None) -> list[Unit]:

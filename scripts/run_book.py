@@ -5,9 +5,9 @@ One resumable entry point over every stage; each stage can be run alone:
 
     prepare   clean + split the source txt          -> outputs/<book>/{source,clean}.txt + chapters/
     roster    frequency -> LLM filter -> re-scan    -> outputs/<book>/roster.json + cast.json
-    script    numbered extraction + segmentation     -> outputs/<book>/chNNN/script.csv + merged script
+    script    one-edit-at-a-time stage-play marking  -> outputs/<book>/script/chNNN.marked.txt (+roles.json)
+    convert   marked text -> script.csv (no LLM)     -> outputs/<book>/script.csv
     render    AuK zero-shot TTS per row + assembly   -> outputs/<book>/render/{rows,chapters,book.wav}
-    report    four-column HTML (optional)
 
 The LLM stages need the local llama.cpp server; this script starts it if it is not
 already up and stops it before rendering (rendering needs the whole GPU).
@@ -29,8 +29,8 @@ from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 PY = str(APP_ROOT / ".venv" / "bin" / "python")
-STAGES = ("prepare", "roster", "script", "merge", "render", "report")
-LLM_STAGES = {"roster", "script", "merge"}
+STAGES = ("prepare", "roster", "script", "convert", "render")
+LLM_STAGES = {"roster", "script"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,7 +39,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--book", required=True, help="book name (outputs/<book>)")
     parser.add_argument("--out", default=None, help="override output root")
     parser.add_argument("--voices", default="outputs/refs_bwe", help="optimized reference wav directory")
-    parser.add_argument("--stages", default=",".join(STAGES), help=f"comma list of {STAGES}")
+    parser.add_argument(
+        "--stages",
+        default="prepare,roster,script,convert,render",
+        help=f"comma list of {STAGES}",
+    )
     parser.add_argument("--llm-base-url", default=os.environ.get("AUDIOBOOK_LLM_BASE_URL", "http://127.0.0.1:8080/v1"))
     parser.add_argument("--llm-model", default=os.environ.get("AUDIOBOOK_LLM_MODEL", "spark-4b"))
     parser.add_argument("--llm-profile", default=os.environ.get("AUDIOBOOK_LLM_PROFILE", "spark-4b"))
@@ -188,39 +192,42 @@ def main() -> None:
         )
 
     if "script" in stages:
-        cmd = [
-            PY,
-            "scripts/build_book.py",
-            args.input,
-            "--out",
-            str(out),
-            "--cast",
-            str(out / "cast.json"),
-        ]
-        for flag, value in (("--start", args.start), ("--end", args.end), ("--limit", args.limit)):
-            if value:
-                cmd += [flag, str(value)]
-        if args.force:
-            cmd.append("--force")
-        _run(cmd, env=llm_env, log_path=logs_dir / "script.log")
-
-    if "merge" in stages:
+        chapter_ids = sorted(int(path.stem[2:]) for path in (out / "chapters").glob("ch*.txt"))
+        if not chapter_ids:
+            raise SystemExit(f"no chapters under {out / 'chapters'}; run the prepare stage first")
+        start = args.start or chapter_ids[0]
+        end = args.end or chapter_ids[-1]
+        if args.limit:
+            end = start + args.limit - 1
         _run(
             [
                 PY,
-                "scripts/merge_roster.py",
-                str(out),
-                "--chapters",
-                str(out / "chapters"),
-                "--roster",
-                str(out / "roster.json"),
-                "--cast-out",
-                str(out / "cast.json"),
-                "--voices",
-                args.voices,
+                "scripts/mark_script.py",
+                str(start),
+                "--count",
+                str(max(0, end - start + 1)),
+                "--book",
+                args.book,
+                "--mode",
+                "seq",
             ],
-            env=llm_env,
-            log_path=logs_dir / "merge.log",
+            env={"AUDIOBOOK_BOOK": args.book, **llm_env},
+            log_path=logs_dir / "script.log",
+        )
+
+    if "convert" in stages:
+        _run(
+            [
+                PY,
+                "scripts/marks_to_script.py",
+                "--marked-dir",
+                str(out / "script"),
+                "--cast",
+                str(out / "cast.json"),
+                "--out",
+                str(out),
+            ],
+            log_path=logs_dir / "convert.log",
         )
 
     if "render" in stages:
@@ -247,22 +254,12 @@ def main() -> None:
                 str(args.max_seconds),
                 "--target-lufs",
                 str(args.target_lufs),
+                *(["--start-chapter", str(args.start)] if args.start else []),
+                *(["--end-chapter", str(args.end)] if args.end else []),
             ],
             log_path=logs_dir / "render.log",
         )
 
-    if "report" in stages:
-        _run(
-            [
-                PY,
-                "scripts/visualize_script.py",
-                "--script",
-                str(out / "script.json"),
-                "--out",
-                "outputs/report.html",
-            ],
-            log_path=logs_dir / "report.log",
-        )
     print("\n[done] stage(s): " + ", ".join(stages), flush=True)
 
 

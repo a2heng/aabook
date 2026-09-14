@@ -94,9 +94,6 @@ def _build_chapter(chapter: Chapter, out: Path, cast: Cast, client: LLMClient, *
     write_script(rows, chapter_dir / "script.csv")
     write_script_json(rows, chapter_dir / "script.json")
     write_script_sqlite(rows, chapter_dir / "script.sqlite")
-    new_roles = sorted({row.role_name for row in rows if "new_role" in (row.flags or "").split(";")})
-    if new_roles:
-        (chapter_dir / "new_roles.json").write_text(json.dumps(new_roles, ensure_ascii=False, indent=2), encoding="utf-8")
     issues = _qa_report(rows)["issues"]
     return len(rows), issues
 

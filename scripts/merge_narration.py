@@ -43,16 +43,8 @@ def main() -> None:
         out_json.write_text(json.dumps(merged_rows, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"wrote {out_json}")
 
-    sys.path.insert(0, str(APP_ROOT / "scripts"))
-    from visualize_script import _read_or, render  # noqa: E402
-
-    src_dir = Path(args.script).parent
-    source_text = _read_or(src_dir / "source.txt")
-    clean_text = _read_or(src_dir / "clean.txt")
-    report = Path(args.report)
-    report.parent.mkdir(parents=True, exist_ok=True)
-    report.write_text(render(merged_rows, "AuK 预处理可视化（旁白合并后）", source_text, clean_text, {}), encoding="utf-8")
-    print(f"report: {report}")
+    if args.report:
+        print(f"report: skipped (visualize_script 已退役) {args.report}")
 
 
 if __name__ == "__main__":

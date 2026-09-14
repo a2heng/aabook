@@ -20,6 +20,7 @@ from .llm import LLMClient, prompt_hash
 from .schema import Cast
 
 PROMPT_ID = "agent.resolve.v2"
+AGENT_MAX_TOKENS = 1024
 
 SYSTEM_TEMPLATE = """你是中文小说说话人判定器。给定若干"说话人未确定"的对白行及其上下文，
 上下文每行格式为"角色/kind 原文"，目标行用 >> 标出。请判断每个目标行的说话人。
@@ -92,7 +93,7 @@ class RoleAgent:
         payload = None
         for thinking in (True, False):
             try:
-                payload = self.client.chat_json(self.system, user, thinking=thinking)
+                payload = self.client.chat_json(self.system, user, max_tokens=AGENT_MAX_TOKENS, thinking=thinking)
                 break
             except Exception:  # noqa: BLE001 - fall back to the other mode
                 continue

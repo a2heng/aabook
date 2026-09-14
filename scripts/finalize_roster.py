@@ -24,7 +24,7 @@ sys.path.insert(0, str(APP_ROOT))
 from audiobook.cleaning import normalize_text, read_text  # noqa: E402
 from audiobook.llm import LLMClient  # noqa: E402
 from audiobook.namefinder import FUNCTION, STOP, discover, scan_chapters, split_keywords  # noqa: E402
-from audiobook.roster import _chat, finalize, infer_gender, to_cast  # noqa: E402
+from audiobook.roster import _chat, finalize, infer_gender, load_main_names, to_cast  # noqa: E402
 from audiobook.textnorm import clean_for_llm  # noqa: E402
 
 CONTEXT_RADIUS = 16
@@ -298,7 +298,7 @@ def main() -> None:
     Path(args.out).write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[roster] wrote {args.out}: {len(result) - 1} people")
     if args.cast_out:
-        to_cast(out).save(args.cast_out)
+        to_cast(out, load_main_names(args.cast_out)).save(args.cast_out)
         print(f"[cast] wrote {args.cast_out}")
     for person in result[1:]:
         print(

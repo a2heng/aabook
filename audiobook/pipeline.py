@@ -95,6 +95,21 @@ def _rows_for_units(chapter: Chapter, units: list[Unit], cast: Cast, model_id: s
     return rows
 
 
+def rows_from_units(
+    chapter: Chapter,
+    units: list[Unit],
+    cast: Cast,
+    client: LLMClient | None,
+    model_id: str,
+    start_order: int = 0,
+) -> list[ScriptRow]:
+    """Agent/segment pre-extracted units and turn them into source-aligned rows."""
+    if client is not None:
+        RoleAgent(cast, client).run(units)
+        units = segment_units(units, cast, client)
+    return _rows_for_units(chapter, units, cast, model_id, start_order)
+
+
 def build_rows(
     chapter: Chapter,
     cast: Cast,
@@ -104,10 +119,7 @@ def build_rows(
 ) -> list[ScriptRow]:
     """Extract/agent/segment one chapter into source-aligned rows (1:1 with units)."""
     units = extract_chapter(chapter, cast, client)
-    if client is not None:
-        RoleAgent(cast, client).run(units)
-        units = segment_units(units, cast, client)
-    return _rows_for_units(chapter, units, cast, model_id, start_order)
+    return rows_from_units(chapter, units, cast, client, model_id, start_order)
 
 
 def _qa_row(row: ScriptRow) -> None:

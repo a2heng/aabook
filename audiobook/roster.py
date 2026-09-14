@@ -9,6 +9,7 @@ gender-correct reference wav from the optimized voice bank.
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 from .llm import LLMClient
@@ -44,6 +45,16 @@ FEMALE_VOICES = [
     "开朗妹妹",
 ]
 NARRATOR_VOICE = "温润君子"
+
+# Fixed generic speakers for everyone not in the (small) main cast: the model never
+# invents names; unknown dialogue is bucketed by gender into one of these four.
+PASSERBY_ROLES = [
+    {"id": "passerby_m1", "name": "路人男1", "gender": "男"},
+    {"id": "passerby_m2", "name": "路人男2", "gender": "男"},
+    {"id": "passerby_f1", "name": "路人女1", "gender": "女"},
+    {"id": "passerby_f2", "name": "路人女2", "gender": "女"},
+]
+PASSERBY_NAMES = {spec["name"] for spec in PASSERBY_ROLES}
 
 
 def _chat(client: LLMClient, system: str, user: str) -> dict | list | None:
@@ -133,13 +144,31 @@ def finalize(people: list[dict], voice_dir: str | Path) -> list[dict]:
     return [narrator, *people]
 
 
-def to_cast(roster: dict) -> Cast:
-    """Bridge the roster dictionary into the extraction ``Cast`` schema."""
+def load_main_names(cast_path: str | Path) -> list[str] | None:
+    """The fixed main-cast allowlist next to a cast file (``main_cast.json``), if any."""
+    path = Path(cast_path).parent / "main_cast.json"
+    if path.is_file():
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list) and data:
+            return [str(item) for item in data]
+    return None
+
+
+def to_cast(roster: dict, main_names: list[str] | None = None) -> Cast:
+    """Bridge the roster dictionary into the extraction ``Cast`` schema.
+
+    ``main_names`` (if given) keeps only those people as named roles -- the fixed
+    main cast with fixed voices; everyone else is served by the generic passerby
+    roles appended below.
+    """
+    main = set(main_names) if main_names else None
     cast = Cast()
     narrator = cast.narrator()
     for person in roster.get("characters", []):
         if person.get("id") == "narrator" or person.get("name") == "旁白":
             narrator.voice_ref = person.get("voice_ref", narrator.voice_ref)
+            continue
+        if main is not None and person["name"] not in main:
             continue
         cast.add(
             Role(
@@ -149,6 +178,19 @@ def to_cast(roster: dict) -> Cast:
                 kind="character",
                 description="；".join(person.get("traits", [])),
                 voice_ref=person.get("voice_ref", ""),
+            )
+        )
+    voice_dir = Path(narrator.voice_ref).parent if narrator.voice_ref else Path("outputs/refs_bwe")
+    used: set[str] = {Path(role.voice_ref).stem for role in cast.roles.values() if role.voice_ref}
+    for spec in PASSERBY_ROLES:
+        cast.add(
+            Role(
+                role_id=spec["id"],
+                name=spec["name"],
+                aliases=[],
+                kind="character",
+                description="路人/配角",
+                voice_ref=assign_voice(spec["name"], spec["gender"], voice_dir, used),
             )
         )
     return cast

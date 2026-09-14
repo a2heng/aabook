@@ -267,11 +267,16 @@ def _merge_fragments(pieces: list[tuple[dict, str, bool]], max_seconds: float) -
     return merged
 
 
+# Cap segment replies: the model occasionally runs away (repetition), and this
+# stage produces only small JSON. Keeps runaway replies from eating the budget.
+SEGMENT_MAX_TOKENS = int(os.environ.get("AUDIOBOOK_SEGMENT_MAX_TOKENS", "1024"))
+
+
 def _agent_adapt(client: LLMClient, system: str, text: str) -> list[dict]:
     payload = None
     for thinking in (False, True):
         try:
-            payload = client.chat_json(system, f"原文：\n{text}\n", thinking=thinking)
+            payload = client.chat_json(system, f"原文：\n{text}\n", max_tokens=SEGMENT_MAX_TOKENS, thinking=thinking)
             break
         except Exception:  # noqa: BLE001 - best-effort
             continue
@@ -283,7 +288,7 @@ def _agent_verify(client: LLMClient, system: str, text: str, segments: list[dict
     user = f'原文：\n{text}\n\n结果：\n{listing}\n只输出 {{"segments":[...]}}。'
     for thinking in (False, True):
         try:
-            payload = client.chat_json(system, user, thinking=thinking)
+            payload = client.chat_json(system, user, max_tokens=SEGMENT_MAX_TOKENS, thinking=thinking)
         except Exception:  # noqa: BLE001 - keep the first pass on failure
             continue
         verified = _as_segments(payload)
@@ -351,6 +356,63 @@ def _merge_narration(units: list[Unit]) -> list[Unit]:
     return merged
 
 
+def _split_deterministic(raw: str, cap: float) -> list[str]:
+    """Sentence/clause/char split of a long raw span (no LLM, raw-aligned)."""
+    sentences = [part for part in _SENTENCE_RE.findall(raw) if part.strip()] or [raw]
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        candidate = current + sentence
+        if current and estimate_text_duration(strip_quotes(candidate)) > cap:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    budget = max(8, int(cap / (SECONDS_PER_CJK_CHAR * CHAR_BOOST * STANDARD_RATE)))
+    out: list[str] = []
+    for chunk in chunks:
+        if estimate_text_duration(strip_quotes(chunk)) <= cap:
+            out.append(chunk)
+            continue
+        clauses = [part for part in _CLAUSE_RE.findall(chunk) if part.strip()] or [chunk]
+        current = ""
+        for clause in clauses:
+            candidate = current + clause
+            if current and estimate_text_duration(strip_quotes(candidate)) > cap:
+                out.append(current)
+                current = clause
+            else:
+                current = candidate
+        if current:
+            out.append(current)
+    final: list[str] = []
+    for piece in out:
+        while len(piece) > budget:
+            final.append(piece[:budget])
+            piece = piece[budget:]
+        if piece:
+            final.append(piece)
+    return final
+
+
+def _deterministic_units(units: list[Unit], cap: float) -> list[Unit]:
+    """Fast path: no LLM. Split over-long units raw-aligned, then merge narration."""
+    result: list[Unit] = []
+    for unit in units:
+        source = unit.raw_text or unit.tts_text
+        if estimate_text_duration(unit.tts_text) <= cap:
+            result.append(unit)
+            continue
+        for piece in _split_deterministic(source, cap):
+            tts = strip_quotes(piece)
+            if not any(char.isalnum() for char in tts):
+                continue
+            result.append(replace(unit, raw_text=piece, tts_text=tts, flags=[*unit.flags, "split_only"]))
+    return _merge_narration(result)
+
+
 def segment_units(
     units: list[Unit],
     cast: Cast,
@@ -360,13 +422,15 @@ def segment_units(
     verify: bool = False,
 ) -> list[Unit]:
     """One agent pass per unit: segment by ``next`` anchors and rewrite declarations only."""
+    cap = max_seconds if max_seconds > 0 else MAX_SEGMENT_SECONDS
     if client is None:
         return units
+    if os.environ.get("AUDIOBOOK_SEGMENT", "1").lower() in ("0", "off", "false", "no"):
+        return _deterministic_units(units, cap)
     system = build_system()
     verify_system = build_verify_system()
     system_hash = segment_prompt_hash()
     narrator = cast.narrator()
-    cap = max_seconds if max_seconds > 0 else MAX_SEGMENT_SECONDS
     result: list[Unit] = []
     for unit in units:
         source = unit.raw_text or unit.tts_text
