@@ -166,7 +166,15 @@ class ScriptServer:
         index = self.text.find(needle)
         if index >= 0:
             return index
-        return self.text.translate(_QUOTE_CANON).find(needle.translate(_QUOTE_CANON))
+        index = self.text.translate(_QUOTE_CANON).find(needle.translate(_QUOTE_CANON))
+        if index >= 0:
+            return index
+        # tolerate a needle that accidentally includes mark syntax characters
+        if any(char in needle for char in (MARK_OPEN, MARK_SEP, MARK_CLOSE)):
+            plain = needle.replace(MARK_OPEN, "").replace(MARK_SEP, "").replace(MARK_CLOSE, "")
+            if plain:
+                return self.text.find(plain)
+        return -1
 
     def _locate(self, text: str, strip: bool = False) -> tuple[int, int] | None:
         text = (text or "").strip()
