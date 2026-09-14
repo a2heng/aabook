@@ -99,52 +99,74 @@ def live_fragments(original: str, current: str) -> list[dict]:
     """
     import difflib
 
-    fragments: list[dict] = []
+    # Strip the marker syntax from the current text first, remembering which regions are
+    # speech. Diffing the *flattened* text keeps the alignment stable (otherwise difflib
+    # can split ⦃ and ␟ away from the role and the marker shows up as literal characters).
+    flat: list[str] = []
+    spans: list[tuple[int, int, str]] = []
     role: str | None = None
+    span_start = 0
+    index = 0
+    while index < len(current):
+        if current.startswith(MARK_OPEN, index):
+            sep = current.find(MARK_SEP, index)
+            if sep >= 0:
+                role = current[index + 1 : sep]
+                span_start = len(flat)
+                index = sep + 1
+                continue
+        if current.startswith(MARK_CLOSE, index):
+            if role is not None:
+                spans.append((span_start, len(flat), role))
+            role = None
+            index += 1
+            continue
+        flat.append(current[index])
+        index += 1
+    flattened = "".join(flat)
 
-    def push(kind: str, text: str) -> None:
+    fragments: list[dict] = []
+
+    def push(kind: str, text: str, who: str | None = None) -> None:
         if not text:
             return
         last = fragments[-1] if fragments else None
-        if last and last["kind"] == kind and last.get("role") == role:
+        if last and last["kind"] == kind and last.get("role") == who:
             last["text"] += text
         else:
             item: dict = {"kind": kind, "text": text}
             if kind == "speech":
-                item["role"] = role or ""
+                item["role"] = who or ""
             fragments.append(item)
 
-    def scan(text: str, default: str) -> None:  # walk a current-text chunk, applying marker state
-        nonlocal role
-        index = 0
-        while index < len(text):
-            if text.startswith(MARK_OPEN, index):
-                sep = text.find(MARK_SEP, index)
-                if sep >= 0:
-                    role = text[index + 1 : sep]
-                    index = sep + 1
-                    continue
-            if text.startswith(MARK_CLOSE, index):
-                role = None
-                index += 1
-                continue
-            stops = [pos for pos in (text.find(MARK_OPEN, index), text.find(MARK_CLOSE, index)) if pos >= 0]
-            nxt = min(stops) if stops else len(text)
-            if nxt <= index:  # malformed marker (e.g. ⦃ with no ␟): treat as plain text and advance
-                nxt = index + 1
-            push("speech" if role else default, text[index:nxt])
-            index = nxt
+    def role_at(pos: int) -> str | None:
+        for start, end, who in spans:
+            if start <= pos < end:
+                return who
+        return None
 
-    matcher = difflib.SequenceMatcher(None, original, current, autojunk=False)
+    def emit(start: int, end: int, default: str) -> None:  # walk a flat range, splitting on speech spans
+        while start < end:
+            who = role_at(start)
+            stop = end
+            for span_start, span_end, _ in spans:
+                if start < span_start < stop:
+                    stop = span_start
+                if start < span_end < stop:
+                    stop = span_end
+            push("speech" if who else default, flattened[start:stop], who)
+            start = stop
+
+    matcher = difflib.SequenceMatcher(None, original, flattened, autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
-            scan(current[j1:j2], "narration")
+            emit(j1, j2, "narration")
         elif tag == "delete":
             push("deleted", original[i1:i2])
         else:  # insert / replace
             if tag == "replace":
                 push("deleted", original[i1:i2])
-            scan(current[j1:j2], "inserted")
+            emit(j1, j2, "inserted")
     return fragments
 
 
