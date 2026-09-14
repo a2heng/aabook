@@ -130,6 +130,8 @@ def live_fragments(original: str, current: str) -> list[dict]:
                 continue
             stops = [pos for pos in (text.find(MARK_OPEN, index), text.find(MARK_CLOSE, index)) if pos >= 0]
             nxt = min(stops) if stops else len(text)
+            if nxt <= index:  # malformed marker (e.g. ⦃ with no ␟): treat as plain text and advance
+                nxt = index + 1
             push("speech" if role else default, text[index:nxt])
             index = nxt
 

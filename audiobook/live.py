@@ -36,20 +36,20 @@ header{height:52px;display:flex;gap:16px;align-items:center;padding:0 18px;borde
 .stat{display:flex;gap:14px;font-size:12.5px;color:var(--dim);white-space:nowrap}.stat b{color:var(--fg)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok);display:inline-block}
 #main{display:grid;grid-template-columns:1fr 380px;height:calc(100vh - 52px)}
-#left{display:flex;flex-direction:column;min-width:0;border-right:1px solid var(--line)}
+#left{display:flex;flex-direction:column;min-width:0;min-height:0;border-right:1px solid var(--line)}
 #chbar{display:flex;gap:10px;align-items:center;padding:8px 16px;border-bottom:1px solid var(--line);font-size:13px}
 #chbar select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:4px 8px;font-size:13px}
 #chbar .chip{font-size:11.5px;color:var(--dim);background:var(--panel2);border:1px solid var(--line);padding:1px 8px;border-radius:99px}
 #chbar button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:4px 10px;cursor:pointer;font-size:12.5px}
 #chbar button.on{background:var(--accent);color:#0b0f15;border-color:var(--accent);font-weight:700}
-#article{overflow:auto;padding:20px 30px 60px;flex:1;font-size:15.5px;line-height:2.05;white-space:pre-wrap;word-break:break-word;
+#article{overflow:auto;min-height:0;padding:20px 30px 60px;flex:1;font-size:15.5px;line-height:2.05;white-space:pre-wrap;word-break:break-word;
   background:radial-gradient(900px 400px at 30% -10%,#17203355,transparent)}
 .who{display:inline-block;font-size:11.5px;font-weight:700;color:#9fd0ff;background:#16314f;border-radius:6px;padding:0 7px;margin:0 3px 0 2px;vertical-align:1px;line-height:1.7}
 .speech{background:#152238;border-radius:8px;padding:2px 6px;box-shadow:inset 0 0 0 1px #2b4a72}
 del{color:#ff9d9d;background:#2a1414;text-decoration:line-through;border-radius:5px;padding:1px 3px}
 ins{color:#9fe6c1;background:#122a1c;text-decoration:none;border-radius:5px;padding:1px 5px}
 .new{animation:appear .6s ease both}@keyframes appear{from{opacity:0;filter:blur(2px)}to{opacity:1;filter:none}}
-#chat{overflow:hidden;padding:10px 12px;display:flex;flex-direction:column;justify-content:flex-end;gap:5px}
+#chat{overflow:hidden;min-height:0;padding:10px 12px;display:flex;flex-direction:column;justify-content:flex-end;gap:5px}
 .ev{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:5px 9px;font-size:12.5px;line-height:1.55;word-break:break-word}
 .ico{display:inline-block;width:15px;margin-right:5px;text-align:center;opacity:.9}
 .think{color:var(--dim);background:#12161d}.think summary{cursor:pointer;font-size:12px}
