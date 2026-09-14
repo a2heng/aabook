@@ -25,7 +25,7 @@
     - MCP 原语（仅 `set_text`/`edit`/`get_marked`）在 `scripts/script_mcp_server.py`，客户端 `audiobook/mcp.py`。
     - 产物：`outputs/<book>/script/{chNNN.marked.txt, roles.json, summary.txt, *.html(段落表+diff)}`。
   - **预处理**：`cleaning`（编码/引号/去页码）+ `textnorm.clean_for_llm`（**通用字符白名单**：只留 L/N/P/M 类别，LLM 前生效）。站点广告/元数据在输入 txt 层一次性删除。
-  - **适用范围**：目前只在一部中文网文（本地示例语料）上验证过；换小说需重写「人物脚本」提示词（`scripts/mark_script.py` 的 `SYSTEM/ROSTER_SYSTEM` 示例），其它阶段通用。（`finalize_roster.py`/`namefinder` 等频率发现路径已不再进入主流程。）
+  - **适用范围**：目前只在一部中文网文（本地示例语料）上验证过；换小说需重写「人物脚本」提示词（`scripts/mark_script.py` 的 `SYSTEM/ROSTER_SYSTEM` 示例），其它阶段通用。频率发现/固定人名表（`finalize_roster`/`namefinder`/`roster`）与旧 LLM 抽取/断句/合并路径（`extract`/`segment`/`agent`/`pipeline`/`merge_roster`/`merge_narration`）已删除。
   - 后端：`voicebank`（instruct 造参考音 → whisper ASR → 克隆）、`renderer`（AuK `zero_shot_tts` 逐行，可续跑）、`assembler`（拼接 + -14 LUFS）；CLI `scripts/build_voicebank.py`、`scripts/render_book.py`。参考音准备：`scripts/prepare_refs.py`（24kHz 单声道、≤12s、去静音）。
   - 输出统一在 `outputs/<book>/`；LLM 缓存 `.cache/llm/`；两者均已 gitignore。
   - 局域网浏览/试听：`scripts/serve_files.py`，systemd `auk-files.service`（`:8899`）。

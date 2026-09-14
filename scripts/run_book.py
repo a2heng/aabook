@@ -162,7 +162,7 @@ def main() -> None:
 
     if "prepare" in stages:
         _run(
-            [PY, "scripts/build_book.py", args.input, "--out", str(out), "--prepare-only"],
+            [PY, "scripts/build_book.py", args.input, "--out", str(out)],
             log_path=logs_dir / "prepare.log",
         )
 

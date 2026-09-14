@@ -23,7 +23,7 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 TEXT_EXTS = {".txt", ".md", ".csv", ".json", ".jsonl", ".log", ".py", ".yaml", ".yml", ".srt"}
@@ -76,6 +76,24 @@ class _RangeFile(io.BufferedIOBase):
 class FileBrowser(SimpleHTTPRequestHandler):
     server_version = "AukFiles/1.0"
 
+    def do_GET(self) -> None:
+        # Short alias: /live -> the marking live page (default book "dawn", ?book= to switch).
+        parsed = urlparse(self.path)
+        if parsed.path.rstrip("/") == "/live":
+            book = parse_qs(parsed.query).get("book", ["dawn"])[0]
+            target = Path(self.directory) / "outputs" / book / "script" / "live.html"
+            if target.is_file():
+                data = target.read_bytes()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            self.send_error(HTTPStatus.NOT_FOUND, "live page not found")
+            return
+        super().do_GET()
+
     def send_head(self) -> io.BufferedIOBase | io.BytesIO | None:
         path = Path(self.translate_path(self.path))
         if path.is_dir():
@@ -84,7 +102,9 @@ class FileBrowser(SimpleHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND, "File not found")
             return None
 
-        if path.suffix.lower() in TEXT_EXTS and path.stat().st_size <= TEXT_INLINE_MAX:
+        range_header = self.headers.get("Range")
+
+        if not range_header and path.suffix.lower() in TEXT_EXTS and path.stat().st_size <= TEXT_INLINE_MAX:
             payload = decode_text(path.read_bytes()).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", self.guess_type(str(path)))
@@ -101,7 +121,6 @@ class FileBrowser(SimpleHTTPRequestHandler):
         stat = os.fstat(handle.fileno())
         size = stat.st_size
         content_type = self.guess_type(str(path))
-        range_header = self.headers.get("Range")
         match = _RANGE_RE.match(range_header) if range_header else None
         if match:
             start = int(match.group(1) or 0)

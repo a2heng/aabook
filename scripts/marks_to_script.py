@@ -35,6 +35,7 @@ def cast_from_roles(roles_path: Path) -> Cast:
     cast.narrator()
     return cast
 
+
 CHAPTER_RE = re.compile(r"ch(\d+)")
 
 

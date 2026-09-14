@@ -1,6 +1,6 @@
 """AuK-backed renderer: ``ScriptRow`` -> per-segment wav (resumable, cached).
 
-Torch/AuK are imported lazily so the front-end (``audiobook.pipeline``) never
+Torch/AuK are imported lazily so the marking front-end (``scripts/mark_script.py``) never
 needs a GPU. Rows are rendered independently so a long book can be resumed and
 parallelised later.
 """

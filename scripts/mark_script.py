@@ -39,6 +39,7 @@ from audiobook.marks import (  # noqa: E402
     render_html,
     unmarked_quotes,
 )
+from audiobook.live import Live  # noqa: E402
 from audiobook.mcp import MCPClient  # noqa: E402
 
 SYSTEM = """你是把「阅读文本」改编成「舞台剧台本」的编剧：人物说出的台词要标出发言角色，旁白原样保留，最终交机器朗读。
@@ -107,7 +108,7 @@ def dict_text(roster: dict[str, list[str]], chapter_text: str) -> str:
     return "人物词典（规范名（标签…），role 只能写规范名）：\n- " + "\n- ".join(lines)
 
 
-def maintain_roster(llm: LLMClient, roster: dict[str, list[str]], chapter_text: str) -> None:
+def maintain_roster(llm: LLMClient, roster: dict[str, list[str]], chapter_text: str) -> int:
     """Extract this chapter's new labels and merge them into the dictionary (in place)."""
     existing = "\n".join(f"{name}: {'、'.join(labels)}" for name, labels in roster.items())
     try:
@@ -118,9 +119,9 @@ def maintain_roster(llm: LLMClient, roster: dict[str, list[str]], chapter_text: 
         )
     except Exception as error:  # noqa: BLE001 - dictionary is best-effort
         print(f"  [roster] 维护失败：{str(error)[:120]}", flush=True)
-        return
+        return 0
     if not isinstance(result, dict):
-        return
+        return 0
     added = 0
     for name, labels in result.items():
         name = str(name).strip()
@@ -134,6 +135,7 @@ def maintain_roster(llm: LLMClient, roster: dict[str, list[str]], chapter_text: 
                 added += 1
     if added:
         print(f"  [roster] 新增 {added} 个标签，词条 {len(roster)}", flush=True)
+    return added
 
 
 def compress(llm: LLMClient, summary: str, chapter_text: str, marked: str) -> str:
@@ -168,7 +170,7 @@ def resolve_label(roster: dict[str, list[str]], name: str) -> str:
     return name
 
 
-def run_turn(client, config, tools, mcp, messages, max_steps, counters) -> None:
+def run_turn(client, config, tools, mcp, messages, max_steps, counters, live: Live | None = None, chapter: int = 0) -> None:
     """Tool loop until the model stops calling tools. Guards against a failing retry loop."""
     errors = 0
     last_sig, repeats, fail_total = "", 0, 0
@@ -200,6 +202,8 @@ def run_turn(client, config, tools, mcp, messages, max_steps, counters) -> None:
             for tc in (message.tool_calls or [])
         ]
         messages.append({"role": "assistant", "content": message.content or "", "tool_calls": tool_calls or None})
+        if live is not None and message.content:
+            live.emit("assistant", chapter=chapter, content=message.content[:2000])
         if not tool_calls:
             return
         for call in tool_calls:
@@ -211,6 +215,13 @@ def run_turn(client, config, tools, mcp, messages, max_steps, counters) -> None:
             result = mcp.call(call["function"]["name"], arguments)
             counters["tool_calls"] += 1
             print(f"  {call['function']['name']} {str(arguments)[:60]} -> {result[:70]}", flush=True)
+            if live is not None:
+                live.emit("tool", chapter=chapter, call=call["function"]["name"], args=arguments)
+                live.emit(
+                    "result", chapter=chapter, ok=('"ok": false' not in result and "not found" not in result), result=result[:500]
+                )
+                current = json.loads(mcp.call("get_marked", {}))["text"]
+                live.set_state(chapter, len(current), parse_marks(current))
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
             if '"ok": false' in result or "not found" in result:
                 fail_total += 1
@@ -251,6 +262,8 @@ def main() -> None:
     else:  # count<=0 -> every chapter from `chapter` to the end
         ids = [cid for cid in sorted(int(p.stem[2:]) for p in chapters.glob("ch*.txt")) if cid >= args.chapter]
 
+    live = Live(out_dir / "live.jsonl")
+    live.emit("start", total=len(ids), book=args.book, mode=args.mode)
     roster = load_roster(args.book)
     counters = {"llm_s": 0.0, "llm_calls": 0, "tool_calls": 0}
     started = time.perf_counter()
@@ -263,7 +276,10 @@ def main() -> None:
             print(f"[skip] ch{cid:03d} 已存在", flush=True)
             continue
         text = (chapters / f"ch{cid:03d}.txt").read_text(encoding="utf-8")
-        maintain_roster(llm, roster, text)  # mine characters when the big text is injected
+        live.emit("chapter", chapter=cid, chars=len(text))
+        live.set_state(cid, len(text), parse_marks(text))
+        added = maintain_roster(llm, roster, text)  # mine characters when the big text is injected
+        live.emit("roster", chapter=cid, added=added, roles=len(roster))
         system = (THINK_TOKEN if THINK else "") + SYSTEM + "\n\n" + dict_text(roster, text)
         preface = f"【前情摘要】\n{summary}\n\n" if (args.mode == "seq" and summary) else ""
         mcp.call("set_text", {"text": text})
@@ -278,6 +294,8 @@ def main() -> None:
             ],
             args.max_steps,
             counters,
+            live,
+            cid,
         )
         for _ in range(3):  # completeness: re-feed leftover quotes until none remain
             left = unmarked_quotes(json.loads(mcp.call("get_marked", {}))["text"])
@@ -298,6 +316,8 @@ def main() -> None:
                 ],
                 args.max_steps,
                 counters,
+                live,
+                cid,
             )
         snapshot = json.loads(mcp.call("get_marked", {}))["text"]
         for seg in parse_marks(snapshot):  # normalise any label/alias to the canonical name
@@ -313,6 +333,7 @@ def main() -> None:
         left = len(unmarked_quotes(snapshot))
         phases.append({"chapter": cid, "chars": len(snapshot), "leftover": left, "roles": len(roster)})
         print(f"[{args.mode}] ch{cid:03d} chars={len(snapshot)} leftover={left} 词条={len(roster)}", flush=True)
+        live.emit("done", chapter=cid, leftover=left, roles=len(roster), summary=summary)
     (out_dir / "summary.txt").write_text(summary, encoding="utf-8")
 
     marked = "\n".join((out_dir / f"ch{cid:03d}.marked.txt").read_text(encoding="utf-8") for cid in ids)
