@@ -33,8 +33,7 @@ def normalize_tts(text: str | None) -> str:
     if not text:
         return ""
     text = text.replace("——", "，").replace("—", "，")
-    text = re.sub(r"…+|\.{2,}", "。", text)  # ellipsis reads as a full stop, not a weak pause
-    text = re.sub(r"。{2,}", "。", text)
+    text = re.sub(r"\.{2,}", "……", text)  # ASCII dots -> Chinese ellipsis; ellipsis itself is kept
     text = re.sub(r"[，、；：]{2,}", "，", text)
     text = re.sub(r"([。！？…])[，、；：]+", r"\1", text)
     text = re.sub(r"[，、；：]+([。！？…])", r"\1", text)
@@ -50,15 +49,14 @@ def clean_for_llm(text: str | None) -> str:
 
 
 _UNWANTED_RE = re.compile(r"·{2,}|—{2,}|-{2,}|＊+|#{2,}")
-_ELLIPSIS_RE = re.compile(r"…+|\.{2,}")
 _WS_RE = re.compile(r"[\s\u3000]+")
 
 
 def one_paragraph(text: str | None) -> str:
     """Code-side preprocessing done ONCE, before the LLM: collapse the chapter to a
-    single paragraph, turn ellipsis into a full stop, dashes / decorative repeats into
-    a comma, and drop unwanted whitespace. The model never has to do any of this."""
-    text = _ELLIPSIS_RE.sub("。", text or "")
+    single paragraph, turn ASCII ellipsis / dashes / decorative repeats into a comma
+    (Chinese ellipsis ``……`` is kept), and drop unwanted whitespace."""
+    text = re.sub(r"\.{2,}", "……", text or "")
     text = _UNWANTED_RE.sub("，", text)
     text = re.sub(r"。{2,}", "。", text)
     text = re.sub(r"，{2,}", "，", text)

@@ -31,9 +31,9 @@ chapters can be concatenated without level jumps between speakers.
 
 TARGET_LUFS = -16.0
 PEAK_CEILING = 0.95
-SAME_SPEAKER_GAP = 0.25
-SPEAKER_CHANGE_GAP = 0.40
-KIND_CHANGE_GAP = 0.50
+SAME_SPEAKER_GAP = float(os.environ.get("AUDIOBOOK_GAP_SAME", "0.25"))
+SPEAKER_CHANGE_GAP = float(os.environ.get("AUDIOBOOK_GAP_SPEAKER", "0.40"))
+KIND_CHANGE_GAP = float(os.environ.get("AUDIOBOOK_GAP_KIND", "0.50"))
 
 # Final deliverables default to MP3 64k: the most portable lossy format. Opus
 # and AAC are available and smaller/better at equal bitrate if compatibility allows.
@@ -302,6 +302,11 @@ def is_event_tag(tag: str | None) -> bool:
     """Accept the curated set or any short Chinese tag (free-form vocabulary)."""
     cleaned = normalize_tag(tag)
     return bool(cleaned) and (cleaned in VOCAL_EVENTS or bool(_CJK_RE.match(cleaned)))
+
+
+def is_vocal_event(tag: str | None) -> bool:
+    """Strict MCP validation for the marking ``tag``: curated words only."""
+    return normalize_tag(tag) in VOCAL_EVENTS
 
 
 def find_tags(text: str | None) -> list[str]:

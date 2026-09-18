@@ -44,6 +44,24 @@ class ModelProfile:
 
 # Qwen3.5 official sampling (model card "Best Practices") + froggeric template for Qwen3.8.
 PROFILES: dict[str, ModelProfile] = {
+    "bonsai-27b": ModelProfile(
+        key="bonsai-27b",
+        repo="prism-ml/Ternary-Bonsai-27B-gguf",
+        gguf="ckpts/llm/Ternary-Bonsai-27B-PQ2_0.gguf",
+        arch="qwen35 (Bonsai 27B ternary, DSpark drafter)",
+        context=262144,
+        temperature=0.7,
+        top_p=0.95,
+        top_k=20,
+        min_p=0.0,
+        presence_penalty=0.0,
+        repetition_penalty=1.0,
+        thinking_off_kwargs={"enable_thinking": False},
+        notes="PrismML Bonsai 27B ternary: README sampling temp 0.7 / top_p 0.95 / top_k 20 (thinking mode); "
+        "needs the PrismML llama.cpp fork (third_party/llama.cpp -> build/llama-cpp; upstream must use Q2_g64, "
+        "fork uses PQ2_0); DSpark draft converted with gguf_dspark_to_dflash.py --drop-shared-tensors; "
+        "serve: --spec-type draft-dspark --spec-draft-n-max 4, KV q4_0.",
+    ),
     "qwen3.5-9b": ModelProfile(
         key="qwen3.5-9b",
         repo="unsloth/Qwen3.5-9B-MTP-GGUF",

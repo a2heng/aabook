@@ -18,9 +18,10 @@ MARK_RE = os.environ.get("AUDIOBOOK_MARK_RE", r"<([^<>\n]{1,24})>(.*?)</\1>")
 MARKS_RE = re.compile(MARK_RE, re.DOTALL)
 NARRATOR = "旁白"
 
-# A short narration between two speech spans of the SAME role is a breath/beat, not a
-# speaker change: drop it and merge the speech into one row so TTS is called once.
-MAX_INTERRUPT_CHARS = int(os.environ.get("AUDIOBOOK_MERGE_INTERRUPT_CHARS", "12"))
+# A short narration between two speech spans of the SAME role is a breath/beat. By default we
+# KEEP it (never drop narration text) as its own narration row; set a positive
+# AUDIOBOOK_MERGE_INTERRUPT_CHARS to absorb such beats into one speech row instead.
+MAX_INTERRUPT_CHARS = int(os.environ.get("AUDIOBOOK_MERGE_INTERRUPT_CHARS", "0"))
 
 
 def mark(role: str, text: str) -> str:
@@ -101,19 +102,12 @@ _QUOTE_CHARS = '“”‘’「」『』"'
 
 
 def strip_quotes(marked: str) -> tuple[str, int]:
-    """Drop every leftover quote mark outside tags (chapter-end cleanup). Returns (text, count)."""
-    stripped = MARKS_RE.sub("", marked)
-    count = sum(stripped.count(char) for char in _QUOTE_CHARS)
+    """Drop every leftover quote mark -- inside tags too: quotes are never spoken.
+    Returns (text, count)."""
+    count = sum(marked.count(char) for char in _QUOTE_CHARS)
     if not count:
         return marked, 0
-    parts: list[str] = []
-    last = 0
-    for match in MARKS_RE.finditer(marked):
-        parts.append(marked[last : match.start()].translate({ord(char): None for char in _QUOTE_CHARS}))
-        parts.append(match.group(0))
-        last = match.end()
-    parts.append(marked[last:].translate({ord(char): None for char in _QUOTE_CHARS}))
-    return "".join(parts), count
+    return marked.translate({ord(char): None for char in _QUOTE_CHARS}), count
 
 
 def render_html(segments: list[dict], marked: str, path) -> None:
@@ -176,6 +170,8 @@ def live_fragments(original: str, current: str) -> list[dict]:
     def push(kind: str, text: str, who: str | None = None) -> None:
         if not text:
             return
+        if kind == "deleted" and (not text.strip() or all(char in _QUOTE_CHARS for char in text)):
+            return  # quote marks are removed mechanically: no diff card, keep speech continuous
         last = fragments[-1] if fragments else None
         if last and last["kind"] == kind and last.get("role") == who:
             last["text"] += text

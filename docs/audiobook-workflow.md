@@ -26,7 +26,7 @@ stages（可续跑，自动起停本地 LLM）：`prepare → script → convert
 | convert | `marks_to_script.py --marked-dir outputs/<book>/script --out outputs/<book>` | `script.csv`、`script.json` |
 | render | `render_book.py --script outputs/<book>/script.csv ...` | `render/{rows,chapters,book.wav}` |
 
-预处理：`cleaning`（编码/引号/去页码；方括号只去 `[` `]` 符号、**不删括号里的字**）→ `textnorm.clean_for_llm`（通用字符白名单 + 标点规范化，**省略号统一变 `。`**，LLM 前生效）。站点广告/元数据在输入 TXT 层先删掉。
+预处理：`cleaning`（编码/引号/去页码；方括号只去 `[` `]` 符号、**不删括号里的字**）→ `textnorm.clean_for_llm`（通用字符白名单 + 标点规范化，**省略号保留 `……`**，ASCII `...` 归一为 `……`，LLM 前生效）。站点广告/元数据在输入 TXT 层先删掉。
 
 ## 标记约定
 
@@ -67,6 +67,12 @@ http://<host>:8899/outputs/<book>/script/live.html
 页面按聊天气泡展示：人物挖掘、每次 `edit` 调用与结果、每章摘要。
 
 **原始 LLM 输入/输出**（监督用）：`script/llm_raw.html`（请求的每条 message 可展开、原始 reasoning/content/tool_calls，1.5s 自刷新）与 `script/llm_raw.jsonl`（逐条 JSONL，含 roster 与标注两类调用）；每次运行开始会清空。
+
+### 合并与间隔（后端）
+
+- `audiobook/marks.py::parse_marks`：**相邻旁白自动合并成一段**（一次 TTS 生成）；相邻**同角色**台词合并。
+- 同角色台词之间的短旁白**默认保留**（`AUDIOBOOK_MERGE_INTERRUPT_CHARS=0`，绝不丢旁白）；需要更连贯时可设正值（如 12/24），把 ≤N 字的短旁白吞并进台词——会丢字，慎用。
+- 拼接间隔可调（`audiobook/tts.py`）：`AUDIOBOOK_GAP_SAME`（同角色，默认 0.25s）、`AUDIOBOOK_GAP_SPEAKER`（换角色 0.40s）、`AUDIOBOOK_GAP_KIND`（旁白↔台词 0.50s）。
 
 ## 产物
 

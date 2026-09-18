@@ -62,9 +62,12 @@ if [ -n "$TEMPLATE" ] && [ -f "$TEMPLATE" ]; then
   template_args=(--chat-template-file "$TEMPLATE")
 fi
 
+# Keep prompt caching ON: `--no-cache-idle-slots` and `--ctx-checkpoints 0` used to disable
+# reuse, so every tool round-trip re-prefilled the whole conversation (~2s x 20-45 calls per
+# chapter). Do not add them back.
 exec "$BIN/llama-server" \
   -m "$MODEL" --host 127.0.0.1 --port "$PORT" --jinja \
-  -np 1 --ctx-checkpoints 0 --no-cache-idle-slots \
+  -np 1 \
   --reasoning-format deepseek --reasoning-budget "$BUDGET" \
   -ngl "$NGL" -c "$CTX" -b "$BATCH" -ub "$UBATCH" -fa "$FA" \
   -ctk "$KV" -ctv "$KV" \

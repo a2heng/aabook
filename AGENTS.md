@@ -4,6 +4,7 @@
 
 - **唯一 TTS = Breeze TTS 2**：子模块 `third_party/Breeze-TTS-2.cpp`（C++/GGUF，含嵌套 `third_party/ggml`）+ 参考实现 `third_party/breeze-tts`。**两者均保持 pristine，一行不改**。
 - **唯一 LLM = Qwen3.5-9B（MTP）**：本地 llama.cpp（CUDA）起 OpenAI 兼容服务，用于剧本标注；权重 `ckpts/llm/Qwen3.5-9B-UD-Q4_K_XL.gguf`（unsloth Dynamic 2.0，~5.9 GB，**内置 MTP head**，`--spec-type draft-mtp --spec-draft-n-max 6`）。用**模型自带 chat template**（`scripts/serve_llm_cuda.sh` 默认不传模板；`qwen_chat_template.jinja`/froggeric 是 Qwen3.8 时代的修正模板，勿用于 3.5）；采样按官方 thinking：temp 1.0 / top_p 0.95 / top_k 20 / presence_penalty 1.5。备选提速：`z-lab/Qwen3.5-9B-DFlash`（本地 `convert_hf_to_gguf.py --target-model-dir` 转 GGUF 后 `--spec-type draft-dflash`，无 9B DSpark）。`ckpts/llm` 其余模型（gemma-4-E4B、Qwen3.8-27B、Ornith、Spark）保留备选。
+- **备选 LLM = Bonsai 27B（Ternary + DSpark）**：PrismML 的 llama.cpp fork 已做子模块 `third_party/llama.cpp`，编到 `build/llama-cpp/`（CUDA 参数同 Breeze）；权重只能用 fork 专用的 `ckpts/llm/Ternary-Bonsai-27B-PQ2_0.gguf`（上游 llama.cpp 用 `Q2_g64`，别混）；DSpark 草稿要先转：`gguf_dspark_to_dflash.py --drop-shared-tensors <legacy-Q4_1> <PQ2_0> <out-dflash.gguf>`。启动：`AUDIOBOOK_LLAMA_BIN=build/llama-cpp/bin` + `--spec-type draft-dspark --spec-draft-n-max 4` + KV q4_0；采样 temp 0.7 / top_p 0.95 / top_k 20。实测 98 tok/s（无草稿 62.6）@200W。
 - **我们的代码在外层**：`audiobook/`（前端 + Breeze 渲染）、`scripts/`、`tests/`、`requirements.txt`、`AGENTS.md`。
 - 运行环境：外层 `.venv`，依赖见 `requirements.txt`。Python 侧只做音频 I/O、ASR、响度、LLM 客户端；**不再需要 torch**。
 - **目录规划**：`outputs/<book>/` 只放书产物；`build/breeze-cpp/` 放 Breeze 编译/试听产物；`benchmarks/` 放基准结果；`.cache/llm/`、`.cache/logs/` 放 LLM 缓存与服务日志。以上均已 gitignore。
@@ -29,7 +30,7 @@
   - **补漏**：章末 `unmarked_quotes` 找出未处理引号，回炉重标直到 0。
   - MCP 原语（`set_text`/`edit`/`get_marked`）**内联在 `scripts/mark_script.py`**（`ScriptServer` + in-process `MCPClient`，无子进程）。
   - 产物：`outputs/<book>/script/{chNNN.marked.txt, roles.json, summary.txt, *.html}`。
-- **预处理**：`cleaning`（编码/引号/去页码/**第一步去方括号——只去 `[` `]` 符号、保留括号内文字**）+ `textnorm.clean_for_llm`（只做字符白名单 L/N/P/M + 标点规范化；**省略号 `……`/`...` → `。`**）；**不做小句切分**，整章直接送 LLM。
+- **预处理**：`cleaning`（编码/引号/去页码/**第一步去方括号——只去 `[` `]` 符号、保留括号内文字**）+ `textnorm.clean_for_llm`（只做字符白名单 L/N/P/M + 标点规范化；**省略号保留 `……`，ASCII `...` 归一为 `……`**）；**不做小句切分**，整章直接送 LLM。
 - **Vocal events**：单一数据源 `audiobook/tts.py` 的 `VOCAL_EVENTS`（官方中文例子 `[笑]/[叹气]/[咳嗽]/[清嗓子]`，词表开放，`is_event_tag` 放行自由词）；标注 `speak` 可带 `tag`，程序写成 `[tag]` 前置；渲染器检测到 tag 自动把 cfg 提到 2.5。
 - **速度**：Breeze 无时长/语速参数（自己决定停）；快慢用 direction 指令（`语速放慢`）、参考音语速，或后处理 `tts.atempo`（`row.speed` / `--speed`，保音高）。
 - 后端**单文件** `audiobook/tts.py`：Breeze HTTP 渲染（可续跑）+ 拼接/响度（-16 LUFS）+ `encode_lossy`（MP3 64k）+ `atempo` 变速 + vocal events。参考音准备：`scripts/prepare_refs.py`。

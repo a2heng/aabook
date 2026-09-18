@@ -10,9 +10,22 @@ from audiobook.tts import VOCAL_EVENTS, find_tags, is_event_tag, normalize_tag
 
 
 class SpeechMergeTest(unittest.TestCase):
-    def test_short_narration_between_same_role_speech_is_dropped_and_merged(self):
+    def test_short_narration_is_kept_by_default(self):
         text = f"{mark('甲', '第一句。')}他顿了顿。{mark('甲', '第二句。')}"
         segments = parse_marks(text)
+        self.assertEqual([seg["kind"] for seg in segments], ["speech", "narration", "speech"])
+        self.assertEqual(segments[1]["text"], "他顿了顿。")
+
+    def test_short_narration_can_be_merged_when_enabled(self):
+        import audiobook.marks as marks
+
+        original = marks.MAX_INTERRUPT_CHARS
+        marks.MAX_INTERRUPT_CHARS = 12
+        try:
+            text = f"{mark('甲', '第一句。')}他顿了顿。{mark('甲', '第二句。')}"
+            segments = parse_marks(text)
+        finally:
+            marks.MAX_INTERRUPT_CHARS = original
         self.assertEqual(len(segments), 1)
         self.assertEqual(segments[0]["kind"], "speech")
         self.assertEqual(segments[0]["text"], "第一句。第二句。")
@@ -115,6 +128,24 @@ class DeleteDanglingTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(server.text, "后面还有。")
 
+    def test_empty_quote_swallows_attribution_within_10_char_window(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他沉默了很久，终于缓缓叹道：“”屋里没人接话。")
+        result = server.edit(op="delete", text="叹道：")
+        self.assertTrue(result["ok"])
+        self.assertEqual(server.text, "他沉默了很久，屋里没人接话。")
+
+    def test_symbol_only_quote_triggers_the_same_check(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他愣了一下，叹道：“ ， ”屋子里没人接话。")
+        result = server.edit(op="delete", text="叹道：")
+        self.assertTrue(result["ok"])
+        self.assertEqual(server.text, "他愣了一下，屋子里没人接话。")
+
     def test_quoted_empty_pair_is_tolerated(self):
         from scripts.mark_script import ScriptServer
 
@@ -207,6 +238,155 @@ class RosterMergeTest(unittest.TestCase):
         self.assertIn("高文·塞西尔", roster)
 
 
+class AnchorMarkingTest(unittest.TestCase):
+    def test_speak_with_long_anchor_marks_whole_quote(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“这是一段很长的台词，后面还有更多的内容。”")
+        result = server.edit(op="speak", text="这是一段很长的", role="高文")
+        self.assertTrue(result["ok"])
+        self.assertEqual(server.text, "他叹道：<高文>这是一段很长的台词，后面还有更多的内容。</高文>")
+
+    def test_delete_with_long_anchor_strips_whole_quote(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他把“固定视角永远改变了他的命运”当成口头禅。")
+        result = server.edit(op="delete", text="固定视角永远")
+        self.assertTrue(result["ok"])
+        self.assertNotIn("“", server.text)
+        self.assertIn("固定视角永远改变了他的命运", server.text)
+
+    def test_speak_mid_quote_fragment_marks_whole_quote(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“这是一段很长的台词，后面还有更多的内容。”")
+        result = server.edit(op="speak", text="很长的台词", role="高文")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result.get("expanded"))
+        self.assertEqual(server.text, "他叹道：<高文>这是一段很长的台词，后面还有更多的内容。</高文>")
+
+    def test_delete_mid_quote_fragment_strips_whole_quote(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他把“固定视角永远改变了他的命运”当成口头禅。")
+        result = server.edit(op="delete", text="永远改变了")
+        self.assertTrue(result["ok"])
+        self.assertNotIn("“", server.text)
+        self.assertIn("固定视角永远改变了他的命运", server.text)
+
+    def test_speak_tolerates_inner_quote_marks(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他上前一步：“父王，您认为那位‘复活’的大公是真是假？”")
+        result = server.edit(op="speak", text="父王，您认为那位复活的大公是真是假？", role="拜伦")
+        self.assertTrue(result["ok"])
+        self.assertIn("<拜伦>父王，您认为那位复活的大公是真是假？</拜伦>", server.text)
+
+    def test_speak_strips_inner_quote_marks(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他说道：“那位古人给了我们一个大大的‘惊喜’。”")
+        result = server.edit(op="speak", text="那位古人给了我们一个大大的", role="高文")
+        self.assertTrue(result["ok"])
+        self.assertNotIn("‘", server.text)
+        self.assertIn("<高文>那位古人给了我们一个大大的惊喜。</高文>", server.text)
+
+    def test_delete_removes_single_quote_pair(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他把它称为‘惊喜’然后走了。")
+        result = server.edit(op="delete", text="惊喜")
+        self.assertTrue(result["ok"])
+        self.assertEqual(server.text, "他把它称为惊喜然后走了。")
+
+    def test_strip_quotes_also_inside_tags(self):
+        from audiobook.marks import strip_quotes
+
+        text, count = strip_quotes("<甲>‘惊喜’</甲>“走”")
+        self.assertEqual(text, "<甲>惊喜</甲>走")
+        self.assertEqual(count, 4)
+
+    def test_speak_tolerates_punctuation_changes(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他一把抓过旁边的人：“快，派个会变鸟的德鲁伊！去皇冠街四号，让他们速做准备！”")
+        result = server.edit(op="speak", text="快，派个会变鸟的德鲁伊，去皇冠街四号，让他们速做准备", role="高文")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result.get("expanded"))
+        self.assertIn("<高文>快，派个会变鸟的德鲁伊！去皇冠街四号，让他们速做准备！</高文>", server.text)
+
+    def test_speak_matches_ellipsis_punctuation_variant(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("“抱……抱歉……”这位女士慌张地道着歉。")
+        result = server.edit(op="speak", text="抱，抱歉", role="埃德蒙")
+        self.assertTrue(result["ok"])
+        self.assertEqual(server.text, "<埃德蒙>抱……抱歉……</埃德蒙>这位女士慌张地道着歉。")
+
+    def test_delete_matches_punctuation_variant_inside_quotes(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他被称为“万物之耻，第一人”然后走了。")
+        result = server.edit(op="delete", text="万物之耻第一人")
+        self.assertTrue(result["ok"])
+        self.assertNotIn("“", server.text)
+        self.assertIn("万物之耻，第一人", server.text)
+
+    def test_speak_anchor_outside_quotes_marks_only_fragment(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他转身离开，随后又停下脚步。")
+        result = server.edit(op="speak", text="随后又停下", role="高文")
+        self.assertTrue(result["ok"])
+        self.assertEqual(server.text, "他转身离开，<高文>随后又停下</高文>脚步。")
+
+
+class RoleAttributionTest(unittest.TestCase):
+    def test_different_attribution_corrects_role(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_name_index({"高文": "高文", "琥珀": "琥珀"})
+        server.set_text("高文：“……我吃饱撑的跟你这个万物之耻讲道理！”")
+        result = server.edit(op="speak", text="我吃饱撑的", role="琥珀")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["role"], "高文")
+        self.assertIn("role_note", result)
+        self.assertEqual(server.text, "<高文>……我吃饱撑的跟你这个万物之耻讲道理！</高文>")
+
+    def test_same_attribution_is_dropped(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_name_index({"高文": "高文"})
+        server.set_text("高文：“你来了。”")
+        result = server.edit(op="speak", text="你来了", role="高文")
+        self.assertTrue(result["ok"])
+        self.assertEqual(server.text, "<高文>你来了。</高文>")
+
+
+class LiveFragmentsTest(unittest.TestCase):
+    def test_removed_quote_marks_do_not_split_speech(self):
+        from audiobook.marks import live_fragments
+
+        original = "他说：“大大的‘惊喜’。”"
+        marked = "他说：<高文>大大的惊喜。</高文>"
+        fragments = live_fragments(original, marked)
+        speech = [frag["text"] for frag in fragments if frag["kind"] == "speech"]
+        self.assertEqual(speech, ["大大的惊喜。"])
+
+
 class McpTagTest(unittest.TestCase):
     def test_speak_rejects_punctuation_only(self):
         from scripts.mark_script import ScriptServer
@@ -223,6 +403,7 @@ class McpTagTest(unittest.TestCase):
         server.set_text("他说：“算了。”")
         result = server.edit(op="speak", text="“算了。”", role="张三", tag="叹气")
         self.assertTrue(result["ok"])
+        self.assertEqual(result["tag"], "叹气")
         self.assertIn("<张三>[叹气]算了。</张三>", server.text)
 
     def test_speak_ignores_invalid_tag(self):
@@ -232,8 +413,28 @@ class McpTagTest(unittest.TestCase):
         server.set_text("他说：“算了。”")
         result = server.edit(op="speak", text="“算了。”", role="张三", tag="laugh")
         self.assertTrue(result["ok"])
+        self.assertEqual(result["tag"], "")
+        self.assertIn("tag_note", result)
         self.assertIn("<张三>算了。</张三>", server.text)
         self.assertNotIn("[laugh]", server.text)
+
+    def test_free_form_cjk_tag_is_rejected(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他说：“算了。”")
+        result = server.edit(op="speak", text="“算了。”", role="张三", tag="无奈的冷笑")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tag"], "")
+        self.assertIn("tag_note", result)
+        self.assertNotIn("[无奈的冷笑]", server.text)
+
+    def test_tag_survives_into_script_text(self):
+        from audiobook.marks import parse_marks
+        from audiobook.tts import find_tags
+
+        segments = parse_marks("<高文>[叹气]好吧。</高文>")
+        self.assertEqual(find_tags(segments[0]["text"]), ["叹气"])
 
 
 if __name__ == "__main__":

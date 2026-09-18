@@ -310,6 +310,12 @@ LD_LIBRARY_PATH=.venv/lib/python3.12/site-packages/nvidia/cublas/lib:.venv/lib/p
 - 注意：只对**新 prepare** 生效；已有 `outputs/<book>` 需重跑 `prepare`（章节文件会变，旧 marked 作废）。
 - 测试：`tests/test_textnorm.py` 新增省略号用例，10/10 通过；`ruff check/format` 干净。
 
+### Exp-14 回退：省略号保留（2026-09-18 修订）
+
+- 起因：`……`→`。` 会把 `高文：“……我吃饱…` 变成 `高文：“。我吃饱…`，制造伪句首（ch045 实例）。
+- 改法：`normalize_tts` / `one_paragraph` 不再转换省略号，保留 `……`（ASCII `...` 归一为 `……`）；`_ENDINGS` 仍含 `…`，句末省略号不会补句号。
+- 影响：需重跑 `prepare` 才生效；旧 `outputs/<book>/chapters` 仍是旧标点。
+
 ## Exp-15 预处理修正：方括号只去符号、保留文字
 
 - 问题：`cleaning.normalize_text` 原来用 `\[[^\[\]]*\]` 把 `[...]` **连内容整段删掉**（如 `[作者的话]` 直接消失）；本意只是去掉方括号符号。
@@ -364,3 +370,58 @@ LD_LIBRARY_PATH=.venv/lib/python3.12/site-packages/nvidia/cublas/lib:.venv/lib/p
   - **词典防污染**：`maintain_roster` 跳过 `aliases`/`voice` 等结构键；合并改为保守规则（新名必须是已有条目的别名才并入），避免种族/群体标签吞并既有角色；`load_roster` 载入时按「长名优先」合并重复项，`_canonicalize_profiles` 把声线并到规范名。
   - **ROSTER_SYSTEM**：禁止把 aliases/voice 当键、必须沿用已有规范名、不收种族/群体/泛称（混血精灵/士兵等）。
 - 验证：词典从污染态（含 `aliases`/`voice`/`高文`+`高文·塞西尔` 重复）清理为 11 个规范条目；重启后 ch012 起无批量 not found；全套 48 个测试通过。
+
+## Exp-20 长台词锚点 + 空引号 10 字回看
+
+- 长文本根因：要求模型逐字输出长台词会拼错/漏字 → `not found`。改为**锚点模式**：
+  - `speak`/`delete` 的 `text` 只给**不带引号的开头约 10 字**（逐字来自原文）；MCP 定位后自动扩到整个引号段（`_mark_speaker` 遇到紧跟在左引号后的片段即扩到右引号；`delete` 的 `_locate(strip=True)` 同样扩展）。
+  - 提示词/工具说明/few-shot/补漏消息全部改成「短句给全句、长台词给开头 10 字」。
+- 空引号（`“”`/`“ ， ”`，即引号内无中文/字母数字、只有符号或空白）：触发**向前 10 个字符回看**检查——窗口内若有悬空归属（`某某说道：` / 词典内人名）则连归属一起删；超过 10 字的归属只删窗口内的尾段。
+- 测试：`AnchorMarkingTest` 3 例 + `DeleteDanglingTest` 2 例；全套 53 个测试通过。
+- 稳定性：`already:true` 的重复调用不再计为进展，重复 3 次即停止并提醒，避免 ch019 那种空转。
+- 片段容错补充：`_enclosing_quotes` 支持**句中任意片段**（模型给中间几个字也能扩到两端引号并整段标记，返回带 `expanded`/note）；`_find_index` 增加忽略引号字符的兜底匹配（模型漏掉内层 `‘复活’` 的单引号也能找到）。
+- 内层引号（`‘惊喜’` 这类）：说话内容在包装时统一剥掉引号字符（朗读不需要）；`delete` 识别相邻单引号对并一起去掉；章末 `strip_quotes` 改为标签内外都清理。注意：`_find_index` 的去引号兜底只对不含引号的 needle 生效，避免 `_locate` 用带引号搜索串时长度错位。
+- 跨句引号：`_enclosing_quotes` 向左只在遇到闭引号/换行时才停止（引号内可以有多句话），修正了 ch025 `……我只能说。它确实……‘惊喜’。”` 这类跨句台词无法扩展的问题。
+- 测试：`AnchorMarkingTest` 8 例；全套 59 个测试通过。
+
+## Exp-21 prompt 缓存修复（每轮全量 prefill → 只算增量）
+
+- 现象：每次工具往返服务端都 `prompt eval ~7–9k tokens / ~2s`；一章 20–45 次调用 → 40–90s 纯重复 prefill。
+- 根因：`serve_llm_cuda.sh` 里的 `--no-cache-idle-slots` 与 `--ctx-checkpoints 0` 把 llama.cpp 的 prompt/KV 前缀缓存关掉了（hybrid/SWA 模型还需要 checkpoint 才能复用）。
+- 修法：移除这两个参数（OpenAI 端点默认 `cache_prompt=true`，无需客户端改动），并在脚本里加注释防回归。
+- 实测：ch033–036 用时 **13.8/51.8/35.5/22.6s（均值 ≈31s）**，生成 122–153 tok/s；此前摘要阶段 ~60–93s/章。整本外推从 ~40h 降到 ~13–15h。
+- 注意：缓存是**前缀匹配**——保持消息纯追加最划算；若中途裁剪/改写工具历史，复用会在断点失效并重算其后全部内容。
+
+## Exp-22 TTS 方括号标签：词表校验 + 返回反馈
+
+- `speak` 的 `tag`：可选，**默认空 = 无**；只有命中 `audiobook/tts.py` 的 `VOCAL_EVENTS` 词表（笑/叹气/咳嗽/清嗓子…）才写成 `[tag]` 前置进台词；没命中则**置空**，并在工具返回里带 `tag_note` 告诉模型（原先自由词也放行、失败还静默）。
+- 新增 `is_vocal_event()`（严格词表）供 MCP 校验；工具 schema 的 `tag` 仍带 enum 与说明；提示词补充「原文有明确非语言声时才填」。
+- 渲染链不变：`parse_marks` 保留 `[tag]` 文本 → `find_tags` 检出后渲染器自动把 cfg 提到 2.5。
+- 测试：合法 tag 写入、非法/自由词被拒并返回 note、tag 能活到 script 文本；全套 62 个测试通过。
+
+## Exp-23 引号前归属：只删同一个人，不同人则纠错
+
+- 实例（ch045）：原文 `换酒！”高文：“……我吃饱撑的跟你这个万物之耻讲道理！”`，模型把 高文 的台词标成 `role=琥珀`；旧逻辑 `_is_pure_name` 只要归属名字在词典里就删，于是把 `高文：` 当成可删归属删掉，输出成了 `<琥珀>……我吃饱…`，字面还少了说话人。
+- 改法：`_mark_speaker` 读引号前紧邻的 `人名：`——若归属与所标角色是**同一人**则照旧删；若是**另一个人**（词典内的规范名/别名），则以归属为准纠正说话人、删掉归属，并在工具返回里带 `role_note`/`role_corrected_from` 告知模型；`旁白` 不参与纠正；归属回看遇到 `<`/`>` 也停止（不再把标签字符混进名字）。
+- 测试：`RoleAttributionTest` 2 例（不同归属→纠正+删归属；同一归属→正常删）；全套通过。
+- 配套：省略号改为保留（见 Exp-14 回退），并已重跑 `prepare`、回退 ch045 起重新标注。
+
+## Exp-24 Bonsai 27B（Ternary + PrismML fork + DSpark）
+
+- 子模块/构建：`git submodule add https://github.com/PrismML-Eng/llama.cpp third_party/llama.cpp`（commit f0a2b5d，分支 `prism`），编到 `build/llama-cpp/`（CUDA 13 toolkit，flags 与 Breeze 相同：`-DGGML_CUDA=ON` + rpath/`-rpath-link` 必带；只编 `llama-server llama-cli`）。
+- 权重坑（务必分清）：
+  - fork 专用：`Ternary-Bonsai-27B-PQ2_0.gguf`（g128 专用核，7.17GB）；
+  - 上游 llama.cpp：`Ternary-Bonsai-27B-Q2_g64.gguf`（7.59GB）；
+  - legacy `Q2_0` 不要用（旧 g128 布局，且并行下载中断会留空洞，magic 都读不到）。
+- DSpark 草稿：仓库自带 `dspark-Q4_1.gguf` 是 legacy `arch=dspark`，直接加载报 offset/legacy Q2_0；用 fork 自带工具一次性转换：
+  `PYTHONPATH=third_party/llama.cpp/gguf-py .venv/bin/python third_party/llama.cpp/gguf-py/gguf/scripts/gguf_dspark_to_dflash.py --drop-shared-tensors <legacy-dspark-Q4_1> <PQ2_0> <out-dflash-Q4_1>` → 0.82GB（去掉共享 token_embd/output，运行时向主模型借）。
+- 配置（16GB / 200W）：`AUDIOBOOK_LLAMA_BIN=build/llama-cpp/bin`、ctx 65536、KV q4_0、`--spec-type draft-dspark --spec-draft-n-max 4`、采样 temp 0.7 / top_p 0.95 / top_k 20；显存 12.1GB。
+- 实测（ch011 章 prompt，greedy 400 tok，同一 200W 限制）：
+  | 配置 | tok/s |
+  | --- | ---: |
+  | 上游 llama.cpp + Q2_g64，无草稿 | 58.2 |
+  | fork + PQ2_0，无草稿 | 62.6 |
+  | **fork + PQ2_0 + DSpark n=4** | **98.4（1.57x）** |
+  - DSpark 接受率 0.456、平均接受 2.82；工具调用 sanity：`finish=tool_calls`、参数 JSON 正常（`{"op":"speak","text":"你终于来了。","role":"他"}`）。
+- 对比：Qwen3.5-9B + MTP n4 = 147 tok/s（更快），Bonsai 是 27B 质量档；`audiobook/llm.py` 已加 `bonsai-27b` profile（temp 0.7 / top_p 0.95 / top_k 20）。
+- 清理：删除下错的 `Q2_g64`（7.59GB）与 legacy `dspark-Q4_1`（1.95GB）；保留 PQ2_0 + 转换后的 dflash 草稿；老模型（Qwen/gemma 等）不动。

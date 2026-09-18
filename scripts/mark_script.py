@@ -24,6 +24,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.request
 from pathlib import Path
 
@@ -34,6 +35,7 @@ THINK = os.environ.get("AUDIOBOOK_THINK", "1").lower() not in ("0", "off", "fals
 
 from audiobook.llm import LLMClient, config_from_env, raw_log, reasoning_of  # noqa: E402
 from audiobook.marks import (  # noqa: E402
+    NARRATOR,
     live_fragments,
     parse_marks,
     render_diff_html,
@@ -42,7 +44,7 @@ from audiobook.marks import (  # noqa: E402
     unmarked_quotes,
 )
 from audiobook.schema import Cast  # noqa: E402
-from audiobook.tts import VOCAL_EVENTS, is_event_tag, normalize_tag  # noqa: E402
+from audiobook.tts import VOCAL_EVENTS, is_vocal_event, normalize_tag  # noqa: E402
 
 OPEN = "“『「"
 CLOSE = "”』」"
@@ -55,6 +57,10 @@ for _char in '“”"＂「」『』':
 for _char in "‘’'":
     _CANON[ord(_char)] = "'"
 _QUOTE_CANON = str.maketrans(_CANON)
+_QUOTE_STRIP_CHARS = '"“”‘’「」『』'
+_QUOTE_STRIP = str.maketrans("", "", _QUOTE_STRIP_CHARS)
+_ALL_OPEN = OPEN + "‘"
+_ALL_CLOSE = CLOSE + "’"
 
 
 class ScriptServer:
@@ -85,10 +91,58 @@ class ScriptServer:
         return self._delete(text or find)
 
     # ---- primitives ----------------------------------------------------------
+    def _enclosing_quotes(self, start: int, end: int) -> tuple[int, int] | None:
+        """Quoted span containing [start, end): scan left for the opening quote (a quoted span
+        may contain several sentences, so only a closing quote / newline stops the scan) and
+        right for its matching closing quote."""
+        left = -1
+        for i in range(start - 1, max(-1, start - 400), -1):
+            char = self.text[i]
+            if char in CLOSE or char == "\n":
+                return None
+            if char in OPEN:
+                left = i
+                break
+        if left < 0:
+            return None
+        for j in range(end, min(len(self.text), end + 500)):
+            char = self.text[j]
+            if char in OPEN:
+                return None
+            if char in CLOSE:
+                return left, j + 1
+        return None
+
+    def _find_quoted_fragment(self, needle: str) -> int:
+        """Near-miss fallback: match the needle inside any quoted span with punctuation and
+        quote marks ignored (e.g. model sends 「抱，抱歉」 for 「抱……抱歉……」). Returns the
+        content start of the first matching span, or -1; the caller expands to the whole span."""
+        plain_needle = "".join(char for char in needle if not unicodedata.category(char).startswith("P"))
+        if len(plain_needle) < 2:
+            return -1
+        for opener, closer in zip(OPEN, CLOSE):
+            position = 0
+            while True:
+                start = self.text.find(opener, position)
+                if start < 0:
+                    break
+                end = self.text.find(closer, start + 1)
+                if end < 0:
+                    break
+                content = self.text[start + 1 : end]
+                plain_content = "".join(char for char in content if not unicodedata.category(char).startswith("P"))
+                if plain_needle in plain_content:
+                    return start + 1
+                position = end + 1
+        return -1
+
     def _mark_speaker(self, text: str, role: str, tag: str = "") -> dict:
-        # Mark EXACTLY the given fragment -- never guess/expand (a long speech is marked in
-        # several speak calls and adjacent same-role fragments are merged downstream).
+        # `text` may be ANY fragment inside one quoted span (start / middle / whole). MCP expands
+        # it to the whole quote pair, so long speeches need only the first ~10 characters and a
+        # mid-sentence fragment still marks (and merges) the entire speech.
         index = self._find_index(text)
+        if index < 0:
+            index = self._find_quoted_fragment(text)
         if index < 0:
             return {"ok": False, "reason": "not found", "text": text}
         start, end = index, index + len(text)
@@ -103,29 +157,50 @@ class ScriptServer:
             body = body[1:]
         while body[-1:] in CLOSE:
             body = body[:-1]
-        # fragment sits fully inside a quoted span -> consume that quote pair too
-        if start >= 1 and self.text[start - 1] in OPEN and end < len(self.text) and self.text[end] in CLOSE:
-            start -= 1
-            end += 1
+        expanded = False
+        enclosing = self._enclosing_quotes(start, end)
+        if enclosing is not None:  # expand to the two quotes: the whole speech is marked
+            start, end = enclosing
+            body = self.text[start + 1 : end - 1]
+            expanded = True
+        body = body.translate(_QUOTE_STRIP)  # inner emphasis quotes (e.g. ‘惊喜’) are not spoken
         cut = start
-        if cut >= 1 and self.text[cut - 1] == "：":  # drop ONLY a bare 「人名：」
+        role_override = ""
+        if cut >= 1 and self.text[cut - 1] == "：":
             k = cut - 1
-            while k > 0 and self.text[k - 1] not in "。！？\n“”‘’「」『』 \t，,；;：":
+            while k > 0 and self.text[k - 1] not in "。！？\n“”‘’「」『』 \t，,；;：<>":
                 k -= 1
-            name = self.text[k : cut - 1]
-            if self._is_pure_name(name, role):
-                cut = k
+            attribution = self.text[k : cut - 1]
+            attr_canonical = self._name_index().get(attribution)
+            if attr_canonical and attr_canonical != NARRATOR:
+                if attr_canonical != self._canonical_role(role):
+                    role_override = attr_canonical  # the quote says who is speaking: trust it
+                cut = k  # a bare 「人名：」 is consumed either way
         if not any(char.isalnum() for char in body):
             return {"ok": False, "reason": '引号里只有标点，不是台词；请用 edit(op="delete") 去掉引号'}
-        if is_event_tag(tag):
-            body = f"[{normalize_tag(tag)}]{body}"
-        canonical = self._canonical_role(role) or (role or "").strip()
+        event = normalize_tag(tag) if is_vocal_event(tag) else ""  # only curated words are written
+        if event:
+            body = f"[{event}]{body}"
+        canonical = role_override or self._canonical_role(role) or (role or "").strip()
         if not canonical:
             return {"ok": False, "reason": "role 不能为空"}
         wrapped = f"<{canonical}>{body}</{canonical}>"
         self.text = self.text[:cut] + wrapped + self.text[end:]
-        self.edits.append({"op": "speak", "role": canonical, "text": text, "tag": tag, "attribution": cut < start})
-        return {"ok": True, "role": canonical, "text": body[:24]}
+        self.edits.append(
+            {"op": "speak", "role": canonical, "text": text, "tag": tag, "attribution": cut < start, "expanded": expanded}
+        )
+        result = {"ok": True, "role": canonical, "text": body[:24]}
+        if expanded:
+            result["expanded"] = True
+            result["note"] = "已扩展到两端引号，整段记录为台词"
+        if role_override:
+            result["role_note"] = f"按引号前的归属「{role_override}」判定说话人"
+            result["role_corrected_from"] = role
+        if tag:
+            result["tag"] = event
+            if not event:
+                result["tag_note"] = "tag 不在词表，已按无处理（可用：笑/叹气/咳嗽/清嗓子 等）"
+        return result
 
     _SPEECH_TAIL_RE = re.compile(
         r"(说道|问道|答道|喊道|叫道|笑道|叹道|应道|喝道|骂道|吼道|念道|回答|低语|喃喃|嘟囔|传来|开口|说)[，,：:]?$"
@@ -150,7 +225,7 @@ class ScriptServer:
         if close_at < 0:
             return None
         content = self.text[open_at + 1 : close_at]
-        if any(char.isalnum() for char in content) or len(content) > 20:
+        if any(char.isalnum() for char in content) or len(content) > 40:
             return None
         return open_at, close_at + 1
 
@@ -164,15 +239,30 @@ class ScriptServer:
                 span = (index, index + len(target))
         if span is None:
             span = self._locate(target, strip=True)
+        if span is None:  # near-miss inside quotes -> let the enclosing-quote expansion handle it
+            quoted_at = self._find_quoted_fragment(target)
+            if quoted_at >= 0:
+                span = (quoted_at, quoted_at + len(target))
         if span is not None:
             start, end = span
-            # empty quote pair: inside the target (「他说道：“”」) or right after it
-            # (delete target 「他说道：」, no quotes needed) -> shrink to that pair
-            pair = self._empty_quote_pair(start, end, inside=any(char in OPEN + CLOSE for char in self.text[start:end]))
-            if pair is not None:
-                start, end = pair
+            if all(char not in _QUOTE_STRIP_CHARS for char in self.text[start:end]):
+                if start >= 1 and self.text[start - 1] in "‘" and end < len(self.text) and self.text[end] in "’":
+                    start -= 1  # single-quote wrapped (‘惊喜’): remove that pair too
+                    end += 1
+                else:
+                    enclosing = self._enclosing_quotes(start, end)  # mid-quote fragment -> whole span
+                    if enclosing is not None:
+                        start, end = enclosing
+                    else:
+                        pair = self._empty_quote_pair(start, end, inside=False)  # 「他说道：」+ empty pair
+                        if pair is not None:
+                            start, end = pair
+            else:
+                pair = self._empty_quote_pair(start, end, inside=True)  # 「他说道：“”」 -> shrink to the pair
+                if pair is not None:
+                    start, end = pair
             inner = self.text[start:end]
-            body = inner[1:-1] if (inner[:1] in OPEN and inner[-1:] in CLOSE) else inner
+            body = inner[1:-1] if (inner[:1] in _ALL_OPEN and inner[-1:] in _ALL_CLOSE) else inner
             keep = any(char.isalnum() for char in body)
             if keep and self._looks_like_speech(start) and target not in self._refused_deletes:
                 self._refused_deletes.add(target)
@@ -183,9 +273,11 @@ class ScriptServer:
                 }
             cut = start
             if not keep and cut >= 1 and self.text[cut - 1] == "：":
-                # empty / punctuation-only quote: the dangling 「…说道：」 before it goes too
+                # empty / symbol-only quote (" " or "，"): check the 10 characters before it --
+                # a dangling 「某某说道：」 inside that window goes together with the quote pair
                 k = cut - 1
-                while k > 0 and self.text[k - 1] not in "。！？\n“”‘’「」『』 \t，,；;：":
+                floor = max(0, cut - 1 - 10)
+                while k > floor and self.text[k - 1] not in "。！？\n“”‘’「」『』 \t，,；;：<>":
                     k -= 1
                 attribution = self.text[k : cut - 1]
                 if attribution and (self._SPEECH_TAIL_RE.search(attribution) or attribution in self._known_names()):
@@ -228,6 +320,12 @@ class ScriptServer:
     def _canonical_role(self, role: str) -> str | None:
         return self._name_index().get((role or "").strip())
 
+    def set_name_index(self, index: dict[str, str]) -> None:
+        """Test/offline hook: force the label -> canonical map."""
+        book = os.environ.get("AUDIOBOOK_BOOK", "dawn")
+        self._index_cache = dict(index)
+        self._index_path = str(APP_ROOT / "outputs" / book / "script" / "roles.json")
+
     def _known_names(self) -> set[str]:
         """All canonical names + labels from the dictionary (roles.json, cast.json fallback)."""
         book = os.environ.get("AUDIOBOOK_BOOK", "dawn")
@@ -250,12 +348,6 @@ class ScriptServer:
         self._names_cache, self._names_path = names, cache_key
         return names
 
-    def _is_pure_name(self, name: str, role: str) -> bool:
-        """True only for a bare person name (so 「高文：」 is dropped but 「赫蒂抬起头说道：」 is kept)."""
-        if not name or len(name) > 8:
-            return False
-        return name == role or name in self._known_names()
-
     def _find_index(self, needle: str) -> int:
         if not needle:
             return -1
@@ -265,6 +357,28 @@ class ScriptServer:
         index = self.text.translate(_QUOTE_CANON).find(needle.translate(_QUOTE_CANON))
         if index >= 0:
             return index
+        # tolerate quote marks the model dropped (e.g. 「‘复活’」 given as 「复活」). Only when the
+        # needle itself has no quotes: otherwise the matched length would not map back safely.
+        squeezed_needle = needle.translate(_QUOTE_STRIP)
+        if squeezed_needle and len(squeezed_needle) == len(needle):
+            squeezed_text = self.text.translate(_QUOTE_STRIP)
+            pos = squeezed_text.find(squeezed_needle)
+            if pos >= 0:
+                mapping = [i for i, char in enumerate(self.text) if char not in _QUOTE_STRIP_CHARS]
+                return mapping[pos]
+        # last resort: punctuation-insensitive (the model may drop or swap ，。！？); map back by
+        # the letters themselves. Only for quote-free needles of a useful length.
+        plain_needle = "".join(char for char in needle if not unicodedata.category(char).startswith("P"))
+        if len(plain_needle) >= 4 and all(char not in _QUOTE_STRIP_CHARS for char in needle):
+            plain_chars: list[str] = []
+            plain_map: list[int] = []
+            for position, char in enumerate(self.text):
+                if not unicodedata.category(char).startswith("P"):
+                    plain_chars.append(char)
+                    plain_map.append(position)
+            pos = "".join(plain_chars).find(plain_needle)
+            if pos >= 0:
+                return plain_map[pos]
         # tolerate a needle that accidentally includes mark syntax characters
         if "<" in needle or ">" in needle:
             plain = needle.replace("<", "").replace(">", "").replace("/", "")
@@ -314,11 +428,15 @@ class ScriptServer:
             {
                 "name": "edit",
                 "description": (
-                    "编辑工具（一次一处）。speak：人物对话——text 给**不带引号**的对话原文 + role"
-                    "（结合上下文判断的说话人），两侧引号由 MCP 自动识别并清除；delete：非对话的注意性引号——"
-                    "text 给**不带引号**的词/短语，只去引号留字；空的引号「“”」则 text 给前面的「某某说道：」，"
-                    "MCP 会连空引号一起删；禁止整段/批量删除；replace：给 ≤6 字定位和替换。"
+                    "编辑工具（一次一处）。speak：人物对话——text 给**不带引号**的对话片段 + role"
+                    "（结合上下文判断的说话人）：给任意一段即可（开头约 10 个字最省），"
+                    "MCP 会自动扩展到两端引号并把整段记录为台词；可选 tag（默认空=无）：原文有明确非语言声"
+                    "（笑/叹气/咳嗽/清嗓子 等）时才填，且只能取词表词，不在词表会被忽略并返回提示；"
+                    "delete：非对话的注意性引号——text 给**不带引号**的词/短语（给片段即可），只去引号留字；"
+                    "空的引号「“”」则 text 给前面的「某某说道：」，MCP 会连空引号一起删；"
+                    "禁止整段/批量删除；replace：给 ≤6 字定位和替换。"
                     '示例：{"op":"speak","text":"你来了。","role":"高文"} / '
+                    '{"op":"speak","text":"塞西尔家族一直以骑","role":"赫蒂"} / '
                     '{"op":"delete","text":"固定视角"} / '
                     '{"op":"replace","find":"没想到","replace":"没想到，"}'
                 ),
@@ -328,13 +446,14 @@ class ScriptServer:
                         "op": {"type": "string", "enum": ["speak", "delete", "replace"]},
                         "text": {
                             "type": "string",
-                            "description": "一律不带引号：speak=对话原文；delete=词/短语，或空引号前的「某某说道：」",
+                            "description": "一律不带引号：speak=对话开头（长台词约 10 字）；delete=词/短语，或空引号前的「某某说道：」",
                         },
                         "role": {"type": "string", "description": "speak 时的规范名"},
                         "tag": {
                             "type": "string",
                             "enum": sorted(VOCAL_EVENTS),
-                            "description": "speak 的非语言声（可选），程序会写成 [tag] 前置到台词",
+                            "description": "speak 的情绪/非语言声（可选，默认空=无）；只接受词表里的词，"
+                            "不在词表会被忽略并在返回里告知；程序写成 [tag] 前置到台词",
                         },
                         "find": {"type": "string", "description": "replace 的定位片段（≤6 字）"},
                         "replace": {"type": "string", "description": "replace 的替换内容"},
@@ -587,9 +706,13 @@ function pairCard(req,res){
   const where=(res.chapter!=null?'ch'+res.chapter+' · step'+res.step:(res.source||'llm'));
   const tc=(res.tool_calls||[]).map(function(t){return '<div class="tool">'+esc(t.name)+' '+esc(t.arguments)+'</div>';}).join('');
   card.innerHTML='<div class="hd"><b>'+esc(where)+'</b><span class="dim">'+esc(res.duration_s||'')+'s · finish='+esc(res.finish_reason||'')+(res.tool_calls?(' · 工具×'+res.tool_calls.length):'')+'</span></div>'
-    +'<details class="out" open><summary>输出</summary>'+(res.reasoning?('<div class="reason">思考</div><pre>'+esc(res.reasoning)+'</pre>'):'')
+    +'<details class="out" open><summary>输出</summary>'
+    +(res.reasoning?('<details class="reason"><summary>思考 '+res.reasoning.length+' 字</summary><pre class="rpre"></pre></details>'):'')
     +'<pre>'+esc(res.content||'')+'</pre>'+tc+'</details>'
     +'<details class="in"><summary>输入 · '+(req&&req.messages?req.messages.length:0)+' 条消息</summary><div class="msgs"></div></details>';
+  const reason=card.querySelector('.reason');
+  if(reason){const pre=reason.querySelector('pre');
+    reason.addEventListener('toggle',function(){if(this.open&&!pre.textContent)pre.textContent=res.reasoning;});}
   card.dataset.text=(where+' '+(res.content||'')+' '+(res.reasoning||'')+' '+tc).toLowerCase();
   const msgs=card.querySelector('.msgs');
   card.querySelector('.in').addEventListener('toggle',function(){
@@ -739,13 +862,16 @@ LOCAL_SYSTEM = """你只做一件事：清理【本章正文】里的引号，�
 不要对前情调用任何工具**，也不要处理前情里的内容。
 正文里的引号分两种，处理方式不同：
 - **人物对话**：结合上下文（说/道/问/答/喊 等提示、前后文、人物词典）判断说话人是谁，
-  用 edit(op="speak", text="不带引号的对话原文", role="规范名") 剥离；text **一定不带引号**，
-  两侧引号由 MCP 自动识别并清除；对话必须**完整**，一字不漏、标点照抄。
+  用 edit(op="speak", text="不带引号的对话片段", role="规范名") 剥离；text **一定不带引号**：
+  给对话的**任意一段**都可以（最省事是开头约 10 个字，逐字来自原文），
+  MCP 会自动扩展到两端引号并把整段记录为台词。
 - **引起读者注意的引号**（术语、强调、外号等，不是人物说出的话）：
-  用 edit(op="delete", text="不带引号的这个词/短语") 直接去掉两边引号，文字保留（朗读不需要引号）；
+  用 edit(op="delete", text="不带引号的词/短语，长引号给开头约 10 个字") 直接去掉两边引号，文字保留；
   如果引号里是空的（“”），text 给前面悬空的「某某说道：」，MCP 会连空引号一起删。
 - **同一个人的话被「某某说道」或旁白隔成多段引号时，每段单独 speak，绝对不要拼成一句**；
   相邻同角色的台词 MCP 会自动合并。
+- speak 可带**可选 tag**（默认空=无）：原文里有明确的非语言声（笑/叹气/咳嗽/清嗓子 等）时才填，
+  只能取工具词表里的词；不在词表会被忽略并在工具返回里告知。
 没有引号的内容一律不动。一次一处，处理完本章停下，不要解释，不要整段批量去引号。"""
 
 FEW_SHOT = [
@@ -762,9 +888,14 @@ FEW_SHOT = [
         "content": "示例5 正文（同一个人的话被旁白隔成两段引号，要分两次 speak，不能拼成一句）：\n“别用火球术！”高文高声提醒，“用大范围的法术！”",
     },
     {"role": "assistant", "content": '{"op":"speak","text":"别用火球术！","role":"高文"}'},
+    {
+        "role": "user",
+        "content": "示例6 正文（长台词只给开头约 10 个字，MCP 自动补全整段）：\n“塞西尔家族一直是以骑士的力量立足，武艺与骑术才是家族正统。”",
+    },
+    {"role": "assistant", "content": '{"op":"speak","text":"塞西尔家族一直以骑","role":"赫蒂"}'},
 ]
 
-STEP_MARK = "现在只处理【本章正文】的引号：对话 speak（不带引号的原文 + 规范名），注意性引号 delete（不带引号）；前情里的引号已处理，不要动。处理完停下。"
+STEP_MARK = "现在只处理【本章正文】的引号：对话 speak（不带引号的原文；短句全句、长台词给开头约 10 字），注意性引号 delete（同样给开头即可）；前情里的引号已处理，不要动。处理完停下。"
 
 ROSTER_SYSTEM = """你在维护一部小说的「人物词典 + 声线档案」。输入是「已有词典」和「本章正文」。
 对本章出现、能指向具体人物的人物，输出规范名、别名和一份声线档案。
@@ -1044,6 +1175,7 @@ def run_turn(
     errors = 0
     edits_ok = 0
     last_sig, repeats, fail_total = "", 0, 0
+    ok_sig, ok_repeats = "", 0
     for _step in range(1, max_steps + 1):
         started = time.perf_counter()
         raw_log(
@@ -1140,6 +1272,12 @@ def run_turn(
                 )
                 if repeats >= 3 or fail_total >= 12:
                     return edits_ok
+            elif '"already": true' in result:  # no change: do not count as progress, nudge forward
+                ok_repeats = ok_repeats + 1 if sig == ok_sig else 1
+                ok_sig = sig
+                if ok_repeats >= 3:
+                    return edits_ok
+                messages.append({"role": "user", "content": "这处已经处理过，不要重复；继续处理还没处理的引号。"})
             else:
                 edits_ok += 1
                 last_sig, repeats = "", 0
@@ -1192,6 +1330,12 @@ def run_turn(
                 )
                 if fail_total >= 5:
                     return edits_ok
+            elif '"already": true' in result:  # no change: do not count as progress, nudge forward
+                ok_repeats = ok_repeats + 1 if sig == ok_sig else 1
+                ok_sig = sig
+                if ok_repeats >= 3:
+                    return edits_ok
+                messages.append({"role": "user", "content": "这处已经处理过，不要重复；继续处理还没处理的引号。"})
             else:
                 edits_ok += 1
     return edits_ok
@@ -1336,7 +1480,7 @@ def main() -> None:
                         "role": "user",
                         "content": f"当前文本里还有 {len(pending)} 处引号没处理（逐字复制，**不带引号**）：\n"
                         + "\n".join(f"- {item[1:-1]}" for item in pending[:40])
-                        + "\n只处理下面列出的这些：是人物对话就 speak（原文 + 规范名，引号由 MCP 清除）；"
+                        + "\n只处理下面列出的这些：是人物对话就 speak（给不带引号的原文；长台词给开头约 10 字）；"
                         "只是强调/术语就 delete（去引号留字）；列表之外的一律不要调用工具，也不要说找不到目标。处理完停下。",
                     }
                 )

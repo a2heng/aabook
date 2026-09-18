@@ -22,12 +22,12 @@ class FilterTtsCharsTest(unittest.TestCase):
         self.assertEqual(filter_tts_chars("a\nb\tc"), "a\nb\tc")
 
     def test_clean_for_llm_filters_then_normalises(self):
-        self.assertEqual(clean_for_llm("★★这是……如此——好吧￥"), "这是。如此，好吧。")
+        self.assertEqual(clean_for_llm("★★这是……如此——好吧￥"), "这是……如此，好吧。")
 
-    def test_ellipsis_becomes_full_stop(self):
-        self.assertEqual(clean_for_llm("他走了……"), "他走了。")
-        self.assertEqual(normalize_tts("等等……好啦"), "等等。好啦。")
-        self.assertEqual(normalize_tts("他说...好吧"), "他说。好吧。")
+    def test_ellipsis_is_kept(self):
+        self.assertEqual(clean_for_llm("他走了……"), "他走了……")
+        self.assertEqual(normalize_tts("等等……好啦"), "等等……好啦。")
+        self.assertEqual(normalize_tts("他说...好吧"), "他说……好吧。")
 
 
 class NormalizeTtsTest(unittest.TestCase):
@@ -35,15 +35,15 @@ class NormalizeTtsTest(unittest.TestCase):
         text = "他说……好——真的！"
         self.assertEqual(normalize_tts(normalize_tts(text)), normalize_tts(text))
 
-    def test_ellipsis_becomes_full_stop(self):
-        self.assertEqual(normalize_tts("他说……好——真的！"), "他说。好，真的！")
-        self.assertEqual(normalize_tts("你……？"), "你。？")
+    def test_ellipsis_is_kept(self):
+        self.assertEqual(normalize_tts("他说……好——真的！"), "他说……好，真的！")
+        self.assertEqual(normalize_tts("你……？"), "你……？")
 
 
 class OneParagraphTest(unittest.TestCase):
-    def test_ellipsis_becomes_full_stop(self):
-        self.assertEqual(one_paragraph("等等……好啦"), "等等。好啦")
-        self.assertEqual(one_paragraph("第一……第二...第三"), "第一。第二。第三")
+    def test_ellipsis_is_kept(self):
+        self.assertEqual(one_paragraph("等等……好啦"), "等等……好啦")
+        self.assertEqual(one_paragraph("第一……第二...第三"), "第一……第二……第三")
 
     def test_dashes_and_decorations_stay_commas(self):
         self.assertEqual(one_paragraph("甲——乙＊＊丙"), "甲，乙，丙")
