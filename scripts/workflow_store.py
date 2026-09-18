@@ -23,7 +23,7 @@ sys.path.insert(0, str(APP_ROOT))
 
 PROMPT_KEYS = ("local_system", "step_mark", "roster_system", "check_mark")
 FEW_SHOT_KEYS = ("text", "calls", "results")
-PARAM_RANGES = {"batch": (1, 200), "max_steps": (1, 2000), "check_steps": (0, 500)}
+PARAM_RANGES = {"batch": (1, 200), "max_steps": (1, 5000), "check_steps": (0, 500)}
 
 # The pipeline as a structure: EVERY stage reads and writes the same product -- the text.
 # A chapter is not an object, only a tag in the text; speech/events are tags too.
@@ -116,7 +116,7 @@ def defaults() -> dict:
         "few_shot": cases,
         "params": {
             "batch": 5,  # mark_script `--batch`: first N chapters fed in full, then the summary rolls
-            "max_steps": 200,
+            "max_steps": 1000,
             "check_steps": mark_script.DEFAULT_CHECK_STEPS,
             "think": mark_script.THINK,
         },

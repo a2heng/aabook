@@ -411,11 +411,16 @@ class LineMarkTest(unittest.TestCase):
         self.assertEqual(removed["range"], "B-C")
         self.assertEqual(removed["marked"], "“你终于来了。”")
 
-    def test_one_mark_pass_and_one_check_round(self):
+    def test_check_is_windowed(self):
         from scripts import mark_script
 
-        self.assertEqual(mark_script.CHECK_ROUNDS, 1)
+        self.assertEqual(mark_script.CHECK_WINDOW_SENTENCES, 20)
         self.assertEqual(mark_script.DEFAULT_CHECK_STEPS, 100)
+        text = "\n".join(f"第{i}段他说：“话{i}。”" for i in range(1, 61))
+        windows = mark_script.check_windows(text, 20)
+        self.assertGreaterEqual(len(windows), 3)
+        self.assertEqual(windows[0][0], 1)
+        self.assertEqual(windows[-1][1], 60)
 
     def test_number_text_bakes_paragraph_number_into_labels(self):
         from scripts.mark_script import number_text
@@ -495,6 +500,45 @@ class LineMarkTest(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(server.text, "<维多利亚>“前半句，中间这句。后半句。”</维多利亚>")
         self.assertNotIn("<甲>", server.text)
+
+    def test_long_single_quote_is_not_refused(self):
+        from scripts.mark_script import ScriptServer
+
+        speech = "皇家影卫是干什么的？" + "是保护国王，保护这个国家，保护这片土地的！" * 6
+        server = ScriptServer()
+        server.set_text(f"高文怒道：“{speech}”")
+        result = server.edit(op="speak", begin="1B", end="1C", text=speech, role="高文")
+        self.assertTrue(result["ok"], result)
+        self.assertIn(f"<高文>“{speech}”</高文>", server.text)
+
+    def test_segment_inside_a_quote_expands_to_the_full_quote(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他说：“第一句，第二句，第三句。”然后走了。")
+        result = server.edit(op="speak", begin="1C", end="1D", text="第二句，", role="高文")
+        self.assertTrue(result["ok"], result)
+        self.assertIn("<高文>“第一句，第二句，第三句。”</高文>然后走了。", server.text)
+
+    def test_unmarked_quotes_uses_visible_text_for_partially_marked_runs(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("“前半句，<甲>后半句。</甲>”")
+        missing = server.unmarked_quotes()
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(missing[0]["text"], "“前半句，后半句。”")
+        self.assertTrue(missing[0]["partial"])
+
+    def test_normalize_aliases_renames_both_tags_and_collapses_nesting(self):
+        from scripts.mark_script import normalize_aliases
+
+        roster = {"高文·塞西尔": ["高文"]}
+        text = "<高文>“甲。”</高文><高文><高文>“乙。”</高文></高文>"
+        self.assertEqual(
+            normalize_aliases(text, roster),
+            "<高文·塞西尔>“甲。”</高文·塞西尔><高文·塞西尔>“乙。”</高文·塞西尔>",
+        )
 
     def test_text_without_letters_still_marks_the_sentence(self):
         from scripts.mark_script import ScriptServer
