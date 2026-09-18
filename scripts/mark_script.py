@@ -137,11 +137,8 @@ def render_numbered_line(line_no: int, line: str) -> str:
 
 
 def number_text(text: str) -> str:
-    """Render the sentence-axis cuts with the paragraph baked in: ``[3A]他叹道：[3B]“…”[3C]``.
-
-    Each cut label is ``<paragraph number><letter>`` so a single label locates the place."""
-    lines = text.split("\n")
-    return "\n".join(render_numbered_line(line_no, line) for line_no, line in enumerate(lines, start=1))
+    """The text as the model sees it: plain original text (no labels, nothing added)."""
+    return text
 
 
 def check_windows(text: str, sentences_per_window: int = 20) -> list[tuple[int, int]]:
@@ -491,12 +488,10 @@ class ScriptServer:
                 return {"ok": False, "reason": "这段太短、容易标错位置；请给这段对话的完整原文", "text": text}
             start, stop = index, index + len(text)
         else:
-            index = self._find_index(text)
-            if index < 0:
-                index = self._find_quoted_fragment(text)
-            if index < 0:
-                return {"ok": False, "reason": "not found", "text": text}
-            start, stop = index, index + len(text)
+            located = self._locate_span(text)
+            if located is None:
+                return {"ok": False, "reason": "找不到这段原文；请逐字照抄这段发言的完整内容", "text": text[:24]}
+            start, stop = located
         return start, stop, low, high, exact
 
     @staticmethod
@@ -869,6 +864,55 @@ class ScriptServer:
         self._names_cache, self._names_path = names, cache_key
         return names
 
+    ANCHOR_CHARS = 10  # fuzzy locate = match this many leading chars, then this many trailing chars
+
+    @staticmethod
+    def _find_anchor_in(haystack: str, needle: str) -> int:
+        """Tolerant anchor match: exact, then quote-insensitive, then punctuation-insensitive."""
+        if not needle:
+            return -1
+        index = haystack.find(needle)
+        if index >= 0:
+            return index
+        index = haystack.translate(_QUOTE_CANON).find(needle.translate(_QUOTE_CANON))
+        if index >= 0:
+            return index
+        plain_chars: list[str] = []
+        plain_map: list[int] = []
+        for position, char in enumerate(haystack):
+            if not unicodedata.category(char).startswith("P"):
+                plain_chars.append(char)
+                plain_map.append(position)
+        plain_needle = "".join(char for char in needle if not unicodedata.category(char).startswith("P"))
+        pos = "".join(plain_chars).find(plain_needle)
+        return plain_map[pos] if pos >= 0 else -1
+
+    def _locate_span(self, needle: str) -> tuple[int, int] | None:
+        """Locate a quoted speech by its text: exact first; for long needles match the head and
+        the tail separately (one match each) and take the span between them. Short needles
+        (<= FUZZY_MIN_CHARS) are exact-only -- no fuzzy matching at all."""
+        needle = (needle or "").strip()
+        if not needle:
+            return None
+        index = self.text.find(needle)
+        if index >= 0:
+            return index, index + len(needle)
+        plain_len = sum(1 for char in needle if not unicodedata.category(char).startswith("P"))
+        if plain_len <= self.FUZZY_MIN_CHARS:
+            index = self._find_short_in_quotes(needle)  # quote-aware exact only, no fuzzy
+            return (index, index + len(needle)) if index >= 0 else None
+        if plain_len <= 2 * self.ANCHOR_CHARS:
+            found = self._find_anchor_in(self.text, needle)
+            return (found, found + len(needle)) if found >= 0 else None
+        head, tail = needle[: self.ANCHOR_CHARS], needle[-self.ANCHOR_CHARS :]
+        head_at = self._find_anchor_in(self.text, head)
+        if head_at < 0:
+            return None
+        tail_at = self._find_anchor_in(self.text[head_at + 1 :], tail)
+        if tail_at < 0:
+            return None
+        return head_at, head_at + 1 + tail_at + len(tail)
+
     def _find_index(self, needle: str) -> int:
         return self._find_index_in(self.text, needle)
 
@@ -879,12 +923,17 @@ class ScriptServer:
         found = self._find_index_in(self.text[pos:], needle)
         return pos + found if found >= 0 else -1
 
+    FUZZY_MIN_CHARS = 10  # needles of <=10 chars must match exactly; fuzzy only above that
+
     def _find_index_in(self, haystack: str, needle: str) -> int:
         if not needle:
             return -1
         index = haystack.find(needle)
         if index >= 0:
             return index
+        plain_len = sum(1 for char in needle if not unicodedata.category(char).startswith("P"))
+        if plain_len <= self.FUZZY_MIN_CHARS:
+            return -1  # short needle: no fuzzy matching (too easy to hit the wrong place)
         index = haystack.translate(_QUOTE_CANON).find(needle.translate(_QUOTE_CANON))
         if index >= 0:
             return index
@@ -959,15 +1008,13 @@ class ScriptServer:
             {
                 "name": "edit",
                 "description": (
-                    "标注工具（一次一处，只标**人物直接说的话**）。正文里每一句前后都有唯一的切割标记，"
-                    "形如 `[3A]`、`[22D]`（阿拉伯数字段落号+大写字母；相邻句共用中间的标记，行尾也有收尾标记）。"
-                    "**铁律：begin、end、text、role 四个参数缺一不可**——begin/end 是这段发言前后两个标记"
-                    "（选第 k 句 = 第 k 个标记到它后面一个标记，如 3A→3B；跨多句取起止标记），"
-                    "text 是这段发言原文（照抄，可去掉切割标记），role 是人物表里的规范名。"
-                    "标记自带段落号，不用另给 line。旁白/描写/叙述一律禁止标；标记只包说话内容"
+                    "标注工具（一次一处，只标**人物直接说的话**）。"
+                    "**铁律：text、role 两个参数缺一不可**——text 是这段发言的**完整原文**"
+                    "（逐字照抄，引号和标点一个不差，禁止只抄一半、禁止改写、禁止带旁白），"
+                    "role 是人物表里的规范名。旁白/描写/叙述一律禁止标；标记只包说话内容"
                     "（「某某说道/淡淡地说道」留在标记外）。修正只有一种方式：同一处再 speak 一次，"
                     "覆盖旧标记（可改角色、可改正范围）。"
-                    '示例：{"op":"speak","begin":"3B","end":"3C","text":"你终于来了。","role":"陈默"}'
+                    '示例：{"op":"speak","text":"“你终于来了。”","role":"角色名"}'
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -977,13 +1024,10 @@ class ScriptServer:
                             "enum": ["speak"],
                             "description": "speak=标出说话人（同一处再 speak 会覆盖旧标记）",
                         },
-                        "line": {"type": "integer", "description": "段落号（可省略：begin/end 标记自带段落号）"},
-                        "begin": {"type": "string", "description": "起始切割标记，形如 3B / 22D（段落号+字母）"},
-                        "end": {"type": "string", "description": "结束切割标记，形如 3C / 22E（单句 = begin 后一个标记）"},
-                        "text": {"type": "string", "description": "这段发言的原文（必填；可省略切割标记）"},
-                        "role": {"type": "string", "description": "说话人规范名（speak 必填）；判断不出时填「未知」"},
+                        "text": {"type": "string", "description": "这段发言的完整原文（逐字照抄，必填）"},
+                        "role": {"type": "string", "description": "说话人规范名（必填）；判断不出时填「未知」"},
                     },
-                    "required": ["op", "begin", "end", "text", "role"],
+                    "required": ["op", "text", "role"],
                 },
             }
         ]
@@ -1441,53 +1485,50 @@ LOCAL_SYSTEM = """你只做一件事：找出这段小说文字里**人物直接
   （一段一个 speak），不要合并成一段、也不要漏掉任何一段。
 - **标记只包说话内容**：旁白、动作、描写、叙述都不是台词（没有引号、也没有「说道/忽然想」
   这类提示的就不要标）；「某某说道/淡淡地说道」这类旁白一律留在标记外。
-- 正文里**每一句前后都有唯一的切割标记**，形如 `[3A]`、`[22D]`（阿拉伯数字段落号+大写字母；
-  相邻句共用中间的标记，行尾也有收尾标记）。标一处就用一次
-  edit(op="speak", begin=发言前的标记, end=发言后的标记, text=这段发言的原文, role=说话人规范名)：
-  **位置和正文都要给**；一段完整的发言就取它**前面那个标记**和**后面那个标记**
-  （只选一句 = 这句话前后的两个标记，例如 `[3B]` 到 `[3C]`），text 抄这段发言原文（可去掉标记）。
-  标记自带段落号，不用再给 line；**每处都必须给 begin/end + text，一个都不能少**。
+- 标一处就用一次 edit(op="speak", text=这段发言的完整原文, role=说话人规范名)。
+  **text 必须逐字照抄原文里这一段发言的完整内容**（引号、标点一个不差，不能只抄一半、不能改写、
+  不能省略；也不要抄旁白）。**只给 text 和 role 两个参数，缺一不可。**
   说话人用人物表里的规范名（没有就按原文写法），判断不出填「未知」。
  只管抓对话；原文的文字和标点一个字都不要改。处理完停下，不要解释。"""
 
 # Few-shot as REAL tool calls (the model learns the tool protocol directly); dialogue only.
 FEW_SHOT_CASES: list[tuple[str, list[str], list[str]]] = [
     (
-        "正文（切割标记形如 `[3A]`）：\n[3A]他叹道：[3B]“你终于来了。”[3C]",
+        "正文：\n他叹道：“你终于来了。”",
         [
-            '{"op":"speak","begin":"3B","end":"3C","text":"你终于来了。","role":"陈默"}',
+            '{"op":"speak","text":"“你终于来了。”","role":"角色名"}',
         ],
         [
-            '{"ok": true, "role": "陈默", "text": "“你终于来了。”", "begin": "3B", "end": "3C", "range": "3B-3C"}',
-        ],
-    ),
-    (
-        "正文（切割标记形如 `[7A]`）：\n[7A]“这件事要从很久以前说起，[7B]中间经过了很多波折，[7C]最后我们还是在城南住下了。”[7D]",
-        [
-            '{"op":"speak","begin":"7A","end":"7D","text":"这件事要从很久以前说起，中间经过了很多波折，最后我们还是在城南住下了。","role":"陈默"}',
-        ],
-        [
-            '{"ok": true, "role": "陈默", "text": "“这件事要从很久以前说起，中间经过了很多波折，最后我们还是在城南住下了。”", "begin": "7A", "end": "7D", "range": "7A-7D"}',
+            '{"ok": true, "role": "角色名", "text": "“你终于来了。”", "marked": "“你终于来了。”"}',
         ],
     ),
     (
-        "正文（切割标记形如 `[9A]`）：\n[9A]“快走！”[9B]他高声提醒，[9C]“别管我！”[9D]",
+        "正文：\n“这件事要从很久以前说起，中间经过了很多波折，最后我们还是在城南住下了。”",
         [
-            '{"op":"speak","begin":"9A","end":"9B","text":"快走！","role":"陈默"}',
-            '{"op":"speak","begin":"9C","end":"9D","text":"别管我！","role":"陈默"}',
+            '{"op":"speak","text":"“这件事要从很久以前说起，中间经过了很多波折，最后我们还是在城南住下了。”","role":"角色名"}',
         ],
         [
-            '{"ok": true, "role": "陈默", "text": "“快走！”", "begin": "9A", "end": "9B", "range": "9A-9B"}',
-            '{"ok": true, "role": "陈默", "text": "“别管我！”", "begin": "9C", "end": "9D", "range": "9C-9D"}',
+            '{"ok": true, "role": "角色名", "text": "“这件事要从很久以前说起，中间经过了很多波折，最后我们还是在城南住下了。”"}',
         ],
     ),
     (
-        "正文（切割标记形如 `[11C]`）：\n[11A]陈默坐下，[11B]忽然想：[11C]她又熬夜了吧。[11D]",
+        "正文：\n“快走！”他高声提醒，“别管我！”",
         [
-            '{"op":"speak","begin":"11C","end":"11D","text":"她又熬夜了吧。","role":"陈默"}',
+            '{"op":"speak","text":"“快走！”","role":"角色名"}',
+            '{"op":"speak","text":"“别管我！”","role":"角色名"}',
         ],
         [
-            '{"ok": true, "role": "陈默", "text": "她又熬夜了吧。", "begin": "11C", "end": "11D", "range": "11C-11D"}',
+            '{"ok": true, "role": "角色名", "text": "“快走！”", "marked": "“快走！”"}',
+            '{"ok": true, "role": "角色名", "text": "“别管我！”", "marked": "“别管我！”"}',
+        ],
+    ),
+    (
+        "正文：\n他坐下，忽然想：她又熬夜了吧。",
+        [
+            '{"op":"speak","text":"她又熬夜了吧。","role":"角色名"}',
+        ],
+        [
+            '{"ok": true, "role": "角色名", "text": "她又熬夜了吧。", "marked": "她又熬夜了吧。"}',
         ],
     ),
 ]
@@ -1537,10 +1578,9 @@ FEW_SHOT: list[dict] = few_shot_messages(FEW_SHOT_CASES)
 
 STEP_MARK = (
     "现在只做一件事：从下面【要处理的正文】里抓出**人物直接说的话**。"
-    '唯一允许的操作：edit(op="speak", begin=起始标记, end=结束标记, text=这段原文, role=说话人)。'
-    "切割标记形如 `[3A]`、`[22D]`（阿拉伯数字段落号+大写字母，自带位置；相邻句共用、行尾也有）。"
-    "**铁律**：每处必须同时给 begin、end、text、role 四个参数，缺任何一个都算失败；"
-    "begin/end 是这段发言前后两个标记，text 是这段发言原文（照抄，可去掉切割标记），role 是人物表里的规范名。"
+    '唯一允许的操作：edit(op="speak", text=这段发言的完整原文, role=说话人规范名)。'
+    "**铁律**：text 必须逐字照抄这段发言的**完整内容**——引号、标点一个不差，禁止只抄一半、禁止改写、"
+    "禁止省略、禁止把旁白抄进来；role 必须是人物表里的规范名。两个参数缺一不可。"
     "只标人物直接说的话：旁白、动作、描写、叙述一律禁止标；「某某说道/淡淡地说道」这类话留在标记外。"
     "连续对话必须逐句分清双方；说一句接一段旁白再接着说，必须分开标全。"
     "严禁没说完就结束、严禁把中间旁白包进标记。"
@@ -1548,18 +1588,17 @@ STEP_MARK = (
 )
 
 CHECK_MARK = (
-    "现在是检查环节：上面这一批（窗口）的完整标记里，`<角色>…</角色>` 包住的句子就是「角色」说的；"
-    "`[3A]`、`[22D]` 是句子切割标记（阿拉伯数字段落号+大写字母，每句前后都有，相邻句共用）。\n"
+    "现在是检查环节：上面这一批（窗口）的完整标记里，`<角色>…</角色>` 包住的句子就是「角色」说的。\n"
     "**第一步：处理【机械扫描】列出的疑似漏标。**逐处判断：确实是人物直接说的话就必须 speak 补上"
-    "（begin/end/text/role 缺一不可）；明显是术语/标语/书名/引用（不是人在说话）就跳过不标。\n"
+    "（text 照抄完整原文 + role，缺一不可）；明显是术语/标语/书名/引用（不是人在说话）就跳过不标。\n"
     "**第二步：只允许改确实错的地方，禁止重标任何没问题的段落。**逐处核查以下三类错误：\n"
     "1) 漏标：人物直接说的话没标（连续对话的每一段、旁白隔开的续话、无「某某说道」的交替）；\n"
     "2) 多标/标错：旁白、描写、叙述被标进来，或说话人认错；\n"
     "3) 范围错：多裹了旁白/动作，或没说完就结束。\n"
     "**铁律**：旁白、描写、叙述不是台词，禁止标（尤其严禁把整段叙述标成「未知」）；"
     "标记只能包说话内容，「某某说道/淡淡地说道」这类旁白必须留在标记外。"
-    "修正一律用 edit，并且每处必须同时给 begin、end、text、role 四个参数，缺一不可：\n"
-    "- 说话人错 或 范围错 → op=speak 重标：给正确的 role 和正确的起止标记；role 没变也要重标改正范围；\n"
+    "修正一律用 edit，每处必须给 text（完整原文）和 role，缺一不可：\n"
+    "- 说话人错 或 范围错 → op=speak 重标：给正确的 role 和正确的完整原文；role 没变也要重标改正范围；\n"
     "- 漏标 → op=speak 补上；\n"
     "一次只改 1~2 处，只改真有问题的。改完立刻停下，不要解释。"
 )
@@ -1586,8 +1625,12 @@ ROSTER_SYSTEM = """你在维护一部小说的「人物词典」。输入是「�
 """
 
 TOOLS = ["edit"]
-INJECT_PRIOR = False  # 暂时关掉前情全文注入（会让模型串段落号）；要恢复改成 True
-MAINTAIN_ROSTER = False  # 暂时关掉词典维护注入（【这段文本】会再喂一份本章原文）；要恢复改成 True
+# 上下文只给「前后各一章」放在 system 里（当前章是任务文本，不再额外注入前情全文）：
+#   AUDIOBOOK_INJECT_NEIGHBORS=0 关掉前后文
+#   AUDIOBOOK_MAINTAIN_ROSTER=1  每章维护人物词典（convert 需要 roles.json）
+INJECT_NEIGHBORS = os.environ.get("AUDIOBOOK_INJECT_NEIGHBORS", "1") == "1"
+NEIGHBOR_CHAPTERS = 1  # how many chapters before/after are shown as reference
+MAINTAIN_ROSTER = os.environ.get("AUDIOBOOK_MAINTAIN_ROSTER", "0") == "1"
 
 SUMMARY_SYSTEM = """你在维护一部长篇小说的「前情摘要」，供后续章节判断「谁在说话」时做背景。
 输入：上一版摘要、新增章节的出场角色与正文（可能多章）。输出新摘要（≤400 字），只保留判断说话人需要的信息：
@@ -2172,6 +2215,18 @@ def main() -> None:
             )
         return f"【前情摘要】\n{summary or '（无）'}"
 
+    def neighbor_context(cid: int) -> str:
+        """One chapter before + one after, reference only: helps name characters not introduced
+        in the current chapter. Never includes the current chapter itself."""
+        if not INJECT_NEIGHBORS:
+            return ""
+        parts = []
+        for label, other in (("前文", cid - NEIGHBOR_CHAPTERS), ("后文", cid + NEIGHBOR_CHAPTERS)):
+            path = chapter_path(other)
+            if path.is_file():
+                parts.append(f"【{label}·第 {other} 章（仅供判断人物/称呼，不要标注）】\n{path.read_text(encoding='utf-8')}")
+        return "\n\n".join(parts)
+
     for cid in ids:
         target = out_dir / f"ch{cid:03d}.marked.txt"
         raw_text = chapter_path(cid).read_text(encoding="utf-8")
@@ -2196,21 +2251,15 @@ def main() -> None:
             mcp.call("set_text", {"text": raw_text})
             fold_through(cid - 1)  # summary must cover everything before this chapter
             think = config.thinking_system_token if THINK else ""  # profile-driven (Gemma: "<|think|>", Qwen: none)
-            # Sentence-axis cuts carry the paragraph number (`[3A]`, `[22D]`): every cut label
-            # locates its place by itself, and the MCP marks exactly the span between two labels.
-            numbered = number_text(raw_text)
+            # The model sees the plain chapter text and must quote the COMPLETE speech text;
+            # the MCP locates it (fuzzy only for long needles) -- nothing about that is in the prompt.
             # Few-shot goes AFTER the window and right BEFORE the task, so the examples sit next
             # to the instruction the model is about to execute (not buried above the big text).
+            neighbors = neighbor_context(cid)
             messages = [
-                {"role": "system", "content": f"{think}{LOCAL_SYSTEM}\n\n{hint}"},
+                {"role": "system", "content": f"{think}{LOCAL_SYSTEM}\n\n{hint}" + (f"\n\n{neighbors}" if neighbors else "")},
                 *FEW_SHOT,
-                {
-                    "role": "user",
-                    "content": (
-                        f"{prior_context(cid) + chr(10) + chr(10) if INJECT_PRIOR else ''}"
-                        f"【要处理的正文（每句前后有切割标记，形如 `[3A]`）】\n{numbered}"
-                    ),
-                },
+                {"role": "user", "content": f"【要处理的正文】\n{raw_text}"},
                 {"role": "user", "content": STEP_MARK},
             ]
             run_turn(client, config, tools, mcp, messages, args.max_steps, counters, live, cid, raw_text)
@@ -2228,17 +2277,15 @@ def main() -> None:
                     missing = [item for item in mcp.server.unmarked_quotes() if first <= item["line"] <= last]
                     if not missing and "<" not in window_text:  # pure narration, nothing to check
                         continue
-                    view = "\n".join(
-                        render_numbered_line(line_no, line) for line_no, line in enumerate(lines[first - 1 : last], start=first)
-                    )
+                    view = "\n".join(lines[first - 1 : last])
                     if missing:
                         listed = "\n".join(
-                            f"- [{item['begin']}]~[{item['end']}]：{item['text']}"
+                            f"- {item['text']}"
                             + ("（含旧标记，请整段重标）" if item.get("partial") else "")
                             + f" ｜ 出处：{item['snippet']}"
                             for item in missing[:40]
                         )
-                        scan = f"【机械扫描：本批以下 {len(missing)} 处引号尚未标记（标记号都是本章的）】\n{listed}"
+                        scan = f"【机械扫描：本批以下 {len(missing)} 处引号尚未标记】\n{listed}"
                     else:
                         scan = "【机械扫描：本批没有未标记的引号内容】"
                     batch_note = f"这是第 {index}/{total} 批检查（第 {first}~{last} 段）。"

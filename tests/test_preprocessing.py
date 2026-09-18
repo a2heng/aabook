@@ -422,10 +422,41 @@ class LineMarkTest(unittest.TestCase):
         self.assertEqual(windows[0][0], 1)
         self.assertEqual(windows[-1][1], 60)
 
-    def test_number_text_bakes_paragraph_number_into_labels(self):
+    def test_number_text_is_plain_original_text(self):
         from scripts.mark_script import number_text
 
-        self.assertEqual(number_text("他叹道：“你终于来了。”"), "[1A]他叹道：[1B]“你终于来了。”[1C]")
+        self.assertEqual(number_text("他叹道：“你终于来了。”"), "他叹道：“你终于来了。”")
+
+    def test_plain_text_speak_without_any_labels(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        result = server.edit(op="speak", text="“你终于来了。”", role="陈默")
+        self.assertTrue(result["ok"], result)
+        self.assertIn("<陈默>“你终于来了。”</陈默>", server.text)
+
+    def test_long_needle_fuzzy_matches_head_and_tail_separately(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“这件事要从很久以前说起，中间经过了很多波折，最后我们还是在城南住下了。”")
+        result = server.edit(
+            op="speak",
+            text="“这件事要从很久以前说起，中间经历了很多曲折，最后我们还是在城南住下了。”",
+            role="陈默",
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertIn("<陈默>“这件事要从很久以前说起，中间经过了很多波折，最后我们还是在城南住下了。”</陈默>", server.text)
+
+    def test_short_needle_never_uses_fuzzy_matching(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        result = server.edit(op="speak", text="“你终于回来。”", role="陈默")
+        self.assertFalse(result["ok"])
+        self.assertEqual(server.text, "他叹道：“你终于来了。”")
 
     def test_full_label_locates_without_line_param(self):
         from scripts.mark_script import ScriptServer
@@ -744,14 +775,13 @@ class AnchorMarkingTest(unittest.TestCase):
         self.assertTrue(result.get("expanded"))
         self.assertIn("<高文>“快，派个会变鸟的德鲁伊！去皇冠街四号，让他们速做准备！”</高文>", server.text)
 
-    def test_speak_matches_ellipsis_punctuation_variant(self):
+    def test_short_needle_punctuation_variant_is_refused(self):
         from scripts.mark_script import ScriptServer
 
         server = ScriptServer()
         server.set_text("“抱……抱歉……”这位女士慌张地道着歉。")
         result = server.edit(op="speak", text="抱，抱歉", role="埃德蒙")
-        self.assertTrue(result["ok"])
-        self.assertEqual(server.text, "<埃德蒙>“抱……抱歉……”</埃德蒙>这位女士慌张地道着歉。")
+        self.assertFalse(result["ok"])  # <=10 chars: exact copy only, no fuzzy matching
 
     def test_delete_matches_punctuation_variant_inside_quotes(self):
         from scripts.mark_script import ScriptServer
