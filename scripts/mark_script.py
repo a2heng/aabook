@@ -422,7 +422,6 @@ class ScriptServer:
 
     def _resolve_span(self, text: str, end: str | int = "", line: int = 0, begin=None):
         """Resolve the target span; returns (start, stop, low, high, exact) or an error dict."""
-        plain_needle = "".join(char for char in text if not unicodedata.category(char).startswith("P"))
         low, high = (0, len(self.text))
         exact = False
         start, stop = 0, 0
@@ -482,11 +481,6 @@ class ScriptServer:
                     return {"ok": False, "reason": f"第 {line} 段没有可标的文字", "text": text[:24]}
             if not exact:
                 return {"ok": False, "reason": f"第 {line} 段里找不到这段正文；请核对 text 或 begin/end", "text": text[:24]}
-        elif len(plain_needle) <= 2:
-            index = self._find_short_in_quotes(text)
-            if index < 0:
-                return {"ok": False, "reason": "这段太短、容易标错位置；请给这段对话的完整原文", "text": text}
-            start, stop = index, index + len(text)
         else:
             located = self._locate_span(text)
             if located is None:
@@ -894,13 +888,16 @@ class ScriptServer:
         needle = (needle or "").strip()
         if not needle:
             return None
+        plain_len = sum(1 for char in needle if not unicodedata.category(char).startswith("P"))
+        if plain_len <= self.FUZZY_MIN_CHARS:
+            # short: no fuzzy; prefer the occurrence inside quotes, else the exact one
+            index = self._find_short_in_quotes(needle)
+            if index < 0:
+                index = self.text.find(needle)
+            return (index, index + len(needle)) if index >= 0 else None
         index = self.text.find(needle)
         if index >= 0:
             return index, index + len(needle)
-        plain_len = sum(1 for char in needle if not unicodedata.category(char).startswith("P"))
-        if plain_len <= self.FUZZY_MIN_CHARS:
-            index = self._find_short_in_quotes(needle)  # quote-aware exact only, no fuzzy
-            return (index, index + len(needle)) if index >= 0 else None
         if plain_len <= 2 * self.ANCHOR_CHARS:
             found = self._find_anchor_in(self.text, needle)
             return (found, found + len(needle)) if found >= 0 else None

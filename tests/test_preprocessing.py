@@ -189,14 +189,23 @@ class AnchorEndTest(unittest.TestCase):
         self.assertIn("<维多利亚>“不。”</维多利亚>", server.text)
         self.assertNotIn("是<维多利亚>不", server.text)  # must not hit the narration 不
 
-    def test_tiny_needle_without_quotes_is_refused(self):
+    def test_tiny_needle_in_narration_is_refused(self):
         from scripts.mark_script import ScriptServer
 
         server = ScriptServer()
         server.set_text("他摇了摇头。")
         result = server.edit(op="speak", text="摇", role="甲")
         self.assertFalse(result["ok"])
-        self.assertIn("太短", result["reason"])
+        self.assertIn("旁白", result["reason"])
+
+    def test_tiny_complete_quote_is_marked_not_rejected_as_too_short(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他低声说：“哦……哦，”然后没声了。")
+        result = server.edit(op="speak", text="“哦……哦，”", role="甲")
+        self.assertTrue(result["ok"], result)
+        self.assertIn("<甲>“哦……哦，”</甲>", server.text)
 
     def test_complete_text_never_glues_two_quotes(self):
         from scripts.mark_script import ScriptServer
