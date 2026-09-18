@@ -84,30 +84,7 @@ def parse_marks(text: str) -> list[dict]:
     return merged
 
 
-_BARE_QUOTE_RE = re.compile(r"[“『「][^”』」\n]{1,400}?[”』」]")
-
-
-def unmarked_quotes(marked: str) -> list[str]:
-    """Quoted spans still *outside* any tag (leftovers / very short lines)."""
-    stripped = MARKS_RE.sub("", marked)
-    return [match.group(0) for match in _BARE_QUOTE_RE.finditer(stripped)]
-
-
-def quoted_spans(text: str) -> list[str]:
-    """All quoted spans in a raw (unmarked) text -- used as a completeness checklist."""
-    return [match.group(0) for match in _BARE_QUOTE_RE.finditer(text)]
-
-
 _QUOTE_CHARS = '“”‘’「」『』"'
-
-
-def strip_quotes(marked: str) -> tuple[str, int]:
-    """Drop every leftover quote mark -- inside tags too: quotes are never spoken.
-    Returns (text, count)."""
-    count = sum(marked.count(char) for char in _QUOTE_CHARS)
-    if not count:
-        return marked, 0
-    return marked.translate({ord(char): None for char in _QUOTE_CHARS}), count
 
 
 def render_html(segments: list[dict], marked: str, path) -> None:

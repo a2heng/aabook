@@ -40,11 +40,9 @@ from audiobook.marks import (  # noqa: E402
     parse_marks,
     render_diff_html,
     render_html,
-    strip_quotes,
-    unmarked_quotes,
 )
 from audiobook.schema import Cast  # noqa: E402
-from audiobook.tts import VOCAL_EVENTS, is_vocal_event, normalize_tag  # noqa: E402
+
 
 OPEN = "“『「"
 CLOSE = "”』」"
@@ -78,14 +76,12 @@ class ScriptServer:
     def get_marked(self) -> dict:
         return {"text": self.text}
 
-    def edit(self, op: str = "", text: str = "", role: str = "", tag: str = "", find: str = "", replace: str = "") -> dict:
+    def edit(self, op: str = "", text: str = "", role: str = "", find: str = "", replace: str = "", end: str = "") -> dict:
         """The one editing tool. ``op`` is inferred when omitted."""
         op = op or ("speak" if role else "replace" if (find or replace) else "delete")
         if op == "speak":
-            # Prefer whichever argument still carries the quotes, so the whole quoted
-            # span is consumed (inner-only text would leave stray “ ” behind).
             target = find if any(char in find for char in OPEN + CLOSE) else (text or find)
-            return self._mark_speaker(target, role, tag)
+            return self._mark_speaker(target, role, end)
         if op == "replace":
             return self._replace(find or text, replace)
         return self._delete(text or find)
@@ -136,34 +132,59 @@ class ScriptServer:
                 position = end + 1
         return -1
 
-    def _mark_speaker(self, text: str, role: str, tag: str = "") -> dict:
-        # `text` may be ANY fragment inside one quoted span (start / middle / whole). MCP expands
-        # it to the whole quote pair, so long speeches need only the first ~10 characters and a
-        # mid-sentence fragment still marks (and merges) the entire speech.
+    def _mark_speaker(self, text: str, role: str, end: str = "") -> dict:
+        # The model gives the dialogue's opening (~10 chars) and, for long speeches, its closing
+        # (~10 chars); a short line is given whole. Punctuation is matched loosely by the finder.
         index = self._find_index(text)
         if index < 0:
             index = self._find_quoted_fragment(text)
         if index < 0:
             return {"ok": False, "reason": "not found", "text": text}
-        start, end = index, index + len(text)
+        start, stop = index, index + len(text)
+        anchored = False
+        if end and end != text:
+            search_from = start + 1
+            while True:
+                tail = self._find_index_after(end, search_from)
+                if tail < 0:
+                    break
+                if tail + len(end) >= stop:  # closing anchor must lie at/after the opening one
+                    stop = tail + len(end)
+                    anchored = True
+                    break
+                search_from = tail + 1
         open_lt = self.text.rfind("<", 0, start)
         if open_lt >= 0:
             open_gt = self.text.find(">", open_lt)
-            close_lt = self.text.find("<", end)
+            close_lt = self.text.find("<", stop)
             if open_gt != -1 and open_gt <= start and close_lt != -1 and self.text.startswith("</", close_lt):
                 return {"ok": True, "already": True, "role": self.text[open_lt + 1 : open_gt], "text": text[:24]}
-        body = self.text[start:end]
-        while body[:1] in OPEN:  # stray quote at a chunk edge -> consumed, not kept
-            body = body[1:]
-        while body[-1:] in CLOSE:
-            body = body[:-1]
+        # One speech never covers two separate quoted spans: if the model's text spans a closing
+        # quote, narration, then another opening quote, keep only the FIRST span (each quote is
+        # its own speech; never glue two pieces across the description). Only the same quote pair
+        # counts, so inner quotes of one dialogue are not clipped.
+        clamped = False
+        for opener, closer in (("“", "”"), ("「", "」"), ("『", "』")):
+            close_at = self.text.find(closer, start, stop)
+            if close_at >= 0 and self.text.find(opener, close_at + 1, stop) >= 0:
+                stop = close_at + 1
+                clamped = True
+                break
         expanded = False
-        enclosing = self._enclosing_quotes(start, end)
-        if enclosing is not None:  # expand to the two quotes: the whole speech is marked
-            start, end = enclosing
-            body = self.text[start + 1 : end - 1]
+        if clamped:  # expand to the opening quote of THIS span (the next quote must stay out)
+            for i in range(start - 1, max(-1, start - 400), -1):
+                if self.text[i] in CLOSE or self.text[i] == "\n":
+                    break
+                if self.text[i] in OPEN:
+                    start = i
+                    break
             expanded = True
-        body = body.translate(_QUOTE_STRIP)  # inner emphasis quotes (e.g. ‘惊喜’) are not spoken
+        else:
+            enclosing = self._enclosing_quotes(start, stop)
+            if enclosing is not None:  # expand to the two quotes: quotes stay INSIDE the mark
+                start, stop = enclosing
+                expanded = True
+        body = self.text[start:stop]
         cut = start
         role_override = ""
         if cut >= 1 and self.text[cut - 1] == "：":
@@ -177,29 +198,32 @@ class ScriptServer:
                     role_override = attr_canonical  # the quote says who is speaking: trust it
                 cut = k  # a bare 「人名：」 is consumed either way
         if not any(char.isalnum() for char in body):
-            return {"ok": False, "reason": '引号里只有标点，不是台词；请用 edit(op="delete") 去掉引号'}
-        event = normalize_tag(tag) if is_vocal_event(tag) else ""  # only curated words are written
-        if event:
-            body = f"[{event}]{body}"
+            return {"ok": False, "reason": "这段不是人物直接对话；只标人物直接说的话"}
         canonical = role_override or self._canonical_role(role) or (role or "").strip()
         if not canonical:
             return {"ok": False, "reason": "role 不能为空"}
         wrapped = f"<{canonical}>{body}</{canonical}>"
-        self.text = self.text[:cut] + wrapped + self.text[end:]
+        self.text = self.text[:cut] + wrapped + self.text[stop:]
         self.edits.append(
-            {"op": "speak", "role": canonical, "text": text, "tag": tag, "attribution": cut < start, "expanded": expanded}
+            {
+                "op": "speak",
+                "role": canonical,
+                "text": text,
+                "end": end,
+                "attribution": cut < start,
+                "expanded": expanded,
+                "anchored": anchored,
+            }
         )
         result = {"ok": True, "role": canonical, "text": body[:24]}
+        if anchored:
+            result["anchored"] = True
         if expanded:
             result["expanded"] = True
             result["note"] = "已扩展到两端引号，整段记录为台词"
         if role_override:
             result["role_note"] = f"按引号前的归属「{role_override}」判定说话人"
             result["role_corrected_from"] = role
-        if tag:
-            result["tag"] = event
-            if not event:
-                result["tag_note"] = "tag 不在词表，已按无处理（可用：笑/叹气/咳嗽/清嗓子 等）"
         return result
 
     _SPEECH_TAIL_RE = re.compile(
@@ -349,22 +373,32 @@ class ScriptServer:
         return names
 
     def _find_index(self, needle: str) -> int:
+        return self._find_index_in(self.text, needle)
+
+    def _find_index_after(self, needle: str, pos: int) -> int:
+        """Same fuzzy finder, but only at/after ``pos`` (for the closing anchor)."""
+        if pos < 0:
+            pos = 0
+        found = self._find_index_in(self.text[pos:], needle)
+        return pos + found if found >= 0 else -1
+
+    def _find_index_in(self, haystack: str, needle: str) -> int:
         if not needle:
             return -1
-        index = self.text.find(needle)
+        index = haystack.find(needle)
         if index >= 0:
             return index
-        index = self.text.translate(_QUOTE_CANON).find(needle.translate(_QUOTE_CANON))
+        index = haystack.translate(_QUOTE_CANON).find(needle.translate(_QUOTE_CANON))
         if index >= 0:
             return index
         # tolerate quote marks the model dropped (e.g. 「‘复活’」 given as 「复活」). Only when the
         # needle itself has no quotes: otherwise the matched length would not map back safely.
         squeezed_needle = needle.translate(_QUOTE_STRIP)
         if squeezed_needle and len(squeezed_needle) == len(needle):
-            squeezed_text = self.text.translate(_QUOTE_STRIP)
+            squeezed_text = haystack.translate(_QUOTE_STRIP)
             pos = squeezed_text.find(squeezed_needle)
             if pos >= 0:
-                mapping = [i for i, char in enumerate(self.text) if char not in _QUOTE_STRIP_CHARS]
+                mapping = [i for i, char in enumerate(haystack) if char not in _QUOTE_STRIP_CHARS]
                 return mapping[pos]
         # last resort: punctuation-insensitive (the model may drop or swap ，。！？); map back by
         # the letters themselves. Only for quote-free needles of a useful length.
@@ -372,7 +406,7 @@ class ScriptServer:
         if len(plain_needle) >= 4 and all(char not in _QUOTE_STRIP_CHARS for char in needle):
             plain_chars: list[str] = []
             plain_map: list[int] = []
-            for position, char in enumerate(self.text):
+            for position, char in enumerate(haystack):
                 if not unicodedata.category(char).startswith("P"):
                     plain_chars.append(char)
                     plain_map.append(position)
@@ -383,7 +417,7 @@ class ScriptServer:
         if "<" in needle or ">" in needle:
             plain = needle.replace("<", "").replace(">", "").replace("/", "")
             if plain:
-                return self.text.find(plain)
+                return haystack.find(plain)
         return -1
 
     def _locate(self, text: str, strip: bool = False) -> tuple[int, int] | None:
@@ -428,37 +462,20 @@ class ScriptServer:
             {
                 "name": "edit",
                 "description": (
-                    "编辑工具（一次一处）。speak：人物对话——text 给**不带引号**的对话片段 + role"
-                    "（结合上下文判断的说话人）：给任意一段即可（开头约 10 个字最省），"
-                    "MCP 会自动扩展到两端引号并把整段记录为台词；可选 tag（默认空=无）：原文有明确非语言声"
-                    "（笑/叹气/咳嗽/清嗓子 等）时才填，且只能取词表词，不在词表会被忽略并返回提示；"
-                    "delete：非对话的注意性引号——text 给**不带引号**的词/短语（给片段即可），只去引号留字；"
-                    "空的引号「“”」则 text 给前面的「某某说道：」，MCP 会连空引号一起删；"
-                    "禁止整段/批量删除；replace：给 ≤6 字定位和替换。"
-                    '示例：{"op":"speak","text":"你来了。","role":"高文"} / '
-                    '{"op":"speak","text":"塞西尔家族一直以骑","role":"赫蒂"} / '
-                    '{"op":"delete","text":"固定视角"} / '
-                    '{"op":"replace","find":"没想到","replace":"没想到，"}'
+                    "标注工具（一次一处）：抓人物**直接说的话**并标出说话人。"
+                    "text 给这段对话的**完整原文**（逐字来自原文，一字不差；长台词也要整段给全）。"
+                    "role 给说话人规范名（结合人物表和上下文判断，判断不出填「未知」）。"
+                    '示例：{"op":"speak","text":"你终于来了。","role":"陈默"} / '
+                    '{"op":"speak","text":"这件事要从很久以前说起，最后我们还是在城南住下了。","role":"陈默"}'
                 ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "op": {"type": "string", "enum": ["speak", "delete", "replace"]},
-                        "text": {
-                            "type": "string",
-                            "description": "一律不带引号：speak=对话开头（长台词约 10 字）；delete=词/短语，或空引号前的「某某说道：」",
-                        },
-                        "role": {"type": "string", "description": "speak 时的规范名"},
-                        "tag": {
-                            "type": "string",
-                            "enum": sorted(VOCAL_EVENTS),
-                            "description": "speak 的情绪/非语言声（可选，默认空=无）；只接受词表里的词，"
-                            "不在词表会被忽略并在返回里告知；程序写成 [tag] 前置到台词",
-                        },
-                        "find": {"type": "string", "description": "replace 的定位片段（≤6 字）"},
-                        "replace": {"type": "string", "description": "replace 的替换内容"},
+                        "op": {"type": "string", "enum": ["speak"]},
+                        "text": {"type": "string", "description": "这段对话的完整原文（逐字，一字不差）"},
+                        "role": {"type": "string", "description": "说话人规范名；判断不出时填「未知」"},
                     },
-                    "required": ["op"],
+                    "required": ["text", "role"],
                 },
             }
         ]
@@ -504,7 +521,9 @@ header .grow{flex:1}
 #chbar select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:3px 8px;font-size:13px}
 #chbar button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:3px 10px;cursor:pointer;font-size:12.5px}
 #chbar button.on{background:var(--accent);color:#0b0f15;border-color:var(--accent);font-weight:700}
-#article{overflow:auto;min-height:0;padding:20px 30px 60px;flex:1;font-size:15.5px;line-height:2.05;white-space:pre-wrap;word-break:break-word}
+#article{overflow:auto;min-height:0;padding:20px 30px 60px;flex:1;font-size:15.5px;line-height:2.05;word-break:break-word}
+#article p{margin:0 0 .55em;text-indent:2em}
+#article p:empty{display:none}
 .who{display:inline-block;font-size:11.5px;font-weight:700;color:#9fd0ff;background:#16314f;border-radius:6px;padding:0 7px;margin:0 3px 0 2px;vertical-align:1px;line-height:1.7}
 .speech{background:#152238;border-radius:8px;padding:2px 6px;box-shadow:inset 0 0 0 1px #2b4a72}
 del{color:#ff9d9d;background:#2a1414;text-decoration:line-through;border-radius:5px;padding:1px 3px}
@@ -565,6 +584,8 @@ document.getElementById('breeze').href='http://'+location.hostname+':8137/';
 const article=document.getElementById('article'), chat=document.getElementById('chat'), chs=document.getElementById('chs');
 const book=document.getElementById('book'), followBtn=document.getElementById('follow'), finfo=document.getElementById('finfo');
 let offset=0, follow=true, selected=null, current=null, prevSig='', idxSig='', seen=new Set();
+const wantCh=(new URLSearchParams(location.search).get('ch')||'').trim();  // ?ch=3 pins the picker
+if(wantCh){selected=+wantCh;follow=false;followBtn.classList.remove('on');}
 function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 function fragHTML(f,isNew){const c=isNew?' new':'';
   if(f.kind==='speech')return '<span class="speech'+c+'"><span class="who">'+esc(f.role||'?')+'</span>'+esc(f.text)+'</span>';
@@ -575,8 +596,19 @@ function renderArticle(s){
   if(!s||!s.fragments||document.hidden)return;
   const sig=JSON.stringify(s.fragments); if(sig===prevSig)return;
   if(seen.chapter!==s.chapter){seen=new Set();seen.chapter=s.chapter;}
-  const top=article.scrollTop; let html='';
-  for(const f of s.fragments){const key=f.kind+'|'+(f.role||'')+'|'+f.text;const isNew=!seen.has(key);seen.add(key);html+=fragHTML(f,isNew);}
+  const top=article.scrollTop; let html='<p>';
+  for(const f of s.fragments){
+    const parts=String(f.text).split(/\n+/);
+    for(let i=0;i<parts.length;i++){
+      if(i>0)html+='</p><p>';                       // newline -> real paragraph
+      const txt=(i>0||html==='<p>')?parts[i].replace(/^[ \t\u3000]+/,''):parts[i];  // CSS handles the indent
+      if(!txt)continue;
+      const key=f.kind+'|'+(f.role||'')+'|'+parts[i];
+      const isNew=!seen.has(parts[i])&&!seen.has(key); seen.add(parts[i]); seen.add(key);
+      html+=fragHTML({...f,text:txt},isNew);
+    }
+  }
+  html+='</p>';
   article.innerHTML=html; article.scrollTop=top; prevSig=sig;
   finfo.textContent=(s.chars||0)+' 字 · '+s.fragments.length+' 片段';
 }
@@ -857,72 +889,81 @@ def ensure_live_server(port: int = LIVE_PORT) -> None:
     print(f"[live] serving http://127.0.0.1:{port}/live", flush=True)
 
 
-LOCAL_SYSTEM = """你只做一件事：清理【本章正文】里的引号，并把人物对话标成台词。
-前面可能附带其它章节原文（前情），那只是给你判断说话人用的：**前情里的引号已经全部处理过，
-不要对前情调用任何工具**，也不要处理前情里的内容。
-正文里的引号分两种，处理方式不同：
-- **人物对话**：结合上下文（说/道/问/答/喊 等提示、前后文、人物词典）判断说话人是谁，
-  用 edit(op="speak", text="不带引号的对话片段", role="规范名") 剥离；text **一定不带引号**：
-  给对话的**任意一段**都可以（最省事是开头约 10 个字，逐字来自原文），
-  MCP 会自动扩展到两端引号并把整段记录为台词。
-- **引起读者注意的引号**（术语、强调、外号等，不是人物说出的话）：
-  用 edit(op="delete", text="不带引号的词/短语，长引号给开头约 10 个字") 直接去掉两边引号，文字保留；
-  如果引号里是空的（“”），text 给前面悬空的「某某说道：」，MCP 会连空引号一起删。
-- **同一个人的话被「某某说道」或旁白隔成多段引号时，每段单独 speak，绝对不要拼成一句**；
-  相邻同角色的台词 MCP 会自动合并。
-- speak 可带**可选 tag**（默认空=无）：原文里有明确的非语言声（笑/叹气/咳嗽/清嗓子 等）时才填，
-  只能取工具词表里的词；不在词表会被忽略并在工具返回里告知。
-没有引号的内容一律不动。一次一处，处理完本章停下，不要解释，不要整段批量去引号。"""
+LOCAL_SYSTEM = """你只做一件事：找出这段小说文字里**人物直接说的话**，为每一处标出说话人。
+- 这里没有章节、也没有“引号里的才是对话”这回事：眼前的文字就是全部材料；
+  直接说的话不一定被引号包着，被引号包着的也不一定是直接说的话。
+- **连续对话常常没有「某某说道」提示、两人交替**（甚至上引号直接接在下引号后面）：必须逐句判断，
+  谁说的算谁的，**正确识别双方转换**，不要把不同人的话拼到一起。
+- **标记以“一段话”为单位**：一个人的话中间被旁白/动作描写隔开时，就是两段（可能不止两段），
+  要**分别标全（一段一个 speak）**；**绝不能把两段连成一段**，也不要漏掉任何一段。
+- 找到一处就用一次 edit(op="speak", text=这段对话的完整原文, role=说话人规范名)：
+  **text 给这一段对话的完整原文，逐字来自原文、一字不差**（长台词也要整段给全）。
+  说话人用人物表里的规范名（没有就按原文写法），判断不出填「未知」。
+只管抓对话；原文的文字、标点和引号一个字都不要改。处理完停下，不要解释。"""
 
-FEW_SHOT = [
-    {"role": "user", "content": "示例1 正文：\n他叹道：“你终于来了。”"},
-    {"role": "assistant", "content": '{"op":"speak","text":"你终于来了。","role":"高文"}'},
-    {"role": "user", "content": "示例2 正文（后文可知这个年轻女声是琥珀）：\n一个年轻的女声慌张道：“别，先别杀我啊！”"},
-    {"role": "assistant", "content": '{"op":"speak","text":"别，先别杀我啊！","role":"琥珀"}'},
-    {"role": "user", "content": "示例3 正文：\n他把“固定视角”当成口头禅。"},
-    {"role": "assistant", "content": '{"op":"delete","text":"固定视角"}'},
-    {"role": "user", "content": "示例4 正文：\n他愣了一下，叹道：“”屋子里没人接话。"},
-    {"role": "assistant", "content": '{"op":"delete","text":"叹道："}'},
-    {
-        "role": "user",
-        "content": "示例5 正文（同一个人的话被旁白隔成两段引号，要分两次 speak，不能拼成一句）：\n“别用火球术！”高文高声提醒，“用大范围的法术！”",
-    },
-    {"role": "assistant", "content": '{"op":"speak","text":"别用火球术！","role":"高文"}'},
-    {
-        "role": "user",
-        "content": "示例6 正文（长台词只给开头约 10 个字，MCP 自动补全整段）：\n“塞西尔家族一直是以骑士的力量立足，武艺与骑术才是家族正统。”",
-    },
-    {"role": "assistant", "content": '{"op":"speak","text":"塞西尔家族一直以骑","role":"赫蒂"}'},
+# Few-shot as REAL tool calls (the model learns the tool protocol directly); dialogue only.
+_FEW_SHOT_CASES: list[tuple[str, list[str], list[str]]] = [
+    (
+        "示例1（短句：≤20 字，text 给完整句子）：\n他叹道：“你终于来了。”",
+        ['{"op":"speak","text":"你终于来了。","role":"陈默"}'],
+        ['{"ok": true, "role": "陈默", "expanded": true}'],
+    ),
+    (
+        "示例2（长句也要给完整原文）：\n“这件事要从很久以前说起，中间经过了很多波折，最后我们还是在城南住下了。”",
+        ['{"op":"speak","text":"这件事要从很久以前说起，中间经过了很多波折，最后我们还是在城南住下了。","role":"陈默"}'],
+        ['{"ok": true, "role": "陈默", "expanded": true}'],
+    ),
+    (
+        "示例3（同一人被旁白隔成两段，要分两次 speak）：\n“快走！”他高声提醒，“别管我！”",
+        ['{"op":"speak","text":"快走！","role":"陈默"}', '{"op":"speak","text":"别管我！","role":"陈默"}'],
+        ['{"ok": true, "role": "陈默", "expanded": true}', '{"ok": true, "role": "陈默", "expanded": true}'],
+    ),
 ]
+FEW_SHOT: list[dict] = []
+for _case_index, (_example, _calls, _results) in enumerate(_FEW_SHOT_CASES, start=1):
+    FEW_SHOT.append({"role": "user", "content": _example})
+    FEW_SHOT.append(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": f"few{_case_index}_{call_index}", "type": "function", "function": {"name": "edit", "arguments": call}}
+                for call_index, call in enumerate(_calls, start=1)
+            ],
+        }
+    )
+    FEW_SHOT += [
+        {"role": "tool", "tool_call_id": f"few{_case_index}_{call_index}", "content": result}
+        for call_index, result in enumerate(_results, start=1)
+    ]
 
-STEP_MARK = "现在只处理【本章正文】的引号：对话 speak（不带引号的原文；短句全句、长台词给开头约 10 字），注意性引号 delete（同样给开头即可）；前情里的引号已处理，不要动。处理完停下。"
+STEP_MARK = (
+    "现在只做一件事：从下面的正文里抓出**人物直接说的话**，用 "
+    'edit(op="speak", text=这段对话的完整原文, role=说话人) 标出说话人；'
+    "text 逐字来自原文、一字不差，长台词也要整段给全。不要输出解释或 JSON 文本，只用工具，一次一处，标完停下。"
+    "连续对话的时候双方转换要能正确识别。标记按段来：说完接一段旁白/描写再接着说，就是两段，"
+    "要分开标全，不能连成一段、也不能漏掉。"
+)
 
-ROSTER_SYSTEM = """你在维护一部小说的「人物词典 + 声线档案」。输入是「已有词典」和「本章正文」。
-对本章出现、能指向具体人物的人物，输出规范名、别名和一份声线档案。
+ROSTER_SYSTEM = """你在维护一部小说的「人物词典」。输入是「已有词典」和「这段文本」。
+把这段文本里出现、能指向具体人物的人整理进词典。
 
-## 一、人物词典
 - 规范名：此人最完整/最正式的姓名（如"高文·塞西尔"）；同一人只留一条。
-- **输出 JSON 的键必须全部是人物规范名**；禁止出现 aliases/voice/name 这类字段名当键。
-- aliases 只收两类，**共 3~5 个，宁少勿多**：模糊名称（简称/部分写法）+ 具体称谓（能唯一定位的称呼/头衔/绰号）。
+- **输出 JSON 的键必须全部是人物规范名**；禁止出现 aliases/name 这类字段名当键。
+- **主词（规范名）必须是全名/全称**：简称/称谓/绰号都放进 aliases。就算先见到简称、后见到全名，
+  也用全名当主词（同一人只留一条，旧的简称并进去）。
+- aliases 见到多少收多少（模糊名称 + 能唯一定位的称谓/绰号），**不限数量**。
 - **已有词典里能对上的就是同一人，必须沿用已有规范名**：已有「高文·塞西尔」就把「高文/老祖宗」并进去，
   禁止新增「高文」；已有「瑞贝卡·塞西尔」就不要新增「瑞贝卡」。
 - **绝不收**代词/描述性短语/整句/泛称（大人/老爷/小姐/先生/骑士）；不收地名/组织/物品/种族/群体
   （混血精灵/士兵/众人这类一律不收，只收有名有姓的个人）。
-- 已有条目只增补，不改名、不删除。
-
-## 二、声线档案 voice —— 只定**性别与年龄**（整体、稳定，不受本章剧情影响）
-- age：少年|青年|中年|老年
-- gender：男|女
-- sample：一句**中性陈述**自我介绍，≤30 字，含规范名，**不带情绪/动作/态度称呼**，
-  例："我是高文·塞西尔，很高兴见到你。"
-- **不要**写音色、语速、态度、语气。
+- 已有条目只增补，不改名、不删除；**不要写声线/年龄/性别**（声线在造音色时按人物书重新设计）。
 
 只输出 JSON：
-{"规范名": {"aliases": ["高文", "老祖宗"], "voice": {"age": "青年", "gender": "男", "sample": "我是高文·塞西尔，很高兴见到你。"}}}
+{"规范名": {"aliases": ["高文", "老祖宗"]}}
 """
 
 TOOLS = ["edit"]
-MAX_ALIASES = 5  # per canonical name: fuzzy name + a few specific forms of address
 
 SUMMARY_SYSTEM = """你在维护一部长篇小说的「前情摘要」，供后续章节判断「谁在说话」时做背景。
 输入：上一版摘要、新增章节的出场角色与正文（可能多章）。输出新摘要（≤400 字），只保留判断说话人需要的信息：
@@ -960,45 +1001,12 @@ def load_roster(book: str) -> dict[str, list[str]]:
         return {}
     data = json.loads(path.read_text(encoding="utf-8"))
     clean: dict[str, list[str]] = {}
-    # Longest names first: a more complete name wins over its short form when merging duplicates
-    # (e.g. 「高文·塞西尔」 already lists 「高文」).
+    # Longest names first: the full name becomes the canonical entry and absorbs its short forms.
     for name in sorted(data, key=len, reverse=True):
         labels = data[name]
         if name.lower() in ROSTER_STRUCT_KEYS or not isinstance(labels, list):
             continue
-        tokens = [name, *(str(label).strip() for label in labels if str(label).strip())]
-        canonical = _merge_canonical(clean, name)
-        if canonical == name:
-            clean[name] = [name] + [label for label in tokens[1:] if label != name][:MAX_ALIASES]
-            continue
-        bucket = clean[canonical]
-        for label in tokens:
-            if label != canonical and label not in bucket:
-                bucket.append(label)
-        clean[canonical] = [canonical] + [label for label in bucket if label != canonical][:MAX_ALIASES]
-    return clean
-
-
-def load_profiles(book: str) -> dict[str, dict]:
-    """Resume per-role voice profiles (age/gender/timbre/pace/sample) from the script dir."""
-    path = APP_ROOT / "outputs" / book / "script" / "voice_profiles.json"
-    if not path.is_file():
-        return {}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return data if isinstance(data, dict) else {}
-
-
-def save_profiles(book: str, profiles: dict[str, dict]) -> None:
-    path = APP_ROOT / "outputs" / book / "script" / "voice_profiles.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(profiles, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _canonicalize_profiles(profiles: dict[str, dict], roster: dict[str, list[str]]) -> dict[str, dict]:
-    """Move profile entries of merged names onto their canonical entry."""
-    clean: dict[str, dict] = {}
-    for name, profile in profiles.items():
-        clean.setdefault(_merge_canonical(roster, name), profile)
+        _absorb_entry(clean, name, [str(label).strip() for label in labels if str(label).strip()])
     return clean
 
 
@@ -1052,24 +1060,38 @@ ROSTER_STRUCT_KEYS = frozenset(
 )
 
 
-def _merge_canonical(roster: dict[str, list[str]], name: str) -> str:
-    """Existing canonical that already lists ``name`` as a label, else ``name`` itself.
+def _same_person(roster: dict[str, list[str]], existing: str, name: str, labels: list[str]) -> bool:
+    """Entry ``existing`` and incoming ``(name, labels)`` look like one person."""
+    known = roster.get(existing, [])
+    if existing in labels or name in known:
+        return True
+    if len(existing) >= 2 and len(name) >= 2 and (existing in name or name in existing):
+        return True
+    return False
 
-    Conservative: only merges when the new name is a known alias of an existing entry, so a
-    model-invented label (e.g. a race) can never capture an existing character."""
-    return next((canonical for canonical, existing in roster.items() if name in existing), name)
+
+def _absorb_entry(roster: dict[str, list[str]], name: str, labels: list[str]) -> str:
+    """Fold ``(name, labels)`` into the dictionary and return the canonical name.
+
+    The full/formal name always wins as canonical -- even when only the short form was seen
+    first, the later full name is promoted and the whole entry moves with it. Aliases have no
+    cap: the dictionary may grow as the text flows."""
+    bucket: list[str] = [name, *labels]
+    canonical = name
+    for existing in [key for key in roster if _same_person(roster, key, name, labels)]:
+        canonical = existing if len(existing) > len(canonical) else canonical
+        bucket.extend(roster.pop(existing))
+    roster[canonical] = [canonical] + [item for item in dict.fromkeys(bucket) if item and item != canonical]
+    return canonical
 
 
-def maintain_roster(llm: LLMClient, roster: dict[str, list[str]], profiles: dict[str, dict], chapter_text: str) -> int:
-    """Extract this chapter's labels + voice profiles and merge them in place."""
-    existing = "\n".join(
-        f"{name}: {'、'.join(labels)}" + (f"  voice={profiles[name]}" if name in profiles else "")
-        for name, labels in roster.items()
-    )
+def maintain_roster(llm: LLMClient, roster: dict[str, list[str]], text: str) -> int:
+    """Fold the people seen in this piece of text into the dictionary (no chapters, no voice)."""
+    existing = "\n".join(f"{name}: {'、'.join(labels)}" for name, labels in roster.items())
     try:
         result = llm.chat_json(
             ROSTER_SYSTEM,
-            f"【已有词典】\n{existing or '（空）'}\n\n【本章正文】\n{chapter_text}",
+            f"【已有词典】\n{existing or '（空）'}\n\n【这段文本】\n{text}",
             thinking=False,  # extraction task: thinking only risks echoing the prompt / truncating JSON
         )
     except Exception as error:  # noqa: BLE001 - dictionary is best-effort
@@ -1096,36 +1118,24 @@ def maintain_roster(llm: LLMClient, roster: dict[str, list[str]], profiles: dict
             continue
         if isinstance(entry, dict):
             labels = [str(label).strip() for label in entry.get("aliases") or [] if str(label).strip()]
-            voice = entry.get("voice") or {}
         elif isinstance(entry, list):  # tolerate the older {"name": [labels]} shape
-            labels, voice = [str(label).strip() for label in entry if str(label).strip()], {}
+            labels = [str(label).strip() for label in entry if str(label).strip()]
         else:
-            labels, voice = [], {}
-        canonical = _merge_canonical(roster, name)
-        if canonical != name and name in profiles and canonical not in profiles:
-            profiles[canonical] = profiles.pop(name)
-        bucket = roster.setdefault(canonical, [canonical])
-        for label in [name, *labels]:
-            if label and label != canonical and label not in bucket:
-                bucket.append(label)
-                added += 1
-        roster[canonical] = [canonical] + [label for label in bucket if label != canonical][:MAX_ALIASES]
-        if isinstance(voice, dict) and voice.get("sample"):
-            profiles.setdefault(canonical, {key: str(value).strip() for key, value in voice.items() if value})
-    if added or profiles:
-        print(f"  [roster] +{added} 标签 · 词条 {len(roster)} · 声线 {len(profiles)}", flush=True)
+            labels = []
+        before_labels = {item for bucket in roster.values() for item in bucket}
+        _absorb_entry(roster, name, labels)
+        added += len({item for bucket in roster.values() for item in bucket} - before_labels)
+    if added:
+        print(f"  [roster] +{added} 标签 · 词条 {len(roster)}", flush=True)
     return added
 
 
 def resolve_label(roster: dict[str, list[str]], name: str) -> str:
     """Map a written label/name to its canonical entry (or register it as new)."""
-    if name in roster:
-        return name
     for canonical, labels in roster.items():
-        if name in labels:
+        if name == canonical or name in labels:
             return canonical
-    roster[name] = [name]
-    return name
+    return _absorb_entry(roster, name, [])
 
 
 _THOUGHT_RE = re.compile(r"<\|?channel\|?>.*?<\|?channel\|>", re.DOTALL)
@@ -1158,12 +1168,6 @@ def _extract_edit(content: str) -> dict | None:
     if isinstance(data, dict) and ("op" in data or "role" in data or "find" in data or "text" in data):
         return data
     return None
-
-
-def pending_quotes(marked: str) -> list[str]:
-    """Quoted spans worth sending back to the model: empty / punctuation-only spans carry no
-    dialogue (they are cleaned mechanically at chapter end) and only cause hallucinated targets."""
-    return [span for span in unmarked_quotes(marked) if any(char.isalnum() for char in span[1:-1])]
 
 
 def run_turn(
@@ -1260,14 +1264,11 @@ def run_turn(
                 fail_total += 1
                 repeats = repeats + 1 if sig == last_sig else 0
                 last_sig = sig
-                left = pending_quotes(json.loads(mcp.call("get_marked", {}))["text"])
                 messages.append(
                     {
                         "role": "user",
-                        "content": "找不到目标。还没处理的引号：\n"
-                        + "\n".join(left[:40])
-                        + "\n逐字复制其中一段；被旁白或归属隔开的多段不要拼在一起，一段一次 speak；"
-                        "不在列表里的说明已处理，不要重试；没有就停下。",
+                        "content": "找不到目标。从【要处理的正文】里逐字复制一段重试（开头约 10 字）；"
+                        "句子长时再给结尾约 10 字；一次一处，不是直接对话的不要标；没有就停下。",
                     }
                 )
                 if repeats >= 3 or fail_total >= 12:
@@ -1318,14 +1319,11 @@ def run_turn(
                 fail_total += 1
                 repeats = repeats + 1 if sig == last_sig else 0
                 last_sig = sig
-                left = pending_quotes(json.loads(mcp.call("get_marked", {}))["text"])
                 messages.append(
                     {
                         "role": "user",
-                        "content": "找不到目标。当前还没处理的引号是：\n"
-                        + "\n".join(left[:40])
-                        + "\n\n逐字复制其中一段重试；被旁白或归属隔开的多段不要拼在一起，一段一次 speak；"
-                        "不在列表里的说明已处理，不要重试；没有就结束。",
+                        "content": "找不到目标。从【要处理的正文】里逐字复制一段重试（开头约 10 字）；"
+                        "句子长时再给结尾约 10 字；一次一处，不是直接对话的不要标；没有就结束。",
                     }
                 )
                 if fail_total >= 5:
@@ -1352,8 +1350,48 @@ def _stage_note(book: str, status: str, note: str) -> None:
     path.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def apply_workflow_overrides(args: argparse.Namespace) -> dict:
+    """Overlay ``outputs/<book>/workflow.json`` (edited on the web) over prompts/params.
+
+    The overlay wins over CLI values so the web page is the one place to iterate the flow.
+    """
+    path = APP_ROOT / "outputs" / args.book / "workflow.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    applied: dict = {}
+    params = data.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    for key, target in (("batch", "batch"), ("max_steps", "max_steps")):
+        value = params.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            setattr(args, target, max(1, value))
+            applied[target] = getattr(args, target)
+    if isinstance(params.get("think"), bool):
+        globals()["THINK"] = params["think"]
+        applied["THINK"] = params["think"]
+    prompts = data.get("prompts")
+    if not isinstance(prompts, dict):
+        prompts = {}
+    for key, name in (("local_system", "LOCAL_SYSTEM"), ("step_mark", "STEP_MARK"), ("roster_system", "ROSTER_SYSTEM")):
+        value = prompts.get(key)
+        if isinstance(value, str) and value.strip():
+            globals()[name] = value
+            applied[name] = "overlay"
+    return applied
+
+
 def main() -> None:
     args = parse_args()
+    overrides = apply_workflow_overrides(args)
+    if overrides:
+        print(f"[workflow] 覆盖: {json.dumps(overrides, ensure_ascii=False)}", flush=True)
     if not args.no_live:
         ensure_live_server(args.live_port)
     config = config_from_env()
@@ -1381,7 +1419,6 @@ def main() -> None:
     live = Live(out_dir / "live.jsonl")
     live.emit("start", total=len(ids), book=args.book, batch=args.batch)
     roster = load_roster(args.book)
-    profiles = _canonicalize_profiles(load_profiles(args.book), roster)
     if roster:
         print(f"[resume] 已有词条 {len(roster)}", flush=True)
     counters = {"llm_s": 0.0, "llm_calls": 0, "tool_calls": 0}
@@ -1449,10 +1486,11 @@ def main() -> None:
                 live.set_state(cid, len(snapshot), live_fragments(raw_text, snapshot), done=True)
             print(f"[skip] ch{cid:03d} 已存在", flush=True)
         else:
-            # Per-chapter dictionary: only this chapter's text, so the model keeps a small context.
-            added = maintain_roster(llm, roster, profiles, raw_text)
+            # Dictionary = side product of the text flowing through: fold this piece of text in,
+            # then mark it. No chapters, no voice profiles here (voice is designed from the
+            # dictionary at the voicebank stage).
+            added = maintain_roster(llm, roster, raw_text)
             (out_dir / "roles.json").write_text(json.dumps(roster, ensure_ascii=False, indent=2), encoding="utf-8")
-            save_profiles(args.book, profiles)
             live.emit("roster", chapter=cid, added=added, roles=len(roster))
             names = "、".join(roster)  # consistency hint, not a gate: new names are registered as seen
             hint = f"已有人物（尽量沿用这些名字）：{names}\n\n" if names else ""
@@ -1464,41 +1502,22 @@ def main() -> None:
             messages = [
                 {"role": "system", "content": f"{think}{LOCAL_SYSTEM}\n\n{hint}"},
                 *FEW_SHOT,
-                {"role": "user", "content": f"{prior_context(cid)}\n\n【本章正文（只处理这里的引号）】\n{raw_text}"},
+                {"role": "user", "content": f"{prior_context(cid)}\n\n【要处理的正文（只抓人物直接对话）】\n{raw_text}"},
                 {"role": "user", "content": STEP_MARK},
             ]
             run_turn(client, config, tools, mcp, messages, args.max_steps, counters, live, cid, raw_text)
             snapshot = json.loads(mcp.call("get_marked", {}))["text"]
-            # Completeness: only quotes STILL in the current text are unhandled. A quote already
-            # handled (speak consumed it / delete removed the marks) must not be sent again.
-            for _round in range(3):
-                pending = pending_quotes(snapshot)
-                if not pending:
-                    break
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": f"当前文本里还有 {len(pending)} 处引号没处理（逐字复制，**不带引号**）：\n"
-                        + "\n".join(f"- {item[1:-1]}" for item in pending[:40])
-                        + "\n只处理下面列出的这些：是人物对话就 speak（给不带引号的原文；长台词给开头约 10 字）；"
-                        "只是强调/术语就 delete（去引号留字）；列表之外的一律不要调用工具，也不要说找不到目标。处理完停下。",
-                    }
-                )
-                if run_turn(client, config, tools, mcp, messages, args.max_steps, counters, live, cid, raw_text) == 0:
-                    break  # no progress -> stop instead of looping on failing/hallucinated targets
-                snapshot = json.loads(mcp.call("get_marked", {}))["text"]
+            # No end-of-chapter fill-in pass: whatever the edit loop produced stands; only the
+            # mechanical cleanup below runs.
             for seg in parse_marks(snapshot):  # normalise any label/alias to the canonical name
                 if seg["kind"] != "speech":
                     continue
                 canonical = resolve_label(roster, seg["role_name"])
                 if canonical != seg["role_name"]:
                     snapshot = snapshot.replace(f"<{seg['role_name']}>", f"<{canonical}>")
-            snapshot, leftover = strip_quotes(snapshot)  # safety net: attention quotes the model missed
-            if leftover:
-                print(f"  [clean] ch{cid:03d} 机械去除残留引号 {leftover} 处", flush=True)
+            # Quotes are part of the dialogue sentence and stay inside the marks: no cleanup.
             (out_dir / f"ch{cid:03d}.marked.txt").write_text(snapshot, encoding="utf-8")
             (out_dir / "roles.json").write_text(json.dumps(roster, ensure_ascii=False, indent=2), encoding="utf-8")
-            save_profiles(args.book, profiles)
             phases.append({"chapter": cid, "chars": len(snapshot), "roles": len(roster)})
             print(f"[mark] ch{cid:03d} chars={len(snapshot)} 词条={len(roster)}", flush=True)
             _stage_note(args.book, "run", f"{len(phases)}/{len(ids)}")
@@ -1507,7 +1526,6 @@ def main() -> None:
         live.emit("done", chapter=cid, roles=len(roster), summary=summary[:200])
 
     marked = "\n".join((out_dir / f"ch{cid:03d}.marked.txt").read_text(encoding="utf-8") for cid in ids)
-    print(f"[check] 未标记的引号 {len(unmarked_quotes(marked))} 处", flush=True)
     (out_dir / "roles.json").write_text(json.dumps(roster, ensure_ascii=False, indent=2), encoding="utf-8")
 
     stem = f"ch{ids[0]:03d}_x{len(ids)}"

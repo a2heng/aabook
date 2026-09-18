@@ -34,6 +34,7 @@ for _key in list(os.environ):
         del os.environ[_key]
 os.chdir(APP_ROOT)
 
+from audiobook.llm import LLMClient, config_from_env  # noqa: E402
 from audiobook.tts import BreezeConfig, BreezeRenderer  # noqa: E402
 from audiobook.schema import read_script  # noqa: E402
 
@@ -43,6 +44,22 @@ NARRATOR_SAMPLE = "故事，要从很久以前说起。"
 DEFAULT_STYLE = "日常说话，语气自然。"
 # The narrator is frozen in voices/narrator.json (git-tracked); characters only vary by age+gender.
 NARRATOR_JSON = APP_ROOT / "voices" / "narrator.json"
+
+# Voice profiles (age/gender) are assigned HERE, when the final cast is known -- not during
+# marking. `voice_profiles.json` is just a cache; delete it (or --force-profiles) to redo.
+PROFILE_SYSTEM = """你在给一部小说的有声书定声线档案。根据人物名、别名和部分台词，只判断两件事：
+- age：少年|青年|中年|老年
+- gender：男|女
+依据：台词自称、他人称呼（爷爷/少女/老仆 等）、身份与上下文；拿不准取最接近的一档。
+只输出 JSON：{"规范名": {"age": "青年", "gender": "男"}}"""
+
+AGE_CHOICES = ("少年", "青年", "中年", "老年")
+GENDER_CHOICES = ("男", "女")
+PROFILE_BATCH = 30  # roles per LLM call (keeps the request small)
+
+
+def valid_profile(profile) -> bool:
+    return isinstance(profile, dict) and profile.get("age") in AGE_CHOICES and profile.get("gender") in GENDER_CHOICES
 
 
 def load_narrator() -> dict:
@@ -69,6 +86,66 @@ def voice_instruction(profile: dict | None) -> str:
     return f"一位{age}{gender}性，日常说话，语气自然。"
 
 
+def ensure_profiles(script_dir: Path, lines: dict[str, list[str]], kinds: dict[str, str], force: bool = False) -> dict[str, dict]:
+    """Assign age/gender to every character with the LLM (voicebank stage, not marking).
+
+    The whole cast is known here, so the only input needed is the character info: canonical
+    name + aliases + a few lines. Existing profiles are kept unless ``force``; without an LLM
+    the voicebank still works with the default style.
+    """
+    path = script_dir / "voice_profiles.json"
+    profiles = load_profiles(path)
+    characters = [name for name, kind in kinds.items() if kind == "character"]
+    missing = [name for name in characters if force or not valid_profile(profiles.get(name))]
+    if not missing:
+        return profiles
+    config = config_from_env()
+    if config is None:
+        print(f"[profiles] {len(missing)} 个角色缺年龄/性别，但未配置 LLM；用默认描述造声", flush=True)
+        return profiles
+    roles: dict[str, list[str]] = {}
+    roles_path = script_dir / "roles.json"
+    if roles_path.is_file():
+        roles = json.loads(roles_path.read_text(encoding="utf-8"))
+    alias_to_canonical: dict[str, str] = {}
+    for canonical, labels in roles.items():
+        alias_to_canonical[canonical] = canonical
+        for label in labels:
+            alias_to_canonical.setdefault(str(label), canonical)
+    llm = LLMClient(config)
+    added = 0
+    for start in range(0, len(missing), PROFILE_BATCH):
+        batch = missing[start : start + PROFILE_BATCH]
+        block: list[str] = []
+        for name in batch:
+            aliases = "、".join(str(label) for label in roles.get(name, []) if label and label != name)
+            block.append(f"{name}" + (f"（别名：{aliases}）" if aliases else ""))
+            for line in lines.get(name, [])[:6]:
+                text = line.strip().replace("\n", " ")
+                if text:
+                    block.append(f"    · {text[:60]}")
+        prompt = "【人物】\n" + "\n".join(block) + "\n\n只给这些人物输出 JSON（键=规范名）。"
+        try:
+            result = llm.chat_json(PROFILE_SYSTEM, prompt, thinking=False)
+        except Exception as error:  # noqa: BLE001 - profiles are best-effort
+            print(f"[profiles] LLM 失败：{str(error)[:120]}", flush=True)
+            break
+        if not isinstance(result, dict):
+            continue
+        for key, entry in result.items():
+            name = alias_to_canonical.get(str(key).strip())
+            if name is None or name not in batch or not isinstance(entry, dict):
+                continue
+            age = str(entry.get("age", "")).strip()
+            gender = str(entry.get("gender", "")).strip()
+            if age in AGE_CHOICES and gender in GENDER_CHOICES:
+                profiles[name] = {**(profiles.get(name) or {}), "age": age, "gender": gender}
+                added += 1
+    path.write_text(json.dumps(profiles, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[profiles] 新增/更新 {added} 个 -> {path}", flush=True)
+    return profiles
+
+
 def role_seed(role_name: str, base_seed: int) -> int:
     """Deterministic per-role seed: same role -> same voice, different roles differ."""
     digest = hashlib.sha1(role_name.encode("utf-8")).hexdigest()
@@ -84,6 +161,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples", default=None, help="JSON {role: reference text} overrides (prefer neutral declaratives)")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--narrator-gender", default=None, help="frozen narrator to use (男/女)")
+    parser.add_argument("--no-llm-profiles", action="store_true", help="keep existing profiles; do not ask the LLM")
+    parser.add_argument("--force-profiles", action="store_true", help="re-assign age/gender for every character")
     parser.add_argument("--force", action="store_true", help="redo roles that already have a reference")
     parser.add_argument("--breeze-url", default=None)
     parser.add_argument("--breeze-no-start", action="store_true")
@@ -133,7 +212,10 @@ def main() -> None:
 
     styles = json.loads(Path(args.styles).read_text(encoding="utf-8")) if args.styles else {}
     samples = json.loads(Path(args.samples).read_text(encoding="utf-8")) if args.samples else {}
-    profiles = load_profiles(book / "script" / "voice_profiles.json")
+    if args.no_llm_profiles:
+        profiles = load_profiles(book / "script" / "voice_profiles.json")
+    else:  # age/gender belong to the voicebank stage; the marking stage only keeps names
+        profiles = ensure_profiles(book / "script", lines, kinds, force=args.force_profiles)
 
     config = BreezeConfig(cfg_scale=DESIGN_CFG, seed=args.seed)
     if args.breeze_url:

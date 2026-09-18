@@ -1,16 +1,14 @@
-"""Lightweight TTS-text normalisation before synthesis.
+"""Pre-LLM text cleaning.
 
-The renderer handles segments poorly when they end mid-clause, so use long dash runs or
-repeated ellipses. We normalise those deterministically (the ``raw_text`` is left
-untouched for audit).
+The chapter text is displayed and marked 1:1, so cleaning must be lossless: paragraphs,
+indentation and punctuation are kept. Only glyphs that cannot be spoken at all are dropped,
+plus our own mark delimiters (``[`` ``]`` ``<`` ``>``).
 """
 
 from __future__ import annotations
 
 import re
 import unicodedata
-
-_ENDINGS = "。！？…"
 
 # Letters, numbers, punctuation and marks in every script; whitespace is kept too.
 # Everything else (emoji, box-drawing, math/currency/symbol glyphs, control chars)
@@ -28,36 +26,24 @@ def filter_tts_chars(text: str | None) -> str:
     )
 
 
-def normalize_tts(text: str | None) -> str:
-    text = (text or "").strip()
-    if not text:
-        return ""
-    text = text.replace("——", "，").replace("—", "，")
-    text = re.sub(r"\.{2,}", "……", text)  # ASCII dots -> Chinese ellipsis; ellipsis itself is kept
-    text = re.sub(r"[，、；：]{2,}", "，", text)
-    text = re.sub(r"([。！？…])[，、；：]+", r"\1", text)
-    text = re.sub(r"[，、；：]+([。！？…])", r"\1", text)
-    text = text.strip("，、；：")
-    if text and text[-1] not in _ENDINGS:
-        text += "。"
-    return text
+# Our own delimiters: square brackets (legacy vocal-event tags) and angle brackets (marks).
+# Everything else's punctuation is kept, including decorative marks and dashes.
+_DELIMITER_CHARS = frozenset("[]<>")
 
 
-def clean_for_llm(text: str | None) -> str:
-    """Persistent pre-LLM cleaning: drop non-speech glyphs, then normalise punctuation."""
-    return normalize_tts(filter_tts_chars(text))
+def keep_layout(text: str | None) -> str:
+    """Pre-LLM cleaning that KEEPS paragraphs, indentation and **all punctuation**.
 
-
-_UNWANTED_RE = re.compile(r"·{2,}|—{2,}|-{2,}|＊+|#{2,}")
-_WS_RE = re.compile(r"[\s\u3000]+")
-
-
-def one_paragraph(text: str | None) -> str:
-    """Code-side preprocessing done ONCE, before the LLM: collapse the chapter to a
-    single paragraph, turn ASCII ellipsis / dashes / decorative repeats into a comma
-    (Chinese ellipsis ``……`` is kept), and drop unwanted whitespace."""
-    text = re.sub(r"\.{2,}", "……", text or "")
-    text = _UNWANTED_RE.sub("，", text)
-    text = re.sub(r"。{2,}", "。", text)
-    text = re.sub(r"，{2,}", "，", text)
-    return _WS_RE.sub("", text)
+    Only our own delimiters (``[`` ``]`` ``<`` ``>``) are removed; dashes, quotes, ellipses
+    and decorative punctuation stay as written, and paragraph/indentation is untouched (the
+    chapters are displayed and marked 1:1; TTS-side normalisation happens at render time).
+    ASCII ``...`` is folded into the Chinese ellipsis because it means the same thing.
+    """
+    out: list[str] = []
+    for char in text or "":
+        if char in _DELIMITER_CHARS:
+            continue
+        if char.isspace() or unicodedata.category(char)[0] in _KEEP_CATEGORIES:
+            out.append(char)
+    cleaned = re.sub(r"\.{2,}", "……", "".join(out))
+    return re.sub(r"[ \t]+\n", "\n", cleaned)

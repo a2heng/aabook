@@ -79,7 +79,7 @@ LLM（Qwen3.8-27B + froggeric 修正模板）负责在标注/渲染阶段产出�
 `scripts/optimize_refs.py`、`scripts/download_models.py`，及 AuK 权重
 `ckpts/AuK`、`ckpts/AuK-Flash`、`ckpts/Qwen2.5-Omni-3B`（释放 ~24 G）。
 
-保留：`audiobook/` 前端（cleaning/marks/schema/textnorm/llm/stats/canonical/live）+ 单文件 `audiobook/tts.py`、
+保留：`audiobook/` 前端（cleaning/marks/schema/textnorm/llm/canonical）+ 单文件 `audiobook/tts.py`、
 `scripts/`（run_book/mark_script/marks_to_script/render_book/serve_breeze/serve_files/prepare_refs/
-serve_llm*）、`ckpts/llm`（gemma 等，全部保留）、`ckpts/Breeze-TTS-2.cpp`、`third_party/breeze-tts`
-（PyTorch 参考实现，pristine）、`third_party/Breeze-TTS-2.cpp`。
+serve_llm_cuda.sh/workflow_store）、`ckpts/llm`（gemma 等，全部保留）、`ckpts/Breeze-TTS-2.cpp`、
+`third_party/breeze-tts`（PyTorch 参考实现，pristine）、`third_party/Breeze-TTS-2.cpp`。

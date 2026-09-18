@@ -20,11 +20,15 @@ import mimetypes
 import os
 import re
 import socket
+import subprocess
+import sys
 from datetime import datetime
 from http import HTTPStatus
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
+
+import workflow_store  # same directory (scripts/)
 
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 TEXT_EXTS = {".txt", ".md", ".csv", ".json", ".jsonl", ".log", ".py", ".yaml", ".yml", ".srt"}
@@ -86,16 +90,32 @@ class FileBrowser(SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
     def _send_books(self) -> None:
-        """List book dirs under outputs/ (newest first) so the dashboard can auto-pick."""
+        """List book dirs under outputs/ (newest first) so the dashboard can auto-pick.
+
+        Nested run dirs (``outputs/<book>/<run>``, used for previews) are included and named
+        ``<book>/<run>``; ordering uses the newest mtime of the run dir and its ``script/``.
+        """
         root = Path(self.directory) / "outputs"
         books = []
         if root.is_dir():
-            for item in root.iterdir():
-                if (item / "chapters").is_dir() or (item / "script").is_dir():
-                    try:
-                        books.append({"book": item.name, "mtime": item.stat().st_mtime})
-                    except OSError:
-                        continue
+            candidates = list(root.iterdir())
+            for item in list(candidates):  # one level deeper: outputs/<book>/<run>
+                if not item.is_dir():
+                    continue
+                try:
+                    candidates += [sub for sub in item.iterdir() if sub.is_dir()]
+                except OSError:
+                    continue
+            for item in candidates:
+                if not ((item / "chapters").is_dir() or (item / "script").is_dir()):
+                    continue
+                try:
+                    mtime = item.stat().st_mtime
+                    if (item / "script").is_dir():
+                        mtime = max(mtime, (item / "script").stat().st_mtime)
+                    books.append({"book": str(item.relative_to(root)), "mtime": mtime})
+                except OSError:
+                    continue
         books.sort(key=lambda x: x["mtime"], reverse=True)
         payload = json.dumps(books, ensure_ascii=False).encode("utf-8")
         self.send_response(HTTPStatus.OK)
@@ -104,11 +124,141 @@ class FileBrowser(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        data = json.loads(raw.decode("utf-8") or "{}")
+        return data if isinstance(data, dict) else {}
+
+    def _chapter_state(self, book: str, chapter: int) -> dict:
+        """Raw + marked text of one example chapter, plus whether a run is alive."""
+        base = Path(self.directory) / "outputs" / book
+        raw_path = base / "chapters" / f"ch{chapter:03d}.txt"
+        marked_path = base / "script" / f"ch{chapter:03d}.marked.txt"
+        pidfile = base / "script" / "run.pid"
+        running = False
+        pid = 0
+        if pidfile.is_file():
+            try:
+                pid = int(pidfile.read_text(encoding="utf-8").strip())
+                os.kill(pid, 0)
+                running = True
+            except (OSError, ValueError):
+                running = False
+        return {
+            "book": book,
+            "chapter": chapter,
+            "raw": raw_path.read_text(encoding="utf-8") if raw_path.is_file() else "",
+            "marked": marked_path.read_text(encoding="utf-8") if marked_path.is_file() else "",
+            "raw_mtime": raw_path.stat().st_mtime if raw_path.is_file() else 0,
+            "marked_mtime": marked_path.stat().st_mtime if marked_path.is_file() else 0,
+            "running": running,
+            "pid": pid if running else 0,
+        }
+
+    def _run_chapter(self, payload: dict) -> dict:
+        """Run mark_script for ONE example chapter (reads the persisted overlay)."""
+        book = str(payload.get("book") or "").strip()
+        try:
+            chapter = int(payload.get("chapter") or 0)
+        except (TypeError, ValueError):
+            chapter = 0
+        if not book or chapter <= 0:
+            raise ValueError("book / chapter 不能为空")
+        base = Path(self.directory)
+        if not (base / "outputs" / book / "chapters" / f"ch{chapter:03d}.txt").is_file():
+            raise ValueError(f"章节不存在：{book} ch{chapter:03d}")
+        python = base / ".venv" / "bin" / "python"
+        log = base / ".cache" / "logs" / f"run-{book.replace('/', '_')}-ch{chapter:03d}.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        pidfile = base / "outputs" / book / "script" / "run.pid"
+        pidfile.parent.mkdir(parents=True, exist_ok=True)
+        env = {
+            **os.environ,
+            "AUDIOBOOK_BOOK": book,
+            "AUDIOBOOK_LLM_BASE_URL": os.environ.get("AUDIOBOOK_LLM_BASE_URL", "http://127.0.0.1:8080/v1"),
+            "AUDIOBOOK_LLM_MODEL": os.environ.get("AUDIOBOOK_LLM_MODEL", "qwen3.5-9b"),
+            "AUDIOBOOK_LLM_PROFILE": os.environ.get("AUDIOBOOK_LLM_PROFILE", "qwen3.5-9b"),
+            "NO_PROXY": "*",
+        }
+        with log.open("w", encoding="utf-8") as handle:
+            proc = subprocess.Popen(
+                [
+                    str(python if python.is_file() else Path(sys.executable)),
+                    "-B",
+                    "scripts/mark_script.py",
+                    str(chapter),
+                    "--count",
+                    "1",
+                    "--book",
+                    book,
+                    "--force",
+                    "--no-live",
+                ],
+                cwd=base,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        pidfile.write_text(str(proc.pid), encoding="utf-8")
+        return {"pid": proc.pid, "log": str(log.relative_to(base))}
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         route = parsed.path.rstrip("/") or "/"
         if route == "/books.json":
             self._send_books()
+            return
+        if route == "/chapter.json":
+            query = parse_qs(parsed.query)
+            book = (query.get("book") or [""])[0]
+            try:
+                chapter = int((query.get("chapter") or ["0"])[0])
+            except ValueError:
+                chapter = 0
+            try:
+                if not book or chapter <= 0:
+                    raise ValueError("book / chapter 不能为空")
+                self._send_json(self._chapter_state(book, chapter))
+            except Exception as error:  # noqa: BLE001 - report to the page
+                self.send_error(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if route == "/chapters.json":
+            book = (parse_qs(parsed.query).get("book") or [""])[0]
+            try:
+                if not book:
+                    raise ValueError("book 不能为空")
+                chapters_dir = Path(self.directory) / "outputs" / book / "chapters"
+                ids = sorted(int(path.stem[2:]) for path in chapters_dir.glob("ch*.txt")) if chapters_dir.is_dir() else []
+                self._send_json({"book": book, "chapters": ids})
+            except Exception as error:  # noqa: BLE001 - report to the page
+                self.send_error(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if route == "/workflow":
+            target = Path(self.directory) / "workflow.html"
+            if target.is_file():
+                self._send_file(target, "text/html; charset=utf-8")
+                return
+            self.send_error(HTTPStatus.NOT_FOUND, "workflow.html not found")
+            return
+        if route == "/workflow.json":
+            book = parse_qs(parsed.query).get("book", [""])[0]
+            try:
+                if not book:
+                    raise ValueError("book 不能为空")
+                self._send_json(workflow_store.merged(book))
+            except Exception as error:  # noqa: BLE001 - report to the page
+                self.send_error(HTTPStatus.BAD_REQUEST, str(error))
             return
         if route == "/":
             target = Path(self.directory) / "dashboard.html"
@@ -126,8 +276,9 @@ class FileBrowser(SimpleHTTPRequestHandler):
             book = parse_qs(parsed.query).get("book", [""])[0]
             if book:
                 target = Path(self.directory) / "outputs" / book / "script" / "live.html"
-            else:  # no book given: follow the most recently updated live page
-                pages = list((Path(self.directory) / "outputs").glob("*/script/live.html"))
+            else:  # no book given: follow the most recently updated live page (incl. nested runs)
+                root = Path(self.directory) / "outputs"
+                pages = list(root.glob("*/script/live.html")) + list(root.glob("*/*/script/live.html"))
                 target = max(pages, key=lambda item: item.stat().st_mtime) if pages else Path("/nonexistent")
             if target.is_file():
                 self._send_file(target, "text/html; charset=utf-8")
@@ -135,6 +286,31 @@ class FileBrowser(SimpleHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND, "live page not found")
             return
         super().do_GET()
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        route = parsed.path.rstrip("/") or "/"
+        if route == "/workflow/run":
+            try:
+                self._send_json(self._run_chapter(self._read_json()))
+            except Exception as error:  # noqa: BLE001 - report to the page
+                self.send_error(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if route != "/workflow.json":
+            self.send_error(HTTPStatus.NOT_FOUND, "not found")
+            return
+        try:
+            payload = self._read_json()
+            book = str(payload.get("book") or parse_qs(parsed.query).get("book", [""])[0]).strip()
+            if not book:
+                raise ValueError("book 不能为空")
+            if payload.get("action") == "clear":
+                state = workflow_store.clear(book, actor="web")
+            else:
+                state = workflow_store.save(book, payload, actor="web")
+            self._send_json(state)
+        except Exception as error:  # noqa: BLE001 - report to the page
+            self.send_error(HTTPStatus.BAD_REQUEST, str(error))
 
     def send_head(self) -> io.BufferedIOBase | io.BytesIO | None:
         path = Path(self.translate_path(self.path))

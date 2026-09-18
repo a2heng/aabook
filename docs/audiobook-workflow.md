@@ -15,46 +15,65 @@ stages（可续跑，自动起停本地 LLM）：`prepare → script → convert
 
 ## LLM 服务（标注用）
 
-- 默认 `ckpts/llm/Qwen3.5-9B-UD-Q4_K_XL.gguf`（unsloth Dynamic 2.0，内置 MTP）：`scripts/serve_llm_cuda.sh` 默认 `--spec-type draft-mtp --spec-draft-n-max 6`；采样 temp 1.0 / top_p 0.95 / top_k 20 / presence_penalty 1.5；用模型自带 chat template（不要另传 jinja）。
+- 默认 `ckpts/llm/Qwen3.5-9B-UD-Q4_K_XL.gguf`（unsloth Dynamic 2.0，内置 MTP）：`scripts/serve_llm_cuda.sh` 默认 `--spec-type draft-mtp`（草稿长度 `AUDIOBOOK_LLM_SPEC_DRAFT_N_MAX` 默认 4）；采样 temp 1.0 / top_p 0.95 / top_k 20 / presence_penalty 1.5；用模型自带 chat template（不要另传 jinja）。
 - 可选 DFlash 提速：`z-lab/Qwen3.5-9B-DFlash` 用 `convert_hf_to_gguf.py --target-model-dir ckpts/llm/Qwen3.5-9B-hf --outtype bf16` 转 GGUF，再 `AUDIOBOOK_LLM_SPEC=draft-dflash AUDIOBOOK_LLM_DRAFT=<dflash.gguf>`。9B 无 DSpark 草稿。
 - 环境变量覆盖见 `scripts/serve_llm_cuda.sh` 头部注释；LLM 与 Breeze（8137）不能同时占满 GPU。
+- **前缀缓存**：默认开启（`-np 1`，不要加 `--no-cache-idle-slots`/`--ctx-checkpoints 0`）；另加 `--cache-reuse 256`（`AUDIOBOOK_LLM_CACHE_REUSE`，0 关闭）复用跨章节的共同片段，避免每章重新 prefill。
 
 | 阶段 | 命令 | 产物 |
 | --- | --- | --- |
 | prepare | `build_book.py <txt> --out outputs/<book>` | `source.txt`、`clean.txt`、`chapters/chNNN.txt`、`chapters.json` |
-| script | `mark_script.py <first> --count N --book <book> --mode seq` | `script/chNNN.marked.txt`、`roles.json`、`summary.txt`、`*.html` |
+| script | `mark_script.py <first> --count N --book <book> --batch N` | `script/chNNN.marked.txt`、`roles.json`、`summary.txt`、`*.html` |
 | convert | `marks_to_script.py --marked-dir outputs/<book>/script --out outputs/<book>` | `script.csv`、`script.json` |
 | render | `render_book.py --script outputs/<book>/script.csv ...` | `render/{rows,chapters,book.wav}` |
 
-预处理：`cleaning`（编码/引号/去页码；方括号只去 `[` `]` 符号、**不删括号里的字**）→ `textnorm.clean_for_llm`（通用字符白名单 + 标点规范化，**省略号保留 `……`**，ASCII `...` 归一为 `……`，LLM 前生效）。站点广告/元数据在输入 TXT 层先删掉。
+预处理：`cleaning`（编码/引号/去页码；方括号只去 `[` `]` 符号、**不删括号里的字**）→ `textnorm.keep_layout`：**段落、首行缩进、全部标点原样保留**（`——`/引号/`※` 等不动），只去掉我们自用的 `[` `]` `<` `>` 定界符；ASCII `...` 归一为 `……`。站点广告/元数据在输入 TXT 层先删掉。live 页按段落渲染（`<p>` + 2em 首行缩进）。
 
 ## 标记约定
 
-台词写成 `⦃角色名␟朗读内容⦄`；标记外一律旁白。符号是罕见字符（U+2983 / U+241F / U+2984），可用 `AUDIOBOOK_MARK_OPEN/CLOSE/SEP` 覆盖。解析/渲染在 `audiobook/marks.py`（无 LLM）。
+台词写成 `<角色名>朗读内容</角色名>`（`audiobook/marks.py` 的 `MARK_RE`，可用 `AUDIOBOOK_MARK_RE` 覆盖）；标记外一律旁白。vocal events 写在内容里，如 `<高文>[叹气]好吧。</高文>`。
 
 ## 剧本标注（`scripts/mark_script.py`，唯一路径）
 
 模型只当「阅读文本 → 舞台剧台本」的编剧，**只有一个 `edit` 工具**；所有机械改动由 MCP 代码执行：
 
-- `edit(op="speak", text="“带引号的整段”", role="规范名")`：去引号、包成 `⦃…⦄`，并删掉引号前多余的 `名字：` 归因。
+- `edit(op="speak", text="“带引号的整段”", role="规范名")`：去引号、包成 `<角色>…</角色>`，并删掉引号前多余的 `名字：` 归因。
 - `edit(op="delete", text="“词”")`：去引号留词；引号内只有标点（`“…”`）则整段删；单独标点直接删。
-- `edit(op="replace", find, replace)`：补句末标点；**气口（换气/停顿处）加逗号**。
-- 定位片段要求 ≤6 字；模型抄整句会失败，失败后自动回炉（见下）。
+- `edit(op="replace", find, replace)`：小范围替换（补句末标点等）。
+- 定位片段给开头约 10 字即可；模型抄整句会失败，按工具返回重试。
 
-### 一对多人物词典
+### 人物词典（没有章节概念）
 
-- 词典是 `规范名 → 标签`（正式名、称呼、绰号、代称…），**不用路人**，也不预置固定人名表。
-- **每章开头** `maintain_roster`：LLM 从本章正文挖出标签并并入词典；`speak` 的 role 一律写规范名，标注后把标签归一为规范名。每章末落一次 `roles.json`。
-- 次要人物不在此路人化；留到 TTS 阶段按需处理。
+- 文本流到哪，词典维护到哪：`maintain_roster` 对**每段文本**增量维护，`speak` 的 role 一律写规范名，标注后把标签归一为规范名。
+- **主词必须是全名/全称**：先见到简称、后见到全名时，全名会提升为主词，旧简称并进 aliases（同一人只留一条）。
+- aliases 见到多少收多少、**不限数量**；**绝不收**指代/代词/整句/泛称/地名/组织/种族。
+- **不写声线**：声线在 voicebank 阶段按人物书（`roles.json`）重新设计（年龄/性别 + 设计样本）。
+- 引号是对话句子的一部分，**留在 `<角色>…</角色>` 标记内**，不做引号清理；`[笑]/[叹气]` 等 vocal event 标注不再产出（渲染器仍可识别）。
 
-### 一步一条逻辑对话 + 滚动压缩
+### 窗口 + 滚动摘要（`--batch N`）
 
-始终只维护一条逻辑对话。每章上下文 = `system`（编剧提示词 + 人物词典）+ `user`（**前情摘要** + 本章正文）：
+前 N 章喂全文（`前情`，只用于判断说话人、不处理）；之后每章上下文 = `system`（提示词 + 人物词典）
++ `user`（`前情摘要` + 本章正文）+ `STEP_MARK`：
 
 1. 章内跑完整 tool-loop（模型反复调用 `edit`）。
 2. 章末 `compress()`：用「上一版摘要 + 本章出场角色（`parse_marks`）+ 本章正文」让 LLM 产出新的**滚动摘要**（≤400 字，写 `summary.txt`），只保留判断「谁在说话」需要的信息。
 3. 下一章只带两样耐久记忆：**人物词典**与**前情摘要**；上一章正文和全部工具调用丢弃。
-4. 补漏：章末 `unmarked_quotes` 找出未处理引号，回炉重标直到 0。
+4. **无章末补漏**：编辑循环产出什么就是什么，只做机械收尾（别名归一 + `strip_quotes`）。
+
+### 流水线可视化与覆盖层（`/workflow`）
+
+产品 = **文本（段落流）**：没有章节对象，章节/台词/vocal event 都只是文本里的标记；所有阶段读写
+同一段文本。结构（阶段、标记、参数、提示词）定义在 `scripts/workflow_store.py::PIPELINE`。
+
+```
+http://<host>:8899/workflow?book=<book>
+```
+
+- 页面逐阶段展示 入→出、脚本与命令；“标注”阶段可直接改 `batch / max_steps / think`
+  和三个提示词（`LOCAL_SYSTEM / STEP_MARK / ROSTER_SYSTEM`），并可**一键保存覆盖并运行例章 ch003**（输入原文 / 输出 marked 两栏对照）。
+- 保存写入 `outputs/<book>/workflow.json`，每次改动追加 `workflow_changelog.jsonl`（来源 web/agent 双向可见）；
+  “清除覆盖”回到代码默认值。
+- `mark_script.py` 启动时读取覆盖（覆盖优先于 CLI），启动日志打印 `[workflow] 覆盖: ...`。
 
 ### 实时查看
 

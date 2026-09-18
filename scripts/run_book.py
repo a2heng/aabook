@@ -198,7 +198,7 @@ def main() -> None:
                 "--book",
                 args.book,
                 "--batch",
-                "10",
+                "5",
             ],
             env={"AUDIOBOOK_BOOK": args.book, **llm_env},
             log_path=logs_dir / "script.log",

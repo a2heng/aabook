@@ -13,6 +13,7 @@
 #   AUDIOBOOK_LLM_CTX        default 32768
 #   AUDIOBOOK_LLM_KV         q8_0|q4_0|f16 ... default q8_0
 #   AUDIOBOOK_LLM_FA         flash attention on|off|auto (default on; required for quantized KV)
+#   AUDIOBOOK_LLM_CACHE_REUSE  cross-chapter KV-shifting reuse chunk (default 256; 0 disables)
 #   AUDIOBOOK_LLM_THINK_BUDGET  default 512 (-1 unlimited, 0 off)
 #   AUDIOBOOK_LLM_SPEC       default "draft-mtp" (empty disables)
 #   AUDIOBOOK_LLM_SPEC_DRAFT_N_MAX  default 4 (Qwen3.5 MTP measured best; gemma-4 MTP head also 4)
@@ -34,6 +35,7 @@ NGL="${AUDIOBOOK_LLM_NGL:-99}"
 CTX="${AUDIOBOOK_LLM_CTX:-32768}"
 KV="${AUDIOBOOK_LLM_KV:-q8_0}"
 FA="${AUDIOBOOK_LLM_FA:-on}"
+CACHE_REUSE="${AUDIOBOOK_LLM_CACHE_REUSE:-256}"
 BUDGET="${AUDIOBOOK_LLM_THINK_BUDGET:-512}"
 SPEC="${AUDIOBOOK_LLM_SPEC-draft-mtp}"
 
@@ -61,10 +63,16 @@ template_args=()
 if [ -n "$TEMPLATE" ] && [ -f "$TEMPLATE" ]; then
   template_args=(--chat-template-file "$TEMPLATE")
 fi
+cache_args=()
+if [ "$CACHE_REUSE" != "0" ]; then
+  cache_args=(--cache-reuse "$CACHE_REUSE")
+fi
 
 # Keep prompt caching ON: `--no-cache-idle-slots` and `--ctx-checkpoints 0` used to disable
 # reuse, so every tool round-trip re-prefilled the whole conversation (~2s x 20-45 calls per
 # chapter). Do not add them back.
+# `--cache-reuse N` extends that across chapters: the rolling window shifts by one chapter, so
+# the common middle (chapters n-2..n+1) is reused via KV shifting instead of re-prefilled.
 exec "$BIN/llama-server" \
   -m "$MODEL" --host 127.0.0.1 --port "$PORT" --jinja \
   -np 1 \
@@ -72,4 +80,5 @@ exec "$BIN/llama-server" \
   -ngl "$NGL" -c "$CTX" -b "$BATCH" -ub "$UBATCH" -fa "$FA" \
   -ctk "$KV" -ctv "$KV" \
   "${template_args[@]}" \
-  "${moe_args[@]}" "${draft_args[@]}" "${spec_args[@]}"
+  "${moe_args[@]}" "${draft_args[@]}" "${spec_args[@]}" \
+  "${cache_args[@]}"

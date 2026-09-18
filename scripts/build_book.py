@@ -17,7 +17,7 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_ROOT))
 
 from audiobook.cleaning import Chapter, normalize_text, read_text, split_chapters  # noqa: E402
-from audiobook.textnorm import clean_for_llm, one_paragraph  # noqa: E402
+from audiobook.textnorm import keep_layout  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
 def prepare(input_path: str, out: Path) -> list[Chapter]:
     raw = read_text(input_path)
     source = normalize_text(raw)
-    clean = clean_for_llm(source)
+    clean = keep_layout(source)  # paragraphs / indentation / punctuation stay as written
     out.mkdir(parents=True, exist_ok=True)
     (out / "source.txt").write_text(source, encoding="utf-8")
     (out / "clean.txt").write_text(clean, encoding="utf-8")
@@ -38,7 +38,7 @@ def prepare(input_path: str, out: Path) -> list[Chapter]:
     chapter_dir = out / "chapters"
     chapter_dir.mkdir(parents=True, exist_ok=True)
     for chapter in chapters:
-        text = one_paragraph(chapter.text)
+        text = keep_layout(chapter.text).strip("\n")
         (chapter_dir / f"ch{chapter.chapter_id:03d}.txt").write_text(text + "\n", encoding="utf-8")
     manifest = [{"chapter_id": c.chapter_id, "title": c.title} for c in chapters]
     (out / "chapters.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")

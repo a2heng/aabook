@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 import json
-import sqlite3
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -143,38 +142,6 @@ def write_script_json(rows: list[ScriptRow], path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps([asdict(row) for row in rows], ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-_SQLITE_TYPES = {
-    "order": "INTEGER",
-    "chapter_id": "INTEGER",
-    "seed": "INTEGER",
-    "nfe": "INTEGER",
-    "emotion_multiplier": "REAL",
-    "speed": "REAL",
-    "volume_gain_db": "REAL",
-    "pitch_semitones": "REAL",
-    "target_duration_s": "REAL",
-    "cfg": "REAL",
-    "extract_conf": "REAL",
-    "punct_edited": "INTEGER",
-    "needs_pass2": "INTEGER",
-}
-
-
-def write_script_sqlite(rows: list[ScriptRow], path: str | Path) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    columns = [(f.name, _SQLITE_TYPES.get(f.name, "TEXT")) for f in fields(ScriptRow)]
-    ddl = ", ".join(f'"{name}" {sql_type}' for name, sql_type in columns)
-    placeholders = ", ".join("?" for _ in columns)
-    names = ", ".join(f'"{name}"' for name, _ in columns)
-    with sqlite3.connect(path) as connection:
-        connection.execute("DROP TABLE IF EXISTS script")
-        connection.execute(f"CREATE TABLE script ({ddl})")
-        for row in rows:
-            values = [int(v) if isinstance(v, bool) else v for v in asdict(row).values()]
-            connection.execute(f"INSERT INTO script ({names}) VALUES ({placeholders})", values)
 
 
 def read_script(path: str | Path) -> list[ScriptRow]:

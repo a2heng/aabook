@@ -3,7 +3,7 @@
 ## 项目速览
 
 - **唯一 TTS = Breeze TTS 2**：子模块 `third_party/Breeze-TTS-2.cpp`（C++/GGUF，含嵌套 `third_party/ggml`）+ 参考实现 `third_party/breeze-tts`。**两者均保持 pristine，一行不改**。
-- **唯一 LLM = Qwen3.5-9B（MTP）**：本地 llama.cpp（CUDA）起 OpenAI 兼容服务，用于剧本标注；权重 `ckpts/llm/Qwen3.5-9B-UD-Q4_K_XL.gguf`（unsloth Dynamic 2.0，~5.9 GB，**内置 MTP head**，`--spec-type draft-mtp --spec-draft-n-max 6`）。用**模型自带 chat template**（`scripts/serve_llm_cuda.sh` 默认不传模板；`qwen_chat_template.jinja`/froggeric 是 Qwen3.8 时代的修正模板，勿用于 3.5）；采样按官方 thinking：temp 1.0 / top_p 0.95 / top_k 20 / presence_penalty 1.5。备选提速：`z-lab/Qwen3.5-9B-DFlash`（本地 `convert_hf_to_gguf.py --target-model-dir` 转 GGUF 后 `--spec-type draft-dflash`，无 9B DSpark）。`ckpts/llm` 其余模型（gemma-4-E4B、Qwen3.8-27B、Ornith、Spark）保留备选。
+- **唯一 LLM = Qwen3.5-9B（MTP）**：本地 llama.cpp（CUDA）起 OpenAI 兼容服务，用于剧本标注；权重 `ckpts/llm/Qwen3.5-9B-UD-Q4_K_XL.gguf`（unsloth Dynamic 2.0，~5.9 GB，**内置 MTP head**；`serve_llm_cuda.sh` 默认 `--spec-type draft-mtp`、`AUDIOBOOK_LLM_SPEC_DRAFT_N_MAX` 默认 4）。用**模型自带 chat template**（`scripts/serve_llm_cuda.sh` 默认不传模板；`qwen_chat_template.jinja`/froggeric 是 Qwen3.8 时代的修正模板，勿用于 3.5）；采样按官方 thinking：temp 1.0 / top_p 0.95 / top_k 20 / presence_penalty 1.5。备选提速：`z-lab/Qwen3.5-9B-DFlash`（本地 `convert_hf_to_gguf.py --target-model-dir` 转 GGUF 后 `--spec-type draft-dflash`，无 9B DSpark）。`ckpts/llm` 其余模型（gemma-4-E4B、Qwen3.8-27B、Ornith、Spark）保留备选。
 - **备选 LLM = Bonsai 27B（Ternary + DSpark）**：PrismML 的 llama.cpp fork 已做子模块 `third_party/llama.cpp`，编到 `build/llama-cpp/`（CUDA 参数同 Breeze）；权重只能用 fork 专用的 `ckpts/llm/Ternary-Bonsai-27B-PQ2_0.gguf`（上游 llama.cpp 用 `Q2_g64`，别混）；DSpark 草稿要先转：`gguf_dspark_to_dflash.py --drop-shared-tensors <legacy-Q4_1> <PQ2_0> <out-dflash.gguf>`。启动：`AUDIOBOOK_LLAMA_BIN=build/llama-cpp/bin` + `--spec-type draft-dspark --spec-draft-n-max 4` + KV q4_0；采样 temp 0.7 / top_p 0.95 / top_k 20。实测 98 tok/s（无草稿 62.6）@200W。
 - **我们的代码在外层**：`audiobook/`（前端 + Breeze 渲染）、`scripts/`、`tests/`、`requirements.txt`、`AGENTS.md`。
 - 运行环境：外层 `.venv`，依赖见 `requirements.txt`。Python 侧只做音频 I/O、ASR、响度、LLM 客户端；**不再需要 torch**。
@@ -15,26 +15,27 @@
 小说 TXT → 舞台剧本 → `script.csv` → 逐行渲染 → 母带。完整流程见 `docs/audiobook-workflow.md`。
 
 - **唯一入口**：`scripts/run_book.py <txt> --book <name>`，stages=`prepare → script → convert → render`（可续跑，自动起停本地 LLM；render 前会停 LLM 腾 GPU）。
-- **两段式工作流（固定）**：先**预热**前 10 章跑 `script`，人工**校订** `script/roles.json`（人物/别名）与 `script/voice_profiles.json`（性别/年龄），再**正式**跑全书（复用已校订的词典/声线）。预热示例：`run_book.py <txt> --book <name> --stages prepare,script --limit 10`。
+- **两段式工作流（固定）**：先**预热**前 10 章跑 `script`，人工**校订** `script/roles.json`（人物/别名），再**正式**跑全书（复用已校订的词典）。声线在 voicebank 阶段按人物书重新设计。预热示例：`run_book.py <txt> --book <name> --stages prepare,script --limit 10`。
   1. **prepare**（`scripts/build_book.py --prepare-only`）：清洗/规范化/切章 → `outputs/<book>/{source,clean}.txt` + `chapters/chNNN.txt`。
-  2. **script**（`scripts/mark_script.py`）：逐章 → 舞台剧台本；**不做频率发现、不预置人名表**，人物词典在逐章标注中增量维护。
-  3. **convert**（`scripts/marks_to_script.py --marked-dir`）：`⦃角色␟内容⦄` 机械解析（无 LLM）→ `script.csv`/`script.json`。
-  4. **voicebank**（`scripts/build_voicebank_breeze.py`）：Breeze voice design 给每个角色造参考音 + 用设计样本文本作逐字转写 → `voicebank.json`/`voicebank_meta.json`。
+  2. **script**（`scripts/mark_script.py`）：逐章 → 舞台剧台本（`--batch N`：前 N 章喂全文窗口，之后滚动摘要）；**不做频率发现、不预置人名表**，人物词典在逐章标注中增量维护。
+  3. **convert**（`scripts/marks_to_script.py --marked-dir`）：`<角色名>内容</角色名>` 机械解析（无 LLM）→ `script.csv`/`script.json`。
+  4. **voicebank**（`scripts/build_voicebank_breeze.py`）：Breeze voice design 给每个角色造参考音 + 用设计样本文本作逐字转写 → `voicebank.json`/`voicebank_meta.json`。若 `script/voice_profiles.json` 缺年龄/性别，这里先用 LLM 现定（`--no-llm-profiles` 跳过、`--force-profiles` 重定）。
   5. **render**（`scripts/render_book.py`）：**Breeze TTS 2** 逐行克隆/表演合成 + 拼接 → `outputs/<book>/render/`；最终章节/整书默认 **MP3 64k**（`--audio-format`，逐行 wav 仅作无损缓存）。
-- **声线**：旁白**固化**在 `voices/narrator.json` + `narrator_m/f.wav`（git 追踪；`scripts/build_narrator.py` 复现；青年男/女，seed58，讲故事）。角色由 LLM 只定**性别+年龄**（`voice_profiles.json`），描述固定 `一位{年龄}{性别}性，日常说话，语气自然。`；同角色用确定性 seed（`role_seed`），设计 cfg=4、克隆 cfg=1。
-- **标记约定**：台词 = `⦃角色名␟朗读内容⦄`（罕见符号 U+2983/U+241F/U+2984，可用 `AUDIOBOOK_MARK_OPEN/CLOSE/SEP` 覆盖），标记外一律旁白；解析在 `audiobook/marks.py`。
+- **声线**：旁白**固化**在 `voices/narrator.json` + `narrator_m/f.wav`（git 追踪；`scripts/build_narrator.py` 复现；青年男/女，seed58，讲故事）。角色声线在 voicebank 阶段按**人物书（roles.json）**用 LLM 只定**性别+年龄**（`voice_profiles.json`），描述固定 `一位{年龄}{性别}性，日常说话，语气自然。`；同角色用确定性 seed（`role_seed`），设计 cfg=4、克隆 cfg=1。
+- **标记约定**：台词 = `<角色名>朗读内容</角色名>`（`audiobook/marks.py` 的 `MARK_RE`，可用 `AUDIOBOOK_MARK_RE` 覆盖），标记外一律旁白；vocal events 写在内容里如 `<高文>[叹气]好吧。</高文>`。
 - **剧本标注（`mark_script.py`）**：
-  - 模型只当「阅读文本→舞台剧台本」的编剧，**只有一个 `edit` 工具**（`op=speak/delete/replace`），逐处一次调用；去引号、删多余「名字：」归因、气口加逗号由 MCP 代码机械执行。
-  - **一对多人物词典**（规范名 → **模糊名称 + 3~5 个具体称谓**），冷启动为空，只从 `script/roles.json` 续跑；每章开头 `maintain_roster`，`speak` 写规范名，章末落 `roles.json`。**绝不收指代/代词/描述性短语/泛称**（`MAX_ALIASES=5` 硬上限）。
-  - **滚动压缩（`--mode seq`）**：每章上下文 = `system`（提示词 + 词典）+ `user`（前情摘要 + 本章正文）；章末 `compress()` 产 ≤400 字摘要写 `summary.txt`。下一章只带「词典 + 摘要」。
-  - **补漏**：章末 `unmarked_quotes` 找出未处理引号，回炉重标直到 0。
+  - 模型只当「阅读文本→舞台剧台本」的编剧，**只有一个 `edit` 工具（只 `speak`）**，逐处一次调用：抓**人物直接说的话——说出口的对话 + 心里说的独白**（旁白/间接心理描写不算）。`text` 给开头约 10 字，超过 20 字的再给 `end` 结尾约 10 字（≤20 字给整句）；标点由 MCP 模糊匹配。删多余「名字：」归因由代码机械执行；**引号随原文留在标记内，不清理、不加气口**。
+  - **人物词典（没有章节概念）**：文本流到哪，词典维护到哪——`maintain_roster` 对**每段文本**增量维护，`speak` 一律写规范名。**主词必须是全名/全称**（后出现的全名会把旧简称提升为主词，同一人只留一条）；aliases **不限数量**；**绝不收**指代/代词/整句/泛称/地名/组织/种族。**不写声线**（voicebank 阶段按人物书定）。
+  - **窗口 + 滚动摘要（`--batch N`）**：前 N 章喂全文（`前情`），之后每章 `compress()` 产 ≤400 字摘要写 `summary.txt`；每章上下文 = `system`（提示词 + 词典）+ `user`（前情原文/摘要 + 本章正文）+ `STEP_MARK`。
+  - **无章末补漏**：编辑循环产出什么就是什么，只做别名归一（引号不做清理）。
   - MCP 原语（`set_text`/`edit`/`get_marked`）**内联在 `scripts/mark_script.py`**（`ScriptServer` + in-process `MCPClient`，无子进程）。
-  - 产物：`outputs/<book>/script/{chNNN.marked.txt, roles.json, summary.txt, *.html}`。
-- **预处理**：`cleaning`（编码/引号/去页码/**第一步去方括号——只去 `[` `]` 符号、保留括号内文字**）+ `textnorm.clean_for_llm`（只做字符白名单 L/N/P/M + 标点规范化；**省略号保留 `……`，ASCII `...` 归一为 `……`**）；**不做小句切分**，整章直接送 LLM。
-- **Vocal events**：单一数据源 `audiobook/tts.py` 的 `VOCAL_EVENTS`（官方中文例子 `[笑]/[叹气]/[咳嗽]/[清嗓子]`，词表开放，`is_event_tag` 放行自由词）；标注 `speak` 可带 `tag`，程序写成 `[tag]` 前置；渲染器检测到 tag 自动把 cfg 提到 2.5。
+  - 产物：`outputs/<book>/script/{chNNN.marked.txt, roles.json, summary.txt, *.html}`（引号留在标记内，不做引号清理）。
+- **预处理**：`cleaning`（编码/引号/去页码/**去 `[` `]` 符号、保留括号内文字**）+ `textnorm.keep_layout`：**保留段落、首行缩进和全部标点**（`——`/引号/`※` 等原样保留），只去掉我们自用的 `[` `]` `<` `>` 定界符；ASCII `...` 归一为 `……`；不做小句切分，整章（带段落）直接送 LLM，live 页按 `<p>` + 2em 首行缩进渲染。
+- **Vocal events（渲染器遗留支持）**：`audiobook/tts.py` 仍能识别内容里的 `[笑]/[叹气]`（检测到自动提 cfg），但**标注不再产出 tag**。
 - **速度**：Breeze 无时长/语速参数（自己决定停）；快慢用 direction 指令（`语速放慢`）、参考音语速，或后处理 `tts.atempo`（`row.speed` / `--speed`，保音高）。
 - 后端**单文件** `audiobook/tts.py`：Breeze HTTP 渲染（可续跑）+ 拼接/响度（-16 LUFS）+ `encode_lossy`（MP3 64k）+ `atempo` 变速 + vocal events。参考音准备：`scripts/prepare_refs.py`。
 - 局域网浏览/试听：`scripts/serve_files.py`（`:8899`）。
+- **流水线可视化（web）**：`http://<host>:8899/workflow`（看板有入口）。产品 = **文本（段落流）**，章节/台词/事件都只是标记，所有阶段读写同一段文本；结构定义在 `scripts/workflow_store.py::PIPELINE`。页面可改 `batch / max_steps / think` 与三个提示词、一键保存覆盖并运行例章 ch003（输入/输出对照），保存到 `outputs/<book>/workflow.json` 并写 `workflow_changelog.jsonl`（双向留痕）；`mark_script.py` 启动时应用覆盖（覆盖优先于 CLI）。
 
 ## Breeze TTS 2（C++/GGUF，唯一推理路径）
 
@@ -79,7 +80,7 @@
 1. **禁止对长命令使用 `| head` / `| tail` 截断**。管道会缓冲输出，看起来像卡死。
    - 需要完整输出就直接输出（工具会把超长内容写入文件）。
    - 长时间任务改为后台 + 日志 + 轮询，且**必须完全脱离本会话**：
-     `setsid --fork nohup cmd </dev/null > /tmp/opencode/xxx.log 2>&1 & disown`
+     `setsid --fork nohup cmd </dev/null > .cache/logs/xxx.log 2>&1 & disown`（日志一律写项目内 `.cache/logs/`）
      随后用 Read 读该日志，直到出现结束标志。
    - **根因**：opencode 用 `bash -c` 执行命令，**stdout/stderr 是 unix socket（不是 tty）**，工具一直读到该 socket EOF 才认为命令结束。任何后代进程只要还持有这个 socket，命令就永不「结束」→ 假死。
    - **两个必踩的坑**：
@@ -106,7 +107,7 @@
 - **上游实测 CUDA 比 Vulkan 慢**（本机 RTF≈0.7x）；追求速度可再装 Vulkan SDK 重编。`-dd` 量化变体短句可、长文劣化，别用于 narration。
 - **输出用 MP3 64k**：`tts.encode_lossy`（ffmpeg libmp3lame）把章节/整书 wav 转 `.mp3`，逐行 wav 仍是无损缓存；`--audio-format {mp3,aac,opus,wav}`、`--bitrate` 可切换。
 - **造声参考音的转写用「设计样本文本」本身**，不要用 ASR（ASR 有错字，会静默劣化克隆）。
-- **标注 LLM 必须用 froggeric 模板**：Qwen 官方 chat template 在工具调用上有空 think 毒化 / JSON 参数崩溃 / prefix KV 失效；`serve_llm_cuda.sh` 默认 `--chat-template-file assets/llm/qwen_chat_template.jinja --reasoning-format deepseek --reasoning-preserve`。实测 27B IQ4_XS 全量 GPU（14.7/16.4 GB，~35 tok/s），工具调用返回 `reasoning_content` + `tool_calls` 正常。LLM（8080）与 Breeze（8137）**不能同时占满 GPU**，render 前需停 LLM。
+- **标注 LLM 用模型自带 chat template**（Qwen3.5，`serve_llm_cuda.sh` 不传 jinja）；`assets/llm/qwen_chat_template.jinja`（froggeric）是 Qwen3.8 时代的修正模板，**不要用于 3.5**。LLM（8080）与 Breeze（8137）**不能同时占满 GPU**，render 前需停 LLM。
 
 ## 验证与代码风格
 
