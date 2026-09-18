@@ -21,6 +21,8 @@ class WorkflowStoreTest(unittest.TestCase):
         state = workflow_store.merged("nobook", self.base)
         self.assertEqual(state["pipeline"]["product"]["name"], "文本（段落流）")
         self.assertIn("local_system", state["prompts"])
+        self.assertIn("check_mark", state["prompts"])
+        self.assertIn("check_steps", state["params"])
         self.assertEqual(state["params"]["batch"], 5)
 
     def test_save_merges_partial_and_logs(self):
@@ -44,6 +46,28 @@ class WorkflowStoreTest(unittest.TestCase):
         state = workflow_store.clear("b", actor="agent", base=self.base)
         self.assertEqual(state["params"]["think"], state["defaults"]["params"]["think"])
         self.assertTrue(state["changelog"][0]["cleared"])
+
+    def test_few_shot_defaults_and_save(self):
+        state = workflow_store.merged("nobook", self.base)
+        self.assertTrue(state["few_shot"])
+        self.assertIn("calls", state["few_shot"][0])
+
+        saved = workflow_store.save(
+            "b",
+            {"few_shot": [{"text": "x", "calls": ['{"op":"speak"}'], "results": ["{}"]}]},
+            actor="web",
+            base=self.base,
+        )
+        self.assertEqual(len(saved["few_shot"]), 1)
+        self.assertTrue(saved["few_shot_overridden"])
+        self.assertEqual(saved["changelog"][0]["few_shot"], 1)
+
+    def test_few_shot_builder_skips_bad_cases(self):
+        from scripts.mark_script import few_shot_messages
+
+        self.assertEqual(few_shot_messages([{"text": "", "calls": ["{}"]}]), [])
+        messages = few_shot_messages([{"text": "正文", "calls": ['{"op":"speak"}'], "results": ["{}"]}])
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "tool"])
 
 
 if __name__ == "__main__":

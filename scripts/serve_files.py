@@ -312,7 +312,7 @@ class FileBrowser(SimpleHTTPRequestHandler):
         except Exception as error:  # noqa: BLE001 - report to the page
             self.send_error(HTTPStatus.BAD_REQUEST, str(error))
 
-    def send_head(self) -> io.BufferedIOBase | io.BytesIO | None:
+    def send_head(self) -> io.BufferedIOBase | io.BytesIO | None:  # type: ignore
         path = Path(self.translate_path(self.path))
         if path.is_dir():
             return self.list_directory(str(path))

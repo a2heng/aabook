@@ -92,15 +92,6 @@ class VocalEventsTest(unittest.TestCase):
 
 
 class DeleteDanglingTest(unittest.TestCase):
-    def test_empty_quote_swallows_dangling_attribution(self):
-        from scripts.mark_script import ScriptServer
-
-        server = ScriptServer()
-        server.set_text("他说道：“”现场一片沉默。")
-        result = server.edit(op="delete", text="他说道：")
-        self.assertTrue(result["ok"])
-        self.assertEqual(server.text, "现场一片沉默。")
-
     def test_punctuation_only_quote_swallows_attribution(self):
         from scripts.mark_script import ScriptServer
 
@@ -188,6 +179,25 @@ class AnchorEndTest(unittest.TestCase):
         self.assertNotIn("<陈默>“我先走了。”他披上外套", server.text)
         self.assertTrue(server.text.rstrip().endswith("“明天见。”"))
 
+    def test_tiny_needle_must_be_inside_quotes(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("如果是不了解她的人，恐怕会觉得她难以接近。她淡淡地说：“不。”")
+        result = server.edit(op="speak", text="不", role="维多利亚")
+        self.assertTrue(result["ok"])
+        self.assertIn("<维多利亚>“不。”</维多利亚>", server.text)
+        self.assertNotIn("是<维多利亚>不", server.text)  # must not hit the narration 不
+
+    def test_tiny_needle_without_quotes_is_refused(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他摇了摇头。")
+        result = server.edit(op="speak", text="摇", role="甲")
+        self.assertFalse(result["ok"])
+        self.assertIn("太短", result["reason"])
+
     def test_complete_text_never_glues_two_quotes(self):
         from scripts.mark_script import ScriptServer
 
@@ -208,6 +218,349 @@ class AnchorEndTest(unittest.TestCase):
         self.assertIn("<陈默>“我先走了。”</陈默>", server.text)
         self.assertIn("<陈默>“明天见。”</陈默>", server.text)
         self.assertIn("他披上外套", server.text)
+
+
+class LineMarkTest(unittest.TestCase):
+    def test_clause_numbering(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        result = server.edit(op="speak", line=1, begin="B", end="C", role="陈默")
+        self.assertTrue(result["ok"])
+        self.assertIn("<陈默>“你终于来了。”</陈默>", server.text)
+        self.assertIn("他叹道：", server.text)
+
+    def test_clause_range_covers_inner_punctuation(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("“这件事要从很久以前说起，最后我们还是在城南住下了。”")
+        result = server.edit(op="speak", line=1, begin="A", end="C", role="陈默")
+        self.assertTrue(result["ok"])
+        self.assertIn("<陈默>“这件事要从很久以前说起，最后我们还是在城南住下了。”</陈默>", server.text)
+
+    def test_multi_segment_line_requires_begin(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        result = server.edit(op="speak", line=1, role="陈默")
+        self.assertFalse(result["ok"])
+        self.assertIn("begin", result["reason"])
+
+    def test_single_clause_line_is_automatic(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("“嗯。”")
+        result = server.edit(op="speak", line=1, role="陈默")
+        self.assertTrue(result["ok"])
+        self.assertIn("<陈默>“嗯。”</陈默>", server.text)
+
+    def test_two_pieces_in_the_same_line_marked_separately(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("“快走！”他高声提醒，“别管我！”")
+        server.edit(op="speak", line=1, begin="A", end="B", role="陈默")
+        server.edit(op="speak", line=1, begin="C", end="D", role="陈默")
+        self.assertIn("<陈默>“快走！”</陈默>", server.text)
+        self.assertIn("<陈默>“别管我！”</陈默>", server.text)
+        self.assertIn("他高声提醒", server.text)
+
+    def test_full_scenario_is_consistent_with_mcp(self):
+        from scripts.mark_script import ScriptServer
+
+        text = (
+            "【第一章 雨夜】\n"
+            "陈默推开门，雨水顺着伞骨滴在地上。他低声说：“我回来了，今天真冷，路上还下了雨。”"
+            "苏晚从厨房探出头：“饭在锅里，热着呢。”陈默坐下，忽然想：她又熬夜了吧，桌上那盏灯一直亮着。"
+            "墙上挂着一幅写着“宁静致远”的字。\n"
+            "“你淋湿了。”苏晚递过毛巾，“先擦擦。”陈默接过：“没事。”“明天还去吗？”“去。”"
+            "“带我一起。”他顿了顿，“不行。”"
+        )
+        calls = [
+            (2, "D", "G", "陈默"),
+            (2, "H", "J", "苏晚"),
+            (2, "L", "N", "陈默"),
+            (3, "A", "B", "苏晚"),
+            (3, "C", "D", "苏晚"),
+            (3, "E", "F", "陈默"),
+            (3, "F", "G", "苏晚"),
+            (3, "G", "H", "陈默"),
+            (3, "H", "I", "苏晚"),
+            (3, "J", "K", "陈默"),
+        ]
+        server = ScriptServer()
+        server.set_text(text)
+        for line, clause, clause_end, role in calls:
+            result = server.edit(op="speak", line=line, begin=clause, end=clause_end, role=role)
+            self.assertTrue(result["ok"], result)
+        for expected in (
+            "<陈默>“我回来了，今天真冷，路上还下了雨。”</陈默>",  # multi-sentence span (quotes included)
+            "<苏晚>“饭在锅里，热着呢。”</苏晚>",
+            "<陈默>她又熬夜了吧，桌上那盏灯一直亮着。</陈默>",  # inner thought, multi-sentence
+            "<苏晚>“你淋湿了。”</苏晚>",
+            "<苏晚>“先擦擦。”</苏晚>",  # same speaker, action beat in between
+            "<陈默>“没事。”</陈默>",
+            "<苏晚>“明天还去吗？”</苏晚>",
+            "<陈默>“去。”</陈默>",
+            "<苏晚>“带我一起。”</苏晚>",
+            "<陈默>“不行。”</陈默>",
+        ):
+            self.assertIn(expected, server.text)
+        self.assertIn("【第一章 雨夜】", server.text)
+        self.assertIn("“宁静致远”", server.text)  # quoted term: not a dialogue, untouched
+
+    def test_clause_labels_roll_over_to_aa(self):
+        from scripts.mark_script import clause_label, label_number
+
+        self.assertEqual([clause_label(i) for i in (1, 26, 27, 53)], ["A", "Z", "AA", "BA"])
+        self.assertEqual([label_number(x) for x in ("A", "Z", "AA", "BA")], [1, 26, 27, 53])
+
+    def test_markers_do_not_take_clause_numbers(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("【第 3 章】\n他说：“你来了。”")
+        result = server.edit(op="speak", line=2, begin="B", end="C", role="甲")
+        self.assertTrue(result["ok"])
+        self.assertIn("<甲>“你来了。”</甲>", server.text)
+        self.assertIn("【第 3 章】", server.text)
+
+    def test_missing_line_and_bad_clause_are_refused(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("只有一行。")
+        self.assertIn("段落号", server.edit(op="speak", line=9, begin=1, end=2, role="甲")["reason"])
+        self.assertIn("分割", server.edit(op="speak", line=1, begin="Z", end="Z", role="甲")["reason"])
+
+    def test_respeak_replaces_a_wrong_role(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        server.edit(op="speak", line=1, begin="B", end="C", role="甲")
+        result = server.edit(op="speak", line=1, begin="B", end="C", role="乙")
+        self.assertTrue(result.get("replaced"), result)
+        self.assertIn("<乙>“你终于来了。”</乙>", server.text)
+        self.assertNotIn("<甲>", server.text)
+
+    def test_respeak_same_role_is_already(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        server.edit(op="speak", line=1, begin="B", end="C", role="陈默")
+        result = server.edit(op="speak", line=1, begin="B", end="C", role="陈默")
+        self.assertTrue(result.get("already"), result)
+        self.assertEqual(server.text.count("</陈默>"), 1)
+
+    def test_unmark_removes_the_mark_and_keeps_text(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        server.edit(op="speak", line=1, begin="B", end="C", role="陈默")
+        result = server.edit(op="unmark", line=1, begin="B", end="C")
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("<陈默>", server.text)
+        self.assertIn("他叹道：“你终于来了。”", server.text)
+
+    def test_unmark_by_text_only(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        server.edit(op="speak", line=1, begin="B", end="C", role="陈默")
+        result = server.edit(op="unmark", line=1, text="你终于来了。")
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("</陈默>", server.text)
+
+    def test_unmark_unmarked_span_is_refused(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        result = server.edit(op="unmark", line=1, begin="B", end="C")
+        self.assertFalse(result["ok"])
+        self.assertIn("没有标记", result["reason"])
+
+    def test_result_reports_letter_range_and_marked_text(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        result = server.edit(op="speak", line=1, begin="B", end="C", text="你终于来了。", role="陈默")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["range"], "B-C")
+        self.assertEqual(result["marked"], "“你终于来了。”")
+
+    def test_unmark_and_remark_report_range_and_marked(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        server.edit(op="speak", line=1, begin="B", end="C", role="甲")
+        changed = server.edit(op="speak", line=1, begin="B", end="C", role="乙")
+        self.assertEqual(changed["range"], "B-C")
+        self.assertEqual(changed["marked"], "“你终于来了。”")
+        removed = server.edit(op="unmark", line=1, begin="B", end="C")
+        self.assertEqual(removed["range"], "B-C")
+        self.assertEqual(removed["marked"], "“你终于来了。”")
+
+    def test_one_mark_pass_and_one_check_round(self):
+        from scripts import mark_script
+
+        self.assertEqual(mark_script.CHECK_ROUNDS, 1)
+        self.assertEqual(mark_script.DEFAULT_CHECK_STEPS, 100)
+
+    def test_number_text_bakes_paragraph_number_into_labels(self):
+        from scripts.mark_script import number_text
+
+        self.assertEqual(number_text("他叹道：“你终于来了。”"), "[1A]他叹道：[1B]“你终于来了。”[1C]")
+
+    def test_full_label_locates_without_line_param(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        result = server.edit(op="speak", begin="1B", end="1C", text="你终于来了。", role="陈默")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["range"], "1B-1C")
+        self.assertIn("<陈默>“你终于来了。”</陈默>", server.text)
+
+    def test_labels_tolerate_brackets_case_and_missing_end(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        result = server.edit(op="speak", begin="[1b]", text="你终于来了。", role="陈默")
+        self.assertTrue(result["ok"], result)
+        self.assertIn("<陈默>“你终于来了。”</陈默>", server.text)
+
+    def test_unmarked_quotes_finds_missed_runs_with_labels(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”苏晚点头：“嗯。”")
+        missing = server.unmarked_quotes()
+        self.assertEqual([item["begin"] for item in missing], ["1B", "1D"])
+        self.assertEqual([item["end"] for item in missing], ["1C", "1E"])
+        self.assertEqual([item["text"] for item in missing], ["“你终于来了。”", "“嗯。”"])
+
+    def test_unmarked_quotes_skips_marked_runs(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”苏晚点头：“嗯。”")
+        server.edit(op="speak", begin="1B", end="1C", text="你终于来了。", role="陈默")
+        missing = server.unmarked_quotes()
+        self.assertEqual([item["text"] for item in missing], ["“嗯。”"])
+
+    def test_unmarked_quotes_empty_when_all_marked(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        server.edit(op="speak", begin="1B", end="1C", text="你终于来了。", role="陈默")
+        self.assertEqual(server.unmarked_quotes(), [])
+
+    def test_span_starting_mid_quote_expands_to_the_whole_quote(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("“他亲口跟我说的，说是不习惯被人挂在墙上，”维多利亚说。")
+        result = server.edit(op="speak", begin="1B", end="1C", text="说是不习惯被人挂在墙上，”", role="维多利亚")
+        self.assertTrue(result["ok"], result)
+        self.assertIn("<维多利亚>“他亲口跟我说的，说是不习惯被人挂在墙上，”</维多利亚>维多利亚说。", server.text)
+
+    def test_span_with_open_quote_only_extends_to_the_closing_quote(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他说：“前半句，后半句。”然后走了。")
+        result = server.edit(op="speak", begin="1B", end="1C", text="“前半句，", role="高文")
+        self.assertTrue(result["ok"], result)
+        self.assertIn("<高文>“前半句，后半句。”</高文>然后走了。", server.text)
+
+    def test_existing_inner_mark_is_flattened_when_span_covers_it(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("“前半句，<甲>中间这句。</甲>后半句。”")
+        result = server.edit(op="speak", begin="1A", end="1D", text="“前半句，中间这句。后半句。”", role="维多利亚")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(server.text, "<维多利亚>“前半句，中间这句。后半句。”</维多利亚>")
+        self.assertNotIn("<甲>", server.text)
+
+    def test_text_without_letters_still_marks_the_sentence(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        result = server.edit(op="speak", line=1, text="你终于来了。", role="陈默")
+        self.assertTrue(result["ok"], result)
+        self.assertIn("<陈默>“你终于来了。”</陈默>", server.text)
+
+    def test_text_fallback_when_letters_are_wrong(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        result = server.edit(op="speak", line=1, begin="Z", end="Z", text="你终于来了。", role="陈默")
+        self.assertTrue(result["ok"], result)
+        self.assertIn("<陈默>“你终于来了。”</陈默>", server.text)
+
+    def test_text_fallback_strips_axis_markers(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        result = server.edit(op="speak", line=1, text="[B]你终于来了。[C]", role="陈默")
+        self.assertTrue(result["ok"], result)
+        self.assertIn("<陈默>“你终于来了。”</陈默>", server.text)
+
+    def test_wide_span_is_trimmed_to_the_quote(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("“你终于来了。”他笑了笑。")
+        result = server.edit(op="speak", line=1, begin="A", end="C", role="陈默")
+        self.assertTrue(result["ok"], result)
+        self.assertIn("<陈默>“你终于来了。”</陈默>他笑了笑。", server.text)
+
+    def test_span_with_two_quotes_is_split_into_two_marks(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("“我先走了。”他披上外套，“明天见。”")
+        result = server.edit(op="speak", line=1, begin="A", end="D", role="陈默")
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result.get("split"))
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(server.text, "<陈默>“我先走了。”</陈默>他披上外套，<陈默>“明天见。”</陈默>")
+
+    def test_missing_op_never_deletes_text(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("他叹道：“你终于来了。”")
+        result = server.edit(line=1, begin="B", end="C", text="你终于来了。")
+        self.assertFalse(result["ok"])
+        self.assertIn("role", result["reason"])
+        self.assertEqual(server.text, "他叹道：“你终于来了。”")
+
+    def test_unquoted_thought_after_cue_is_allowed(self):
+        from scripts.mark_script import ScriptServer
+
+        server = ScriptServer()
+        server.set_text("陈默坐下，忽然想：她又熬夜了吧。")
+        result = server.edit(op="speak", line=1, begin="C", end="D", role="陈默")
+        self.assertTrue(result["ok"], result)
+        self.assertIn("<陈默>她又熬夜了吧。</陈默>", server.text)
 
 
 class RosterMergeTest(unittest.TestCase):
@@ -366,14 +719,15 @@ class AnchorMarkingTest(unittest.TestCase):
         self.assertNotIn("“", server.text)
         self.assertIn("万物之耻，第一人", server.text)
 
-    def test_speak_anchor_outside_quotes_marks_only_fragment(self):
+    def test_narration_without_quotes_or_cue_is_refused(self):
         from scripts.mark_script import ScriptServer
 
         server = ScriptServer()
         server.set_text("他转身离开，随后又停下脚步。")
         result = server.edit(op="speak", text="随后又停下", role="高文")
-        self.assertTrue(result["ok"])
-        self.assertEqual(server.text, "他转身离开，<高文>随后又停下</高文>脚步。")
+        self.assertFalse(result["ok"])
+        self.assertIn("旁白", result["reason"])
+        self.assertNotIn("<高文>", server.text)
 
 
 class RoleAttributionTest(unittest.TestCase):

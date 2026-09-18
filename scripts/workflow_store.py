@@ -21,8 +21,9 @@ from pathlib import Path
 APP_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_ROOT))
 
-PROMPT_KEYS = ("local_system", "step_mark", "roster_system")
-PARAM_RANGES = {"batch": (1, 200), "max_steps": (1, 2000)}
+PROMPT_KEYS = ("local_system", "step_mark", "roster_system", "check_mark")
+FEW_SHOT_KEYS = ("text", "calls", "results")
+PARAM_RANGES = {"batch": (1, 200), "max_steps": (1, 2000), "check_steps": (0, 500)}
 
 # The pipeline as a structure: EVERY stage reads and writes the same product -- the text.
 # A chapter is not an object, only a tag in the text; speech/events are tags too.
@@ -103,16 +104,27 @@ def defaults() -> dict:
     """Built-in values, straight from the code (mark_script module constants)."""
     from scripts import mark_script
 
+    cases = []
+    for case in getattr(mark_script, "FEW_SHOT_CASES", []):
+        if isinstance(case, dict):
+            cases.append(
+                {"text": case.get("text", ""), "calls": list(case.get("calls") or []), "results": list(case.get("results") or [])}
+            )
+        elif isinstance(case, (list, tuple)) and len(case) == 3:
+            cases.append({"text": case[0], "calls": list(case[1]), "results": list(case[2])})
     return {
+        "few_shot": cases,
         "params": {
             "batch": 5,  # mark_script `--batch`: first N chapters fed in full, then the summary rolls
             "max_steps": 200,
+            "check_steps": mark_script.DEFAULT_CHECK_STEPS,
             "think": mark_script.THINK,
         },
         "prompts": {
             "local_system": mark_script.LOCAL_SYSTEM,
             "step_mark": mark_script.STEP_MARK,
             "roster_system": mark_script.ROSTER_SYSTEM,
+            "check_mark": mark_script.CHECK_MARK,
         },
     }
 
@@ -158,6 +170,7 @@ def merged(book: str, base: Path | None = None) -> dict:
         "book": book,
         "params": params,
         "prompts": prompts,
+        "few_shot": overlay.get("few_shot") or builtin["few_shot"],
         "pipeline": PIPELINE,
         "defaults": builtin,
         "overlay": overlay,
@@ -165,6 +178,7 @@ def merged(book: str, base: Path | None = None) -> dict:
         "updated_by": overlay.get("updated_by"),
         "changed_params": sorted((overlay.get("params") or {}).keys()),
         "changed_prompts": sorted((overlay.get("prompts") or {}).keys()),
+        "few_shot_overridden": "few_shot" in overlay,
         "paths": {"overlay": str(overlay_path(book, base)), "changelog": str(changelog_path(book, base))},
         "changelog": changelog(book, base=base),
     }
@@ -182,6 +196,22 @@ def _clean_params(params: dict) -> dict:
             raise ValueError(f"param {key} 需要整数")
         low, high = PARAM_RANGES[key]
         clean[key] = max(low, min(high, value))
+    return clean
+
+
+def _clean_few_shot(cases) -> list[dict]:
+    if not isinstance(cases, list) or not cases:
+        raise ValueError("few_shot 需要非空的示例列表")
+    clean: list[dict] = []
+    for case in cases:
+        if not isinstance(case, dict):
+            raise ValueError("few_shot 每项必须是 {text, calls, results}")
+        text = str(case.get("text") or "").strip()
+        calls = [str(item) for item in case.get("calls") or [] if str(item).strip()]
+        results = [str(item) for item in case.get("results") or []]
+        if not text or not calls:
+            raise ValueError("few_shot 每项都要有 text 与 calls")
+        clean.append({"text": text, "calls": calls, "results": results})
     return clean
 
 
@@ -207,7 +237,8 @@ def save(book: str, payload: dict, actor: str = "web", base: Path | None = None)
     """Merge a partial update into the overlay and log what changed."""
     params = _clean_params(payload.get("params") or {})
     prompts = _clean_prompts(payload.get("prompts") or {})
-    if not params and not prompts:
+    few_shot = _clean_few_shot(payload["few_shot"]) if "few_shot" in payload else None
+    if not params and not prompts and few_shot is None:
         raise ValueError("没有可保存的改动")
     current = load_overlay(book, base)
     overlay = {
@@ -218,8 +249,13 @@ def save(book: str, payload: dict, actor: str = "web", base: Path | None = None)
     }
     path = overlay_path(book, base)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if few_shot is not None:
+        overlay["few_shot"] = few_shot
     path.write_text(json.dumps(overlay, ensure_ascii=False, indent=2), encoding="utf-8")
-    _append(book, {"ts": time.time(), "actor": actor, "params": params, "prompts": prompts}, base)
+    entry = {"ts": time.time(), "actor": actor, "params": params, "prompts": prompts}
+    if few_shot is not None:
+        entry["few_shot"] = len(few_shot)
+    _append(book, entry, base)
     return merged(book, base)
 
 

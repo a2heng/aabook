@@ -97,6 +97,11 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d1219;border
   </div>
 
   <div class="panel">
+    <h2>Few-shot 示例（模型实际看到的示例；JSON：text / calls / results）<span class="overridden" id="fsstate"></span></h2>
+    <div class="field"><textarea id="fewshot" style="min-height:280px"></textarea></div>
+  </div>
+
+  <div class="panel">
     <h2>改动记录（双向可见）<span class="overridden" id="where"></span></h2>
     <div class="log"><table id="logtable"><thead><tr><th>时间</th><th>来源</th><th>改动</th></tr></thead><tbody></tbody></table></div>
   </div>
@@ -135,6 +140,7 @@ function renderParams(st){
   const rows = [
     ['batch','batch（前 N 章喂全文）', defs.batch, 1],
     ['max_steps','max_steps（每章工具步数）', defs.max_steps, 1],
+    ['check_steps','check_steps（检查阶段工具步数，0=关闭）', defs.check_steps, 0],
   ];
   let html = rows.map(([key,label,val,min])=>`<div class="field"><label>${esc(label)} ${over[key]!==undefined?'<span class="overridden">已覆盖</span>':''}</label>
     <input type="number" data-param="${key}" min="${min}" value="${esc(st.params[key])}"></div>`).join('');
@@ -149,7 +155,7 @@ function renderParams(st){
 }
 function renderPrompts(st){
   const defs = st.defaults.prompts, over = st.overlay.prompts || {};
-  const labels = {local_system:'主提示词（LOCAL_SYSTEM）', step_mark:'任务提示词（STEP_MARK）', roster_system:'人物词典提示词（ROSTER_SYSTEM）'};
+  const labels = {local_system:'主提示词（LOCAL_SYSTEM）', step_mark:'任务提示词（STEP_MARK）', roster_system:'人物词典提示词（ROSTER_SYSTEM）', check_mark:'检查提示词（CHECK_MARK）'};
   $('prompts').innerHTML = Object.keys(labels).map(key=>{
     const value = over[key] !== undefined ? over[key] : defs[key];   // 预填当前生效文本，可直接改
     return `<div class="field"><label>${esc(labels[key])} ${over[key]!==undefined?'<span class="overridden">已覆盖（保存即持久化）</span>':''}</label>
@@ -157,11 +163,16 @@ function renderPrompts(st){
   }).join('');
   $('prompts').querySelectorAll('[data-prompt]').forEach(el=>el.addEventListener('input',()=>{dirty=true;}));
 }
+function renderFewShot(st){
+  $('fewshot').value = JSON.stringify(st.few_shot || [], null, 2);
+  $('fsstate').textContent = st.few_shot_overridden ? '已覆盖（保存即持久化）' : '';
+}
 function renderLog(st){
   const rows = (st.changelog||[]).map(e=>{
     const changed=[];
     Object.keys(e.params||{}).forEach(k=>changed.push(`param ${k}=${JSON.stringify(e.params[k])}`));
     Object.keys(e.prompts||{}).forEach(k=>changed.push(`prompt ${k}`));
+    if(e.few_shot!==undefined) changed.push(`few_shot ×${e.few_shot}`);
     if(e.cleared) changed.push('清除覆盖');
     return `<tr><td>${fmtTime(e.ts)}</td><td>${esc(e.actor||'')}</td><td>${esc(changed.join(' · '))}</td></tr>`;
   });
@@ -227,6 +238,7 @@ function render(st){
   renderFlow(st.pipeline);
   renderParams(st);
   renderPrompts(st);
+  renderFewShot(st);
   renderLog(st);
   const book = encodeURIComponent(st.book);
   $('live').href = "/live?book=" + book;
@@ -265,7 +277,10 @@ function collect(){
     const v=el.value.trim();
     if(v) prompts[el.getAttribute('data-prompt')]=v;   // empty = keep default
   });
-  return {params, prompts};
+  let fewShot = null;
+  try{ fewShot = JSON.parse($('fewshot').value); }
+  catch(err){ toast('few-shot JSON 解析失败：'+err.message, false); throw err; }
+  return {params, prompts, few_shot: fewShot};
 }
 async function loadBooks(){
   try{
@@ -314,6 +329,7 @@ $('reset').addEventListener('click', reset);
 $('reload').addEventListener('click', ()=>{dirty=false; loadState();});
 $('run').addEventListener('click', runChapter);
 $('exch').addEventListener('change', ()=>setExampleChapter($('exch').value));
+$('fewshot').addEventListener('input', ()=>{dirty=true;});
 $('exlabel').textContent = pad(exampleChapter);
 window.addEventListener('beforeunload',(e)=>{if(dirty){e.preventDefault();e.returnValue='';}});
 loadBooks().then(loadState);

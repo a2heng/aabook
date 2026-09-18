@@ -11,3 +11,4 @@ benchmarks/
 *.log
 opencode.json
 assets
+pyrightconfig.json

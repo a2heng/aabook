@@ -23,8 +23,8 @@ import os
 import sys
 from pathlib import Path
 
-import numpy as np
-import soundfile as sf
+import numpy as np  # type: ignore
+import soundfile as sf  # type: ignore
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_ROOT))

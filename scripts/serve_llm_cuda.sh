@@ -14,7 +14,7 @@
 #   AUDIOBOOK_LLM_KV         q8_0|q4_0|f16 ... default q8_0
 #   AUDIOBOOK_LLM_FA         flash attention on|off|auto (default on; required for quantized KV)
 #   AUDIOBOOK_LLM_CACHE_REUSE  cross-chapter KV-shifting reuse chunk (default 256; 0 disables)
-#   AUDIOBOOK_LLM_THINK_BUDGET  default 512 (-1 unlimited, 0 off)
+#   AUDIOBOOK_LLM_THINK_BUDGET  default 2048 (-1 unlimited, 0 off)
 #   AUDIOBOOK_LLM_SPEC       default "draft-mtp" (empty disables)
 #   AUDIOBOOK_LLM_SPEC_DRAFT_N_MAX  default 4 (Qwen3.5 MTP measured best; gemma-4 MTP head also 4)
 #   AUDIOBOOK_LLM_DRAFT      extra draft gguf. Auto: gemma-4 MTP head. For DFlash/DSpark set
@@ -36,7 +36,7 @@ CTX="${AUDIOBOOK_LLM_CTX:-32768}"
 KV="${AUDIOBOOK_LLM_KV:-q8_0}"
 FA="${AUDIOBOOK_LLM_FA:-on}"
 CACHE_REUSE="${AUDIOBOOK_LLM_CACHE_REUSE:-256}"
-BUDGET="${AUDIOBOOK_LLM_THINK_BUDGET:-512}"
+BUDGET="${AUDIOBOOK_LLM_THINK_BUDGET:-2048}"
 SPEC="${AUDIOBOOK_LLM_SPEC-draft-mtp}"
 
 DRAFT="${AUDIOBOOK_LLM_DRAFT-}"
