@@ -11,6 +11,29 @@ ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "big5", "utf-16")
 _BLANK_LINES_RE = re.compile(r"\n{3,}")
 _TRAILING_WS_RE = re.compile(r"[ \t]+\n")
 _PAGE_MARK_RE = re.compile(r"^\s*[-—=]{1,}\s*(第\s*\d+\s*页|Page\s*\d+)\s*[-—=]{1,}\s*$", re.IGNORECASE)
+# First cleaning step: drop square-bracket *symbols* only, keeping the inner text
+# (the brackets are never read aloud; their content may still matter). This also
+# keeps [笑]-style inline tags from colliding with the vocal-event tags the markup
+# stage writes.
+_BRACKET_CHARS = str.maketrans("", "", "[]")
+
+# Site watermarks / ads / decorative rules in raw TXT dumps. Rule-based (no LLM),
+# so raw input files can be used directly.
+_SITE_LINE_RE = re.compile(
+    r"(声明[：:]?\s*本书|仅供.{0,6}试读|版权归原作者|更多精校|书荒部落|noveless|txt小说天堂|"
+    r"https?://|www\.|请访问|下载于)",
+    re.IGNORECASE,
+)
+_DECOR_LINE_RE = re.compile(r"^\s*[-—=*·]{4,}\s*$")
+# A preface that is only book metadata (title/author/blurb) is not chapter content.
+_META_PREFACE_RE = re.compile(r"(作者[：:]|内容简介|声\s*明[：:]|本书由|ISBN|出版)")
+
+
+def strip_site_boilerplate(text: str) -> str:
+    """Drop obvious site/watermark lines (ads, URLs, decorative rules) from raw input."""
+    lines = [line for line in text.split("\n") if not (_SITE_LINE_RE.search(line) or _DECOR_LINE_RE.match(line))]
+    return "\n".join(lines)
+
 
 CHAPTER_PATTERNS = (
     re.compile(r"^\s*(第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节回卷篇部])\s*(.*)$"),
@@ -66,6 +89,8 @@ def repair_quotes(text: str) -> str:
 
 
 def normalize_text(text: str) -> str:
+    text = strip_site_boilerplate(text)
+    text = text.translate(_BRACKET_CHARS)
     text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\u3000", " ")
     lines = []
     for line in text.split("\n"):
@@ -95,7 +120,7 @@ def split_chapters(text: str) -> list[Chapter]:
 
     chapters: list[Chapter] = []
     preface = "\n".join(lines[: starts[0][0]]).strip()
-    if preface:
+    if preface and not _META_PREFACE_RE.search(preface):
         chapters.append(Chapter(chapter_id=1, title="前言", text=preface))
     for order, (start, title) in enumerate(starts):
         end = starts[order + 1][0] if order + 1 < len(starts) else len(lines)

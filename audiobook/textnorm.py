@@ -1,6 +1,6 @@
 """Lightweight TTS-text normalisation before synthesis.
 
-AuK handles segments poorly when they end mid-clause, use long dash runs or
+The renderer handles segments poorly when they end mid-clause, so use long dash runs or
 repeated ellipses. We normalise those deterministically (the ``raw_text`` is left
 untouched for audit).
 """
@@ -32,8 +32,9 @@ def normalize_tts(text: str | None) -> str:
     text = (text or "").strip()
     if not text:
         return ""
-    text = text.replace("……", "…").replace("——", "，").replace("—", "，")
-    text = re.sub(r"…{2,}", "…", text)
+    text = text.replace("——", "，").replace("—", "，")
+    text = re.sub(r"…+|\.{2,}", "。", text)  # ellipsis reads as a full stop, not a weak pause
+    text = re.sub(r"。{2,}", "。", text)
     text = re.sub(r"[，、；：]{2,}", "，", text)
     text = re.sub(r"([。！？…])[，、；：]+", r"\1", text)
     text = re.sub(r"[，、；：]+([。！？…])", r"\1", text)
@@ -46,3 +47,19 @@ def normalize_tts(text: str | None) -> str:
 def clean_for_llm(text: str | None) -> str:
     """Persistent pre-LLM cleaning: drop non-speech glyphs, then normalise punctuation."""
     return normalize_tts(filter_tts_chars(text))
+
+
+_UNWANTED_RE = re.compile(r"·{2,}|—{2,}|-{2,}|＊+|#{2,}")
+_ELLIPSIS_RE = re.compile(r"…+|\.{2,}")
+_WS_RE = re.compile(r"[\s\u3000]+")
+
+
+def one_paragraph(text: str | None) -> str:
+    """Code-side preprocessing done ONCE, before the LLM: collapse the chapter to a
+    single paragraph, turn ellipsis into a full stop, dashes / decorative repeats into
+    a comma, and drop unwanted whitespace. The model never has to do any of this."""
+    text = _ELLIPSIS_RE.sub("。", text or "")
+    text = _UNWANTED_RE.sub("，", text)
+    text = re.sub(r"。{2,}", "。", text)
+    text = re.sub(r"，{2,}", "，", text)
+    return _WS_RE.sub("", text)

@@ -6,7 +6,7 @@ One resumable entry point over every stage; each stage can be run alone:
     prepare   clean + split the source txt          -> outputs/<book>/{source,clean}.txt + chapters/
     script    one-edit-at-a-time stage-play marking  -> outputs/<book>/script/chNNN.marked.txt (+roles.json)
     convert   marked text -> script.csv (no LLM)     -> outputs/<book>/script.csv
-    render    AuK zero-shot TTS per row + assembly   -> outputs/<book>/render/{rows,chapters,book.wav}
+    render    Breeze TTS 2 per row + assembly        -> outputs/<book>/render/{rows,chapters,book.wav}
 
 The LLM stages need the local llama.cpp server; this script starts it if it is not
 already up and stops it before rendering (rendering needs the whole GPU).
@@ -18,6 +18,7 @@ already up and stops it before rendering (rendering needs the whole GPU).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import subprocess
@@ -43,20 +44,31 @@ def parse_args() -> argparse.Namespace:
         help=f"comma list of {STAGES}",
     )
     parser.add_argument("--llm-base-url", default=os.environ.get("AUDIOBOOK_LLM_BASE_URL", "http://127.0.0.1:8080/v1"))
-    parser.add_argument("--llm-model", default=os.environ.get("AUDIOBOOK_LLM_MODEL", "spark-4b"))
-    parser.add_argument("--llm-profile", default=os.environ.get("AUDIOBOOK_LLM_PROFILE", "spark-4b"))
-    parser.add_argument("--llm-gguf", default="ckpts/llm/Spark-X2.5-4B-Q8_0.gguf")
+    parser.add_argument("--llm-model", default=os.environ.get("AUDIOBOOK_LLM_MODEL", "qwen3.5-9b"))
+    parser.add_argument("--llm-profile", default=os.environ.get("AUDIOBOOK_LLM_PROFILE", "qwen3.5-9b"))
+    parser.add_argument("--llm-gguf", default="ckpts/llm/Qwen3.5-9B-UD-Q4_K_XL.gguf")
     parser.add_argument("--no-serve-llm", action="store_true", help="assume the LLM server is already running")
     parser.add_argument("--keep-llm", action="store_true", help="do not stop the LLM before rendering")
-    parser.add_argument("--variant", choices=["flash", "base"], default="flash")
-    parser.add_argument("--duration-rate", type=float, default=0.8)
-    parser.add_argument("--max-seconds", type=float, default=20.0)
+    parser.add_argument("--voices", default=None, help="voicebank.json (role -> reference wav)")
+    parser.add_argument("--voice-meta", default=None, help="voicebank_meta.json (role -> ref_text)")
+    parser.add_argument("--breeze-url", default=None, help="breeze-server base URL (default 127.0.0.1:8137)")
+    parser.add_argument("--breeze-model", default=None, help="Breeze GGUF path")
+    parser.add_argument("--breeze-cfg", type=float, default=1.0, help="Breeze cfg_scale (1.0 disables guidance)")
+    parser.add_argument("--breeze-direction", action="store_true", help="send per-row style/emotion as voice direction")
     parser.add_argument("--target-lufs", type=float, default=-16.0)
     parser.add_argument("--start", type=int, default=0, help="first chapter id (script stage)")
     parser.add_argument("--end", type=int, default=0, help="last chapter id (script stage)")
-    parser.add_argument("--limit", type=int, default=0, help="only N chapters (script stage)")
+    parser.add_argument("--limit", type=int, default=20, help="only N chapters (global+script); 0 = whole book")
     parser.add_argument("--force", action="store_true", help="rebuild completed chapters")
     return parser.parse_args()
+
+
+def _stage_status(out: Path, stage: str, status: str, note: str = "") -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "pipeline.json"
+    data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {"stages": {}}
+    data.setdefault("stages", {})[stage] = {"status": status, "note": note, "ts": time.time()}
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _run(cmd: list[str], env: dict | None = None, log_path: Path | None = None) -> None:
@@ -113,9 +125,8 @@ def _start_llm(args: argparse.Namespace, log_path: Path) -> None:
     env = {
         **os.environ,
         "AUDIOBOOK_LLM_GGUF": args.llm_gguf,
-        "AUDIOBOOK_LLM_SPEC": "",
         "AUDIOBOOK_LLM_NGL": "99",
-        "AUDIOBOOK_LLM_CTX": os.environ.get("AUDIOBOOK_LLM_CTX", "16384"),
+        "AUDIOBOOK_LLM_CTX": os.environ.get("AUDIOBOOK_LLM_CTX", "32768"),
         "NO_PROXY": "*",
     }
     with log_path.open("w") as log:
@@ -161,12 +172,15 @@ def main() -> None:
     llm_env = _llm_env(args)
 
     if "prepare" in stages:
+        _stage_status(out, "prepare", "run")
         _run(
             [PY, "scripts/build_book.py", args.input, "--out", str(out)],
             log_path=logs_dir / "prepare.log",
         )
+        _stage_status(out, "prepare", "done")
 
     if "script" in stages:
+        _stage_status(out, "script", "run")
         chapter_ids = sorted(int(path.stem[2:]) for path in (out / "chapters").glob("ch*.txt"))
         if not chapter_ids:
             raise SystemExit(f"no chapters under {out / 'chapters'}; run the prepare stage first")
@@ -183,14 +197,16 @@ def main() -> None:
                 str(max(0, end - start + 1)),
                 "--book",
                 args.book,
-                "--mode",
-                "seq",
+                "--batch",
+                "10",
             ],
             env={"AUDIOBOOK_BOOK": args.book, **llm_env},
             log_path=logs_dir / "script.log",
         )
+        _stage_status(out, "script", "done")
 
     if "convert" in stages:
+        _stage_status(out, "convert", "run")
         _run(
             [
                 PY,
@@ -204,8 +220,10 @@ def main() -> None:
             ],
             log_path=logs_dir / "convert.log",
         )
+        _stage_status(out, "convert", "done")
 
     if "render" in stages:
+        _stage_status(out, "render", "run")
         if set(stages) & LLM_STAGES and not args.keep_llm:
             _stop_llm()
         script = out / "script.csv"
@@ -221,19 +239,20 @@ def main() -> None:
                 str(out / "render"),
                 "--cast",
                 str(out / "cast.json"),
-                "--variant",
-                args.variant,
-                "--duration-rate",
-                str(args.duration_rate),
-                "--max-seconds",
-                str(args.max_seconds),
                 "--target-lufs",
                 str(args.target_lufs),
+                *(["--voices", args.voices] if args.voices else []),
+                *(["--voice-meta", args.voice_meta] if args.voice_meta else []),
+                *(["--breeze-url", args.breeze_url] if args.breeze_url else []),
+                *(["--breeze-model", args.breeze_model] if args.breeze_model else []),
+                *(["--breeze-cfg", str(args.breeze_cfg)] if args.breeze_cfg != 1.0 else []),
+                *(["--breeze-direction"] if args.breeze_direction else []),
                 *(["--start-chapter", str(args.start)] if args.start else []),
                 *(["--end-chapter", str(args.end)] if args.end else []),
             ],
             log_path=logs_dir / "render.log",
         )
+        _stage_status(out, "render", "done")
 
     print("\n[done] stage(s): " + ", ".join(stages), flush=True)
 

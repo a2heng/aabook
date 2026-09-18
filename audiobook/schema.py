@@ -4,51 +4,11 @@ from __future__ import annotations
 
 import csv
 import json
-import re
 import sqlite3
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
-KINDS = ("narration", "dialogue", "monologue")
-
-EMOTIONS = ("happy", "angry", "sad", "fearful", "surprised", "disgusted", "calm", "excited")
-
-EMOTION_MULTIPLIERS = {
-    "sad": 1.22,
-    "fearful": 1.16,
-    "happy": 1.06,
-    "angry": 1.06,
-    "surprised": 1.06,
-    "disgusted": 1.06,
-    "calm": 1.06,
-    "excited": 1.06,
-}
-
 NARRATOR_ID = "narrator"
-
-_ALIAS_SPLIT_RE = re.compile(r"[\s,，、/|]+")
-_TITLE_RE = re.compile(
-    r"(骑士|侯爵|伯爵|子爵|男爵|将军|大人|先生|女士|小姐|夫人|陛下|国王|女王|法师|术士|"
-    r"侍女|女仆|先祖|老祖宗|殿下|阁下|队长|团长|会长|长老|祭司|神父|修女|少爷|老爷|太太|"
-    r"公子|姑娘|少女|少年|大汉|青年|女孩|男孩|大公|公爵|亲王|王子|公主)"
-)
-_CORE_SEP_RE = re.compile(r"[·・.\-_—\s]+")
-
-
-def core_name(name: str) -> str:
-    """Strip titles and separators to compare Chinese name variants.
-
-    e.g. ``拜伦·柯克`` -> ``拜伦柯克``, ``拜伦骑士`` -> ``拜伦``.
-    """
-    core = _TITLE_RE.sub("", name)
-    core = _CORE_SEP_RE.sub("", core)
-    return core.strip()
-
-
-def slugify(name: str) -> str:
-    """Stable ASCII-ish id for a role."""
-    cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", "_", name.strip().lower()).strip("_")
-    return cleaned or "role"
 
 
 @dataclass
@@ -87,18 +47,13 @@ class Cast:
         return existing
 
     def resolve(self, label: str) -> Role | None:
+        """Exact name / role_id / alias match only; canonicalization is the LLM's job."""
         needle = label.strip()
         if not needle:
             return None
         for role in self.roles.values():
             if role.matches(needle):
                 return role
-        core = core_name(needle)
-        if len(core) >= 2:
-            for role in self.roles.values():
-                role_core = core_name(role.name)
-                if len(role_core) >= 2 and (core in role_core or role_core in core):
-                    return role
         return None
 
     def narrator(self) -> Role:
@@ -126,101 +81,6 @@ class Cast:
     def load(cls, path: str | Path) -> Cast:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
-    def consolidate(self) -> None:
-        """Merge roles whose names/aliases overlap exactly (case-insensitive).
-
-        Handles duplicates that ``merge_candidates`` misses when two candidate
-        entries only share an alias indirectly (e.g. "高文" vs "高文·塞西尔").
-        Semantic merges still need the LLM pass in :mod:`audiobook.cast`.
-        """
-        parent = {role_id: role_id for role_id in self.roles}
-
-        def find(node: str) -> str:
-            while parent[node] != node:
-                parent[node] = parent[parent[node]]
-                node = parent[node]
-            return node
-
-        def union(left: str, right: str) -> None:
-            root_left, root_right = find(left), find(right)
-            if root_left != root_right:
-                parent[root_right] = root_left
-
-        owner: dict[str, str] = {}
-        for role_id, role in self.roles.items():
-            for token in {role_id, role.name, *role.aliases}:
-                key = token.strip().lower()
-                if not key:
-                    continue
-                if key in owner:
-                    union(owner[key], role_id)
-                else:
-                    owner[key] = role_id
-
-        ids = list(self.roles)
-        cores = {role_id: core_name(self.roles[role_id].name) for role_id in ids}
-        for i, left in enumerate(ids):
-            for right in ids[i + 1 :]:
-                core_left, core_right = cores[left], cores[right]
-                if len(core_left) >= 2 and len(core_right) >= 2:
-                    if core_left in core_right or core_right in core_left:
-                        union(left, right)
-
-        grouped: dict[str, list[Role]] = {}
-        for role_id, role in self.roles.items():
-            grouped.setdefault(find(role_id), []).append(role)
-
-        merged: dict[str, Role] = {}
-        for members in grouped.values():
-            canonical = max(members, key=lambda role: (len(role.name), len(role.aliases), len(role.exemplars)))
-            for role in members:
-                if role is canonical:
-                    continue
-                for alias in [role.name, *role.aliases]:
-                    if alias and alias != canonical.name and alias not in canonical.aliases:
-                        canonical.aliases.append(alias)
-                for sample in role.exemplars:
-                    if sample not in canonical.exemplars:
-                        canonical.exemplars.append(sample)
-                if not canonical.description and role.description:
-                    canonical.description = role.description
-            canonical.aliases = [alias for alias in sorted(canonical.aliases) if alias and alias != canonical.name]
-            merged[canonical.role_id] = canonical
-        self.roles = merged
-
-    def merge_candidates(self, candidates: list[dict]) -> None:
-        """Merge LLM candidate roles, reconciling aliases into one role each."""
-        for candidate in candidates:
-            name = (candidate.get("name") or "").strip()
-            if not name:
-                continue
-            aliases = [alias for alias in _as_list(candidate.get("aliases")) if alias and alias != name]
-            role = None
-            for existing in self.roles.values():
-                if existing.matches(name) or any(existing.matches(alias) for alias in aliases):
-                    role = existing
-                    break
-            if role is None:
-                is_narrator = bool(candidate.get("is_narrator")) or name in ("旁白", "叙述", "旁白君")
-                role_id = NARRATOR_ID if is_narrator else slugify(name)
-                role = Role(role_id=role_id, name=name, kind="narrator" if is_narrator else "character")
-            role.aliases = sorted({alias for alias in [*role.aliases, *aliases] if alias != role.name})
-            if not role.description:
-                role.description = (candidate.get("description") or "").strip()
-            for sample in _as_list(candidate.get("example_utterances")):
-                sample = sample.strip()
-                if sample and sample not in role.exemplars:
-                    role.exemplars.append(sample)
-            self.add(role)
-
-
-def _as_list(value) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [part for part in _ALIAS_SPLIT_RE.split(value) if part]
-    return [str(item) for item in value]
-
 
 @dataclass
 class ScriptRow:
@@ -235,7 +95,6 @@ class ScriptRow:
     tts_text: str = ""
     punct_edited: bool = False
     break_level: str = ""
-    auk_task: str = "zero_shot_tts"
     voice_ref: str = ""
     style_desc: str = ""
     emotion: str = ""
@@ -246,7 +105,6 @@ class ScriptRow:
     pitch_semitones: float = 0.0
     target_duration_s: float = 0.0
     duration_source: str = "est"
-    pe_instruction: str = ""
     seed: int = -1
     nfe: int = 0
     cfg: float = 0.0

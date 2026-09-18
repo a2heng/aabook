@@ -5,6 +5,8 @@ __pycache__/
 ckpts/
 assets/voice-reference/
 outputs/
+build/
+benchmarks/
 .cache/
 *.log
 opencode.json

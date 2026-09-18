@@ -1,22 +1,22 @@
-"""Canonicalize role ids/names across script rows.
+"""Re-group script rows whose speaker was split across role ids.
 
-Cast consolidation is not perfect, so one character can end up split across
-several ``role_id`` values (e.g. ``大英雄高文·塞西尔`` vs ``高文·塞西尔``). This
-groups rows by cast resolution (exact/alias/fuzzy) and by core-name containment,
-then rewrites them to a single canonical role so statistics and voices stay
-consistent. Safe to run on any ``script.csv``, including older ones.
+Role ids are produced by exact cast resolution downstream, but older or hand-made
+``script.csv`` files can still hold several ids for one character. This maps them
+onto the cast role they exactly resolve to, so statistics and voices stay
+consistent. No fuzzy/regex name guessing: canonical names come from the LLM
+dictionary or the cast.
 """
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter
 
-from .schema import Cast, ScriptRow, core_name
+from .schema import Cast, ScriptRow
 
 
 def canonicalize_rows(rows: list[ScriptRow], cast: Cast | None = None) -> dict[str, str]:
     """Merge split roles in place; return ``{old_role_id: canonical_role_id}``."""
-    if not rows:
+    if not rows or cast is None:
         return {}
 
     names: dict[str, str] = {}
@@ -26,49 +26,22 @@ def canonicalize_rows(rows: list[ScriptRow], cast: Cast | None = None) -> dict[s
         names.setdefault(role_id, row.role_name or role_id)
         counts[role_id] += 1
 
-    parent = {role_id: role_id for role_id in names}
-
-    def find(node: str) -> str:
-        while parent[node] != node:
-            parent[node] = parent[parent[node]]
-            node = parent[node]
-        return node
-
-    def union(left: str, right: str) -> None:
-        root_left, root_right = find(left), find(right)
-        if root_left != root_right:
-            parent[root_right] = root_left
-
-    if cast is not None:
-        for role_id, name in list(names.items()):
-            role = cast.resolve(name)
-            if role is None:
-                continue
-            names.setdefault(role.role_id, role.name)
-            parent.setdefault(role.role_id, role.role_id)
-            union(role_id, role.role_id)
-
-    cores = {role_id: core_name(name) for role_id, name in names.items()}
-    ids = list(names)
-    for index, left in enumerate(ids):
-        for right in ids[index + 1 :]:
-            core_left, core_right = cores[left], cores[right]
-            if len(core_left) >= 2 and len(core_right) >= 2:
-                if core_left in core_right or core_right in core_left:
-                    union(left, right)
-
-    groups: dict[str, list[str]] = defaultdict(list)
-    for role_id in ids:
-        groups[find(role_id)].append(role_id)
+    groups: dict[str, list[str]] = {}
+    for role_id, name in names.items():
+        role = cast.resolve(name) or cast.resolve(role_id)
+        groups.setdefault(role.role_id if role else role_id, []).append(role_id)
 
     mapping: dict[str, str] = {}
     canonical_names: dict[str, str] = {}
-    for members in groups.values():
+    for target, members in groups.items():
         canonical = max(members, key=lambda role_id: (counts.get(role_id, 0), len(names.get(role_id, ""))))
-        canonical_name = names.get(canonical, canonical)
-        canonical_names[canonical] = canonical_name
+        canonical_name = names[canonical]
+        resolved = cast.resolve(canonical_name)
+        if resolved is not None:
+            canonical_name = resolved.name
+        canonical_names[target] = canonical_name
         for role_id in members:
-            mapping[role_id] = canonical
+            mapping[role_id] = target
 
     for row in rows:
         role_id = row.role_id or "unknown"

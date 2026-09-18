@@ -266,3 +266,101 @@ LD_LIBRARY_PATH=.venv/lib/python3.12/site-packages/nvidia/cublas/lib:.venv/lib/p
   .venv/bin/python scripts/asr_check.py --script outputs/ep003/script.json \
   --rows outputs/ep003/audio/rows --out outputs/ep003/asr_check.json
 ```
+
+## Exp-13 换模型：Qwen3.5-9B（MTP）+ 投机解码速度对比
+
+- 动机：默认 LLM 从 gemma-4-E4B（QAT Q4 + 外置 MTP head）换到 Qwen3.5-9B（工具调用/中文更稳）；先量清楚 MTP / DFlash 的收益。
+- 权重：
+  - 主模型 `ckpts/llm/Qwen3.5-9B-UD-Q4_K_XL.gguf`（`unsloth/Qwen3.5-9B-MTP-GGUF`，Dynamic 2.0，**MTP head 内置在主 GGUF**）。
+  - DFlash 草稿 `ckpts/llm/Qwen3.5-9B-DFlash-bf16.gguf`（本地从 `z-lab/Qwen3.5-9B-DFlash` 官方权重转换）。
+  - **9B 没有 DSpark 草稿**（DSpark 仅见 0.8B/2B/35B-A3B；llama.cpp 已支持 `draft-dspark`，等社区出 9B 再说）。
+- 方法：同一 `scripts/serve_llm_cuda.sh`（ctx 32768、KV q8_0、fa on、ngl 99），只改 `AUDIOBOOK_LLM_SPEC*`；prompt = `outputs/lingzhi/chapters/ch011.txt`（≈3.3k tok），`temperature=0`、`max_tokens=400`、`ignore_eos`，每配置 3 轮取中位；接受率取服务端日志 `draft acceptance`。
+- 结果（RTX 4070 Ti SUPER 16GB，Q4_K_XL）：
+
+| 配置 | 生成 tok/s | 提升 | 接受率 | 平均接受长度 |
+| --- | ---: | ---: | ---: | ---: |
+| 无投机 | 88.4 | — | — | — |
+| MTP n=2 | 143.1 | +62% | 0.76 | 2.63 |
+| **MTP n=4** | **147.5** | **+67%** | 0.60 | 3.79 |
+| MTP n=6 | 130.9 | +48% | 0.46 | 4.53 |
+| DFlash n=15 | 147.2 | +66% | 0.22 | 5.05 |
+
+- 结论：
+  - **MTP n=4 最优**（n=6 贪多反而慢）；`serve_llm_cuda.sh` 默认 `--spec-draft-n-max 4`。
+  - DFlash 与 MTP n=4 打平，但多占 2.6GB 显存、prompt 阶段更慢（≈3.5k vs 5.2k tok/s），**不默认使用**；`AUDIOBOOK_LLM_SPEC=draft-dflash AUDIOBOOK_LLM_DRAFT=<gguf>` 可切换。
+  - reasoning/聊天类输出接受率更高：同一模型实测 greedy 编辑任务 ≈147 tok/s，思考型长文 ≈98 tok/s、mean len 5.6。
+- 接线：`audiobook/llm.py` 新增 profile `qwen3.5-9b`（官方 thinking 采样 temp 1.0 / top_p 0.95 / top_k 20 / presence_penalty 1.5）并设为默认；`mark_script.py` 的 thinking system token 改由 profile 提供（Gemma `<|think|>` / Qwen 无）；`run_book.py` 默认值、`AGENTS.md`、`docs/audiobook-workflow.md` 同步。
+- 复现：
+  ```
+  # DFlash 草稿转换（.venv 已有 torch/transformers）
+  .venv/bin/python /home/a2heng/下载/llama.cpp/convert_hf_to_gguf.py ckpts/llm/z-lab-Qwen3.5-9B-DFlash \
+    --target-model-dir ckpts/llm/Qwen3.5-9B-hf --outtype bf16 --outfile ckpts/llm/Qwen3.5-9B-DFlash-bf16.gguf
+  # 默认服务（Qwen3.5-9B + MTP n4）
+  bash scripts/serve_llm_cuda.sh
+  ```
+- 产物：`benchmarks/llm-spec/bench.json`（结果）、`/tmp/opencode/bench-spec/*.log`（各配置服务日志，临时）。
+
+## Exp-14 预处理修正：省略号统一变句号
+
+- 问题：`normalize_tts` 把 `……` 折叠成 `…`（弱停顿），`one_paragraph` 甚至变 `，`——TTS 停顿与断句都被带偏。
+- 改法：
+  - `textnorm.normalize_tts`（→ `clean_for_llm`，全流程）：`…+` / `\.{2,}` → `。`，并折叠重复句号。
+  - `textnorm.one_paragraph`（LLM 前）：省略号 → `。`（原来和破折号一起 → `，`）。
+  - 破折号 `——`/`—` 仍 → `，`（保持原约定）。
+- 注意：只对**新 prepare** 生效；已有 `outputs/<book>` 需重跑 `prepare`（章节文件会变，旧 marked 作废）。
+- 测试：`tests/test_textnorm.py` 新增省略号用例，10/10 通过；`ruff check/format` 干净。
+
+## Exp-15 预处理修正：方括号只去符号、保留文字
+
+- 问题：`cleaning.normalize_text` 原来用 `\[[^\[\]]*\]` 把 `[...]` **连内容整段删掉**（如 `[作者的话]` 直接消失）；本意只是去掉方括号符号。
+- 改法：`_BRACKET_RE.sub("", ...)` → `text.translate(_BRACKET_CHARS)`（只删 `[` `]`），括号内文字保留：`他笑了。[作者的话] 这是[笑]的测试。` → `他笑了。作者的话 这是笑的测试。`。
+- 副作用：源文本里的 `[笑]` 变成普通文字 `笑`（不再作为内联标记被吞）；vocal event 仍由标注阶段写 `[tag]`。
+- 测试：`tests/test_preprocessing.py` 更新方括号用例；顺带修好该文件里 2 个引用旧 API 字段 `spanned` 的历史失败（改为断言 `server.text`），全套 31 个测试通过。
+
+## Exp-16 提示词：标注阶段按「两类引号」处理（不再预去引号）
+
+- 背景：旧流程在送 LLM 前用 `strip_quotes` 把正文引号**全部预先去掉**，模型只能靠语义猜对话；注意性引号（强调/术语）与对话无法区分。
+- 改法：
+  - 模型看到**原始引号**；提示词明确两类：①人物对话 → `edit(op="speak", text="连引号的整段", role=规范名)`，必须完整、结合语境定主体；②引起读者注意的引号 → `edit(op="delete", text="连引号的词")`，只去引号留字。Few-shot 与工具描述同步；章末补漏消息也按两类提示。
+  - 模型漏掉的注意性引号由章末 `strip_quotes` 机械兜底（只删引号字符，字不动），并打印 `[clean] … 机械去除残留引号 N 处`。
+  - `delete` 的代码保证：含文字的目标只去引号/原样保留，只有纯标点才整段剔除；对话引号会被 `_looks_like_speech` 拒绝并提示改用 `speak`。
+- 验证（`outputs/_scratch_qmark`，lingzhi ch012，Qwen3.5-9B + MTP n4）：25 次工具调用、138.7s 完成；`speak` 连引号原文正常剥离，`delete` 的注意性引号（“负面环境”“东西”）文字保留；章末机械去残留引号 4 处，未标记引号 0 处；正文逐字对比无丢字。
+- 复现：
+  ```
+  AUDIOBOOK_LLM_BASE_URL=http://127.0.0.1:8080/v1 AUDIOBOOK_LLM_MODEL=qwen3.5-9b AUDIOBOOK_LLM_PROFILE=qwen3.5-9b \
+    .venv/bin/python scripts/mark_script.py 12 --count 1 --book _scratch_qmark --batch 1 --no-live
+  ```
+- 备注：该次 `maintain_roster` 偶发返回非 JSON（模型把提示词当答案复读），被捕获后跳过、不影响本章；后续可加一次重试或关 thinking。
+
+## Exp-17 工作流缺陷：已处理的引号被补漏重发（已修）
+
+- 现象（原始 I/O 监督页可见）：模型已 `delete` 掉的注意性引号，在章末补漏时又被当成"未处理"发回；模型判断没错、再次 `delete`，得到一长串 `not found` 空转。
+- 根因：补漏列表用**原始正文**的引号减去 `speak` 片段（`quoted_spans(raw_text)` - spoken）；`delete` 掉的引号不在 spoken 里，于是永远"待处理"。
+- 修法：
+  - 补漏改为只看**当前文本**仍残留的引号：`pending = unmarked_quotes(snapshot)`（`speak` 已消费的、`delete` 已去掉的都不再出现）；消息也强调"不在列表里的说明已处理，不要重试"。
+  - `_BARE_QUOTE_RE` 引号跨度上限 80 → 400 字（长台词此前对补漏不可见，会被章末机械去引号悄悄吞掉）。
+  - `speak` 拒绝纯标点引号（如 `“。”`），返回"请用 delete"，避免生成垃圾台词行。
+- 验证：重启后同一章 `delete “污泥”` 一次成功、无 `not found` 风暴；`tests/test_preprocessing.py` 新增 4 个用例（长引号可检出、tag 内引号不算、已处理引号不再 pending、speak 拒绝纯标点），全套 38 个测试通过。
+
+## Exp-18 引号指令收紧 + 空引号悬空说话人
+
+- 规则：`edit` 的 `text` 一律**不带引号**（提示词/工具说明/few-shot/补漏消息统一措辞，不再写"可带可不带"）：
+  - speak：`text` 给不带引号的对话原文，两侧引号由 MCP 自动识别清除（代码本就兼容带/不带，指令只保留一种）。
+  - delete：`text` 给不带引号的词/短语，只去两边引号留字。
+  - 空引号 `“”`（或只剩标点）：`text` 给前面悬空的「某某说道：」，代码把「说话人+冒号+空引号」一起删；纯标点引号同样处理。
+- 代码：`_delete` 新增 `_empty_quote_pair`（目标内或紧随其后的空/纯标点引号对），命中后缩小到该引号对并吞掉前置归属；非空对话引号仍先被 `_looks_like_speech` 拦截并提示改用 speak。
+- 测试：`DeleteDanglingTest` 5 例（归属+空引号、纯标点引号、带引号兼容、非空引号仍拦截、speak 不带引号）；全套 43 个测试通过。
+
+## Exp-19 工具调用失败审计与补漏（ch010 一轮 79 次 not found）
+
+- 审计：`llm_raw.jsonl` 里 ch010 一轮 79 次 `not found`。三类根因：
+  1. **前情全文混入**：窗口阶段 ch010 的上下文含第 1–9 章全文，模型把**前几章**的句子当本章引号去 speak（如 ch009 的「沉溺于这些事情…」），全部 not found。
+  2. **纯标点引号进补漏列表**：`unmarked_quotes` 把 `“，”` 之类也列给模型，模型编造归属（`瑞贝卡赶紧回答：`、`赫蒂用力点头：`——原文没有）→ not found 反复重试。
+  3. 长台词跨引号拼接、归属短语混进 `text`（少量）。
+     - 后续审计（ch013：83 调用/17 失败）确认主因就是「同一人的话被旁白/归属隔成多段引号，模型拼成一句」——如 `“别用火球术！”高文提醒，“用大范围的法术！”` 被拼成一段。提示词补规则 + few-shot（示例5）：**每段单独 speak，MCP 自动合并相邻同角色台词**；not-found 回执也去掉过时的「≤6 字片段」提示，改为「逐字复制其中一段；多段不要拼接」。
+- 修法：
+  - **提示词**：`LOCAL_SYSTEM` 明确「只处理【本章正文】；前情只用于判断说话人，引号都已处理，不要对前情调用工具」；正文块标注「【本章正文（只处理这里的引号）】」；`STEP_MARK` 同步；补漏消息写明「只处理下面列出的 N 处，列表之外不要调用工具，不要说找不到目标」。
+  - **代码**：新增 `pending_quotes()`，空/纯标点引号不发给模型（章末机械清除）；`run_turn` 返回本轮成功编辑数，补漏回合 0 成功即熔断，不再空转。
+  - **词典防污染**：`maintain_roster` 跳过 `aliases`/`voice` 等结构键；合并改为保守规则（新名必须是已有条目的别名才并入），避免种族/群体标签吞并既有角色；`load_roster` 载入时按「长名优先」合并重复项，`_canonicalize_profiles` 把声线并到规范名。
+  - **ROSTER_SYSTEM**：禁止把 aliases/voice 当键、必须沿用已有规范名、不收种族/群体/泛称（混血精灵/士兵等）。
+- 验证：词典从污染态（含 `aliases`/`voice`/`高文`+`高文·塞西尔` 重复）清理为 11 个规范条目；重启后 ch012 起无批量 not found；全套 48 个测试通过。

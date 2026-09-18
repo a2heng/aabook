@@ -1,12 +1,10 @@
-"""The marker convention for speech (rare symbols, so plain text never collides).
+"""The HTML-like marker convention for speech.
 
-Speech is wrapped as ``⦃角色名␟朗读内容⦄``; everything outside the markers is narration.
-- ``⦃`` U+2983 (open) / ``⦄`` U+2984 (close): rare "white curly brackets".
-- ``␟`` U+241F (unit separator): role/content delimiter.
+Speech is wrapped as ``<角色名>朗读内容</角色名>``; everything outside the tags is
+narration. The source text is code-filtered, so angle brackets never collide with
+real content. Override the tag pattern via env ``AUDIOBOOK_MARK_RE`` if needed.
 
-The agent (MCP ``mark_speaker``) produces this text; AuK parses it *mechanically* --
-no LLM -- into narration/speech rows and maps each role to its fixed voice.
-Override any symbol via env (``AUDIOBOOK_MARK_OPEN/CLOSE/SEP``).
+Vocal events stay as square brackets inside the content, e.g. ``<高文>[叹气]好吧。</高文>``.
 """
 
 from __future__ import annotations
@@ -14,26 +12,19 @@ from __future__ import annotations
 import os
 import re
 
-from .duration import estimate_text_duration
-from .instructions import render_instruction
 from .schema import Cast, ScriptRow
 
-MARK_OPEN = os.environ.get("AUDIOBOOK_MARK_OPEN", "\u2983")  # ⦃
-MARK_CLOSE = os.environ.get("AUDIOBOOK_MARK_CLOSE", "\u2984")  # ⦄
-MARK_SEP = os.environ.get("AUDIOBOOK_MARK_SEP", "\u241f")  # ␟
-
-MARKS_RE = re.compile(
-    re.escape(MARK_OPEN)
-    + r"([^"
-    + re.escape(MARK_SEP + MARK_CLOSE)
-    + r"]+)"
-    + re.escape(MARK_SEP)
-    + r"([^"
-    + re.escape(MARK_CLOSE)
-    + r"]*)"
-    + re.escape(MARK_CLOSE)
-)
+MARK_RE = os.environ.get("AUDIOBOOK_MARK_RE", r"<([^<>\n]{1,24})>(.*?)</\1>")
+MARKS_RE = re.compile(MARK_RE, re.DOTALL)
 NARRATOR = "旁白"
+
+# A short narration between two speech spans of the SAME role is a breath/beat, not a
+# speaker change: drop it and merge the speech into one row so TTS is called once.
+MAX_INTERRUPT_CHARS = int(os.environ.get("AUDIOBOOK_MERGE_INTERRUPT_CHARS", "12"))
+
+
+def mark(role: str, text: str) -> str:
+    return f"<{role}>{text}</{role}>"
 
 
 def _has_content(text: str) -> bool:
@@ -41,7 +32,7 @@ def _has_content(text: str) -> bool:
 
 
 def parse_marks(text: str) -> list[dict]:
-    """Split marked text into ``[{kind, role_name, text}]`` (narration = unmarked)."""
+    """Split marked text into ``[{kind, role_name, text}]`` (narration = outside tags)."""
     segments: list[dict] = []
     pos = 0
     for match in MARKS_RE.finditer(text):
@@ -55,24 +46,74 @@ def parse_marks(text: str) -> list[dict]:
     tail = text[pos:].strip()
     if _has_content(tail):
         segments.append({"kind": "narration", "role_name": NARRATOR, "text": tail})
-    # Long speech is marked in several `speak` calls; stitch adjacent same-role pieces.
+
+    # Merge so one person's turn becomes ONE row (fewer TTS calls): adjacent same-role
+    # speech joins; a short narration between two spans of the same role is dropped;
+    # adjacent narration joins.
     merged: list[dict] = []
+    pending: dict | None = None
     for segment in segments:
+        if pending is not None:
+            last = merged[-1] if merged else None
+            if (
+                segment["kind"] == "speech"
+                and last
+                and last["kind"] == "speech"
+                and last["role_name"] == segment["role_name"]
+                and len(pending["text"]) <= MAX_INTERRUPT_CHARS
+            ):
+                last["text"] += segment["text"]
+                pending = None
+                continue
+            if segment["kind"] == "narration":
+                pending["text"] += segment["text"]
+                continue
+            merged.append(pending)
+            pending = None
+        if segment["kind"] == "narration":
+            pending = dict(segment)
+            continue
         last = merged[-1] if merged else None
-        if last and last["kind"] == "speech" and segment["kind"] == "speech" and last["role_name"] == segment["role_name"]:
+        if last and last["kind"] == "speech" and last["role_name"] == segment["role_name"]:
             last["text"] += segment["text"]
-        else:
-            merged.append(dict(segment))
+            continue
+        merged.append(dict(segment))
+    if pending is not None:
+        merged.append(pending)
     return merged
 
 
-_BARE_QUOTE_RE = re.compile(r"[“『「][^”』」\n]{1,80}?[”』」]")
+_BARE_QUOTE_RE = re.compile(r"[“『「][^”』」\n]{1,400}?[”』」]")
 
 
 def unmarked_quotes(marked: str) -> list[str]:
-    """Quoted spans still *outside* any ⦃…⦄ mark (L3 leftovers / very short lines)."""
+    """Quoted spans still *outside* any tag (leftovers / very short lines)."""
     stripped = MARKS_RE.sub("", marked)
     return [match.group(0) for match in _BARE_QUOTE_RE.finditer(stripped)]
+
+
+def quoted_spans(text: str) -> list[str]:
+    """All quoted spans in a raw (unmarked) text -- used as a completeness checklist."""
+    return [match.group(0) for match in _BARE_QUOTE_RE.finditer(text)]
+
+
+_QUOTE_CHARS = '“”‘’「」『』"'
+
+
+def strip_quotes(marked: str) -> tuple[str, int]:
+    """Drop every leftover quote mark outside tags (chapter-end cleanup). Returns (text, count)."""
+    stripped = MARKS_RE.sub("", marked)
+    count = sum(stripped.count(char) for char in _QUOTE_CHARS)
+    if not count:
+        return marked, 0
+    parts: list[str] = []
+    last = 0
+    for match in MARKS_RE.finditer(marked):
+        parts.append(marked[last : match.start()].translate({ord(char): None for char in _QUOTE_CHARS}))
+        parts.append(match.group(0))
+        last = match.end()
+    parts.append(marked[last:].translate({ord(char): None for char in _QUOTE_CHARS}))
+    return "".join(parts), count
 
 
 def render_html(segments: list[dict], marked: str, path) -> None:
@@ -100,35 +141,32 @@ def live_fragments(original: str, current: str) -> list[dict]:
     """Inline display fragments for the live canvas (continuous text + overlays).
 
     Diff original vs current so every change is visible in place:
-    - ``speech``    ⦃role␟…⦄ content -> role card (marker syntax hidden);
+    - ``speech``    <role>…</role> content -> role card (tags hidden);
     - ``deleted``   characters gone from the original (struck through);
     - ``inserted``  new characters (e.g. a comma at a breath point);
     - ``narration`` untouched text.
     """
     import difflib
 
-    # Strip the marker syntax from the current text first, remembering which regions are
-    # speech. Diffing the *flattened* text keeps the alignment stable (otherwise difflib
-    # can split ⦃ and ␟ away from the role and the marker shows up as literal characters).
     flat: list[str] = []
     spans: list[tuple[int, int, str]] = []
     role: str | None = None
     span_start = 0
     index = 0
     while index < len(current):
-        if current.startswith(MARK_OPEN, index):
-            sep = current.find(MARK_SEP, index)
-            if sep >= 0:
-                role = current[index + 1 : sep]
-                span_start = len(flat)
-                index = sep + 1
+        if current.startswith("<", index):
+            close = current.find(">", index)
+            if close > index:
+                tag = current[index + 1 : close]
+                if tag.startswith("/"):
+                    if role is not None:
+                        spans.append((span_start, len(flat), role))
+                    role = None
+                elif not tag.endswith("/"):
+                    role = tag
+                    span_start = len(flat)
+                index = close + 1
                 continue
-        if current.startswith(MARK_CLOSE, index):
-            if role is not None:
-                spans.append((span_start, len(flat), role))
-            role = None
-            index += 1
-            continue
         flat.append(current[index])
         index += 1
     flattened = "".join(flat)
@@ -153,13 +191,13 @@ def live_fragments(original: str, current: str) -> list[dict]:
                 return who
         return None
 
-    def emit(start: int, end: int, default: str) -> None:  # walk a flat range, splitting on speech spans
+    def emit(start: int, end: int, default: str) -> None:
         while start < end:
             who = role_at(start)
             stop = end
-            for span_start, span_end, _ in spans:
-                if start < span_start < stop:
-                    stop = span_start
+            for span_start_i, span_end, _ in spans:
+                if start < span_start_i < stop:
+                    stop = span_start_i
                 if start < span_end < stop:
                     stop = span_end
             push("speech" if who else default, flattened[start:stop], who)
@@ -229,12 +267,16 @@ def to_script_rows(
                 role_name=role.name if role else segment["role_name"],
                 raw_text=segment["text"],
                 tts_text=segment["text"],
-                auk_task="zero_shot_tts",
                 voice_ref=role.voice_ref if role else "",
                 style_desc=role.style_desc if role else "",
-                target_duration_s=round(estimate_text_duration(segment["text"]), 3),
+                target_duration_s=round(_estimate(segment["text"]), 3),
                 duration_source="est",
-                pe_instruction=render_instruction("zero_shot_tts", segment["text"]),
             )
         )
     return rows
+
+
+def _estimate(text: str) -> float:
+    from .tts import estimate_text_duration
+
+    return estimate_text_duration(text)

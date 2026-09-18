@@ -17,7 +17,7 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_ROOT))
 
 from audiobook.cleaning import Chapter, normalize_text, read_text, split_chapters  # noqa: E402
-from audiobook.textnorm import clean_for_llm  # noqa: E402
+from audiobook.textnorm import clean_for_llm, one_paragraph  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,7 +38,8 @@ def prepare(input_path: str, out: Path) -> list[Chapter]:
     chapter_dir = out / "chapters"
     chapter_dir.mkdir(parents=True, exist_ok=True)
     for chapter in chapters:
-        (chapter_dir / f"ch{chapter.chapter_id:03d}.txt").write_text(chapter.text + "\n", encoding="utf-8")
+        text = one_paragraph(chapter.text)
+        (chapter_dir / f"ch{chapter.chapter_id:03d}.txt").write_text(text + "\n", encoding="utf-8")
     manifest = [{"chapter_id": c.chapter_id, "title": c.title} for c in chapters]
     (out / "chapters.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[prepare] chapters={len(chapters)} -> {out}", flush=True)

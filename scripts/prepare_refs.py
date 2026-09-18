@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare per-role reference audio for AuK cloning.
+"""Prepare per-role reference audio for Breeze TTS 2 cloning.
 
 Trims leading/trailing silence, caps length, converts to mono at the model's
 sample rate (24 kHz), and writes ``voices.json`` (role -> wav). Reference audio

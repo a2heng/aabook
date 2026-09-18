@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import html
 import io
+import json
 import mimetypes
 import os
 import re
@@ -74,12 +75,54 @@ class _RangeFile(io.BufferedIOBase):
 
 
 class FileBrowser(SimpleHTTPRequestHandler):
-    server_version = "AukFiles/1.0"
+    server_version = "BreezeFiles/1.0"
+
+    def _send_file(self, target: Path, content_type: str) -> None:
+        data = target.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_books(self) -> None:
+        """List book dirs under outputs/ (newest first) so the dashboard can auto-pick."""
+        root = Path(self.directory) / "outputs"
+        books = []
+        if root.is_dir():
+            for item in root.iterdir():
+                if (item / "chapters").is_dir() or (item / "script").is_dir():
+                    try:
+                        books.append({"book": item.name, "mtime": item.stat().st_mtime})
+                    except OSError:
+                        continue
+        books.sort(key=lambda x: x["mtime"], reverse=True)
+        payload = json.dumps(books, ensure_ascii=False).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def do_GET(self) -> None:
-        # Short alias: /live -> the marking live page (default book "dawn", ?book= to switch).
         parsed = urlparse(self.path)
-        if parsed.path.rstrip("/") == "/live":
+        route = parsed.path.rstrip("/") or "/"
+        if route == "/books.json":
+            self._send_books()
+            return
+        if route == "/":
+            target = Path(self.directory) / "dashboard.html"
+            if target.is_file():
+                self._send_file(target, "text/html; charset=utf-8")
+                return
+        if route == "/dashboard":
+            target = Path(self.directory) / "dashboard.html"
+            if target.is_file():
+                self._send_file(target, "text/html; charset=utf-8")
+                return
+            self.send_error(HTTPStatus.NOT_FOUND, "dashboard.html not found")
+            return
+        if route == "/live":
             book = parse_qs(parsed.query).get("book", [""])[0]
             if book:
                 target = Path(self.directory) / "outputs" / book / "script" / "live.html"
@@ -87,12 +130,7 @@ class FileBrowser(SimpleHTTPRequestHandler):
                 pages = list((Path(self.directory) / "outputs").glob("*/script/live.html"))
                 target = max(pages, key=lambda item: item.stat().st_mtime) if pages else Path("/nonexistent")
             if target.is_file():
-                data = target.read_bytes()
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                self._send_file(target, "text/html; charset=utf-8")
                 return
             self.send_error(HTTPStatus.NOT_FOUND, "live page not found")
             return
@@ -226,12 +264,15 @@ _PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AuK 文件库 {title}</title>
+<title>有声书文件库 {title}</title>
 <style>
   :root {{ color-scheme: dark; }}
   body {{ margin: 0; font-family: system-ui, -apple-system, "Noto Sans CJK SC", sans-serif;
          background: #14161a; color: #e6e6e6; }}
   header {{ position: sticky; top: 0; background: #1d2026; padding: 12px 18px; border-bottom: 1px solid #2c313a; }}
+  nav {{ display: flex; gap: 14px; font-size: 13px; margin-bottom: 8px; }}
+  nav a {{ color: #7cc4ff; text-decoration: none; }}
+  nav .on {{ color: #e6e6e6; font-weight: 700; }}
   h1 {{ font-size: 15px; margin: 0 0 8px; font-weight: 600; color: #9ecbff; word-break: break-all; }}
   input {{ width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 8px;
            border: 1px solid #333a45; background: #101216; color: #e6e6e6; }}
@@ -247,6 +288,12 @@ _PAGE = """<!doctype html>
 </head>
 <body>
 <header>
+  <nav>
+    <a href="/">文件库</a>
+    <a href="/dashboard">看板</a>
+    <a href="/live">台本实时</a>
+    <a id="breeze" href="#" target="_blank">Breeze ↗</a>
+  </nav>
   <h1>📁 {title}</h1>
   <input id="q" placeholder="过滤文件名…" oninput="filterRows(this.value)">
 </header>
@@ -254,6 +301,7 @@ _PAGE = """<!doctype html>
 {rows}
 </tbody></table>
 <script>
+document.getElementById('breeze').href = 'http://' + location.hostname + ':8137/';
 function filterRows(q) {{
   q = q.toLowerCase();
   document.querySelectorAll('#t tbody tr[data-name]').forEach(function (tr) {{

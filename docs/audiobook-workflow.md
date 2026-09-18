@@ -13,6 +13,12 @@ python scripts/run_book.py assets/txt/novel.txt --book dawn --stages script
 
 stages（可续跑，自动起停本地 LLM）：`prepare → script → convert → render`
 
+## LLM 服务（标注用）
+
+- 默认 `ckpts/llm/Qwen3.5-9B-UD-Q4_K_XL.gguf`（unsloth Dynamic 2.0，内置 MTP）：`scripts/serve_llm_cuda.sh` 默认 `--spec-type draft-mtp --spec-draft-n-max 6`；采样 temp 1.0 / top_p 0.95 / top_k 20 / presence_penalty 1.5；用模型自带 chat template（不要另传 jinja）。
+- 可选 DFlash 提速：`z-lab/Qwen3.5-9B-DFlash` 用 `convert_hf_to_gguf.py --target-model-dir ckpts/llm/Qwen3.5-9B-hf --outtype bf16` 转 GGUF，再 `AUDIOBOOK_LLM_SPEC=draft-dflash AUDIOBOOK_LLM_DRAFT=<dflash.gguf>`。9B 无 DSpark 草稿。
+- 环境变量覆盖见 `scripts/serve_llm_cuda.sh` 头部注释；LLM 与 Breeze（8137）不能同时占满 GPU。
+
 | 阶段 | 命令 | 产物 |
 | --- | --- | --- |
 | prepare | `build_book.py <txt> --out outputs/<book>` | `source.txt`、`clean.txt`、`chapters/chNNN.txt`、`chapters.json` |
@@ -20,7 +26,7 @@ stages（可续跑，自动起停本地 LLM）：`prepare → script → convert
 | convert | `marks_to_script.py --marked-dir outputs/<book>/script --out outputs/<book>` | `script.csv`、`script.json` |
 | render | `render_book.py --script outputs/<book>/script.csv ...` | `render/{rows,chapters,book.wav}` |
 
-预处理：`cleaning`（编码/引号/去页码）→ `textnorm.clean_for_llm`（通用字符白名单，LLM 前生效）。站点广告/元数据在输入 TXT 层先删掉。
+预处理：`cleaning`（编码/引号/去页码；方括号只去 `[` `]` 符号、**不删括号里的字**）→ `textnorm.clean_for_llm`（通用字符白名单 + 标点规范化，**省略号统一变 `。`**，LLM 前生效）。站点广告/元数据在输入 TXT 层先删掉。
 
 ## 标记约定
 
@@ -59,6 +65,8 @@ http://<host>:8899/outputs/<book>/script/live.html
 ```
 
 页面按聊天气泡展示：人物挖掘、每次 `edit` 调用与结果、每章摘要。
+
+**原始 LLM 输入/输出**（监督用）：`script/llm_raw.html`（请求的每条 message 可展开、原始 reasoning/content/tool_calls，1.5s 自刷新）与 `script/llm_raw.jsonl`（逐条 JSONL，含 roster 与标注两类调用）；每次运行开始会清空。
 
 ## 产物
 

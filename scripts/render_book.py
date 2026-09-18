@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Render a built script.csv into audio (per-row wavs -> per-chapter -> book).
+"""Render a built script.csv into audio with Breeze TTS 2 (rows -> chapters -> book).
 
 Rendering is resumable: existing per-row wavs (matching the same hash) are reused.
+Cloning needs a reference wav per role plus its exact transcript, so pass
+``--voices`` (voicebank.json) and optionally ``--voice-meta`` (voicebank_meta.json);
+the meta file is auto-detected next to ``--out`` if omitted.
 
 Examples:
-    python scripts/render_book.py --script outputs/mybook/script.csv --out outputs/mybook/render
     python scripts/render_book.py --script outputs/mybook/script.csv --out outputs/mybook/render \\
-        --voices outputs/mybook/voices.json --limit-chapters 1
+        --voices outputs/mybook/voicebank.json --voice-meta outputs/mybook/voicebank_meta.json
 """
 
 from __future__ import annotations
@@ -16,74 +18,97 @@ import json
 import os
 import sys
 import time
+import urllib.parse
 from collections import OrderedDict
 from pathlib import Path
 
+import soundfile as sf
+
 APP_ROOT = Path(__file__).resolve().parent.parent
-for _path in (APP_ROOT / "vendor", APP_ROOT / "third_party" / "AuK" / "src", APP_ROOT):
-    sys.path.insert(0, str(_path))
+sys.path.insert(0, str(APP_ROOT))
 
 for _key in list(os.environ):
     if "proxy" in _key.lower():
         del os.environ[_key]
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 os.chdir(APP_ROOT)
 
-from audiobook.assembler import TARGET_LUFS, assemble_chapters, assemble_rows  # noqa: E402
+from audiobook.tts import (  # noqa: E402
+    TARGET_LUFS,
+    BreezeConfig,
+    BreezeRenderer,
+    assemble_chapters,
+    assemble_rows,
+    voice_map_from_args,
+)
 from audiobook.canonical import canonicalize_rows  # noqa: E402
-from audiobook.renderer import RenderConfig, Renderer, voice_map_from_args  # noqa: E402
 from audiobook.schema import Cast, read_script  # noqa: E402
 
-VOICE_POOL = [
-    "assets/voice-reference/不同情绪音色/男-温暖、智勇双全、正直.wav",
-    "assets/voice-reference/不同情绪音色/女-明亮、坚定自信、师姐.wav",
-    "assets/voice-reference/不同情绪音色/男-骄纵傲气，小正经.wav",
-    "assets/voice-reference/不同情绪音色/女-温柔、姐姐.wav",
-    "assets/voice-reference/不同情绪音色/灵犀-女-俏皮，活泼.wav",
-    "assets/voice-reference/不同情绪音色/男-中音，慢速，柔和.wav",
-    "assets/voice-reference/不同情绪音色/女-冷艳、师姐、妩媚.wav",
-    "assets/voice-reference/不同情绪音色/男-傲慢、狂妄.wav",
-]
-NARRATOR_VOICE = "assets/voice-reference/不同情绪音色/男-中音，平静，柔和.wav"
+_EXT = {"opus": "opus", "aac": "m4a", "mp3": "mp3", "wav": "wav"}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Render a script.csv with AuK")
+    parser = argparse.ArgumentParser(description="Render a script.csv with Breeze TTS 2")
     parser.add_argument("--script", required=True, help="path to script.csv")
     parser.add_argument("--out", required=True, help="output directory for audio")
     parser.add_argument("--cast", default=None, help="cast.json (enables role canonicalization)")
     parser.add_argument("--voices", default=None, help="JSON mapping role name/alias -> reference wav")
+    parser.add_argument(
+        "--voice-meta",
+        default=None,
+        help="voicebank_meta.json (role -> ref_text) for cloning; auto-detected from --out/..",
+    )
     parser.add_argument("--voice", action="append", default=None, help="role=path override (repeatable)")
-    parser.add_argument("--variant", choices=["flash", "base"], default="flash")
-    parser.add_argument("--ckpt", default="")
-    parser.add_argument("--config", default="")
-    parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--duration-rate", type=float, default=1.0, help="extra scale on standard duration (1.0 = as-is)")
-    parser.add_argument("--max-seconds", type=float, default=20.0, help="clamp on gen_seconds (tightened; long rows degraded)")
     parser.add_argument("--target-lufs", type=float, default=TARGET_LUFS, help="loudness target for rows and masters")
-    parser.add_argument("--no-normalize", action="store_true", help="write raw AuK levels (no loudness normalization)")
+    parser.add_argument("--no-normalize", action="store_true", help="write raw levels (no loudness normalization)")
+    parser.add_argument(
+        "--audio-format",
+        choices=["mp3", "aac", "opus", "wav"],
+        default="mp3",
+        help="final chapter/book format (default mp3; per-row cache stays wav)",
+    )
+    parser.add_argument("--bitrate", default="64k", help="lossy bitrate (default 128k for mp3)")
+    parser.add_argument("--keep-wav", action="store_true", help="keep the intermediate chapter/book wavs")
     parser.add_argument("--limit-chapters", type=int, default=0, help="only the first N chapters")
     parser.add_argument("--start-chapter", type=int, default=0, help="first chapter_id to render (inclusive)")
     parser.add_argument("--end-chapter", type=int, default=0, help="last chapter_id to render (inclusive)")
     parser.add_argument("--limit-rows", type=int, default=0, help="only the first N rows (smoke test)")
     parser.add_argument("--no-assemble", action="store_true")
+    parser.add_argument("--breeze-url", default=None, help="breeze-server base URL (default 127.0.0.1:8137)")
+    parser.add_argument("--breeze-model", default=None, help="Breeze GGUF path")
+    parser.add_argument("--breeze-bin", default=None, help="breeze-server binary path")
+    parser.add_argument("--breeze-cfg", type=float, default=1.0, help="Breeze cfg_scale (1.0 disables guidance)")
+    parser.add_argument("--speed", type=float, default=1.0, help="global speed change via ffmpeg atempo (pitch-preserving)")
+    parser.add_argument(
+        "--breeze-direction",
+        action="store_true",
+        help="send per-row style/emotion as a voice-direction instruction",
+    )
+    parser.add_argument(
+        "--breeze-no-start",
+        action="store_true",
+        help="never start breeze-server; require one already running",
+    )
     return parser.parse_args()
 
 
-def build_voice_map(rows, explicit: dict[str, str]) -> dict[str, str]:
-    voices = dict(explicit)
-    for row in rows:
-        name = row.role_name or row.role_id
-        if not name or name in voices:
-            continue
-        if row.role_id == "narrator" or name in ("旁白", "叙述"):
-            voices[name] = NARRATOR_VOICE
-        else:
-            index = int.from_bytes(name.encode("utf-8"), "little") % len(VOICE_POOL)
-            voices[name] = VOICE_POOL[index]
-    return voices
+def load_voice_meta(args: argparse.Namespace) -> dict:
+    path = args.voice_meta
+    if not path:
+        candidate = Path(args.out).resolve().parent / "voicebank_meta.json"
+        if candidate.is_file():
+            path = str(candidate)
+    if not path:
+        return {}
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def wav_seconds(path: str | Path) -> float:
+    try:
+        info = sf.info(str(path))
+        return info.frames / float(info.samplerate or 24000)
+    except Exception:  # noqa: BLE001 - accounting only
+        return 0.0
 
 
 def main() -> None:
@@ -118,26 +143,37 @@ def main() -> None:
     explicit = voice_map_from_args(args.voice)
     if args.voices:
         explicit.update(json.loads(Path(args.voices).read_text(encoding="utf-8")))
-    voices = build_voice_map(selected, explicit)
-
-    config = RenderConfig(
-        variant=args.variant,
-        ckpt_path=args.ckpt,
-        config_path=args.config,
-        device=args.device,
-        seed=args.seed,
-        duration_rate=args.duration_rate,
-        max_seconds=args.max_seconds,
-        target_lufs=args.target_lufs,
-        normalize_rows=not args.no_normalize,
-    )
-    from app.patches import apply_patches
-
-    apply_patches()
+    voices = explicit
 
     out_dir = Path(args.out)
-    renderer = Renderer(config)
-    print(f"[render] variant={args.variant} rows={len(selected)} chapters={len(chapters)} out={out_dir}")
+    voice_meta = load_voice_meta(args)
+
+    breeze = BreezeConfig(
+        cfg_scale=args.breeze_cfg,
+        seed=args.seed,
+        target_lufs=args.target_lufs,
+        normalize_rows=not args.no_normalize,
+        direction=args.breeze_direction,
+    )
+    if args.breeze_url:
+        breeze.base_url = args.breeze_url.rstrip("/")
+        parsed = urllib.parse.urlparse(breeze.base_url)
+        if parsed.hostname:
+            breeze.host = parsed.hostname
+        if parsed.port:
+            breeze.port = parsed.port
+    if args.breeze_model:
+        breeze.model_path = args.breeze_model
+    if args.breeze_bin:
+        breeze.server_bin = args.breeze_bin
+
+    renderer = BreezeRenderer(breeze, voice_meta=voice_meta)
+    if not args.breeze_no_start:
+        renderer.start()
+    print(
+        f"[render] backend=breeze url={breeze.base_url} cfg={breeze.cfg_scale} "
+        f"direction={breeze.direction} rows={len(selected)} chapters={len(chapters)} out={out_dir}"
+    )
 
     (out_dir / "chapters").mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
@@ -145,23 +181,28 @@ def main() -> None:
     chapter_paths: list[tuple[int, Path]] = []
     audio_seconds = 0.0
     seen = 0
-    for chapter_id, chapter_rows in chapters.items():
-        limit = (args.limit_rows - seen) if args.limit_rows else None
-        if limit is not None and limit <= 0:
-            break
-        chapter_rendered = renderer.render_rows(chapter_rows, out_dir, voices=voices, limit=limit)
-        rendered.update(chapter_rendered)
-        seen += len(chapter_rendered)
-        audio_seconds += sum(config.seconds_for(row) for row in chapter_rows if row.order in chapter_rendered)
-        if args.no_assemble:
-            continue
-        items = [(chapter_rendered[row.order], row) for row in chapter_rows if row.order in chapter_rendered]
-        if not items:
-            continue
-        chapter_path = out_dir / "chapters" / f"ch{chapter_id:04d}.wav"
-        assemble_rows(items, chapter_path, normalize=not args.no_normalize, target_lufs=args.target_lufs)
-        chapter_paths.append((chapter_id, chapter_path))
-        print(f"[assemble] ch{chapter_id:04d}: {len(items)} rows -> {chapter_path}", flush=True)
+    try:
+        for chapter_id, chapter_rows in chapters.items():
+            limit = (args.limit_rows - seen) if args.limit_rows else None
+            if limit is not None and limit <= 0:
+                break
+            chapter_rendered = renderer.render_rows(chapter_rows, out_dir, voices=voices, limit=limit)
+            rendered.update(chapter_rendered)
+            seen += len(chapter_rendered)
+            audio_seconds += sum(
+                wav_seconds(chapter_rendered[row.order]) for row in chapter_rows if row.order in chapter_rendered
+            )
+            if args.no_assemble:
+                continue
+            items = [(chapter_rendered[row.order], row) for row in chapter_rows if row.order in chapter_rendered]
+            if not items:
+                continue
+            chapter_path = out_dir / "chapters" / f"ch{chapter_id:04d}.wav"
+            assemble_rows(items, chapter_path, normalize=not args.no_normalize, target_lufs=args.target_lufs)
+            chapter_paths.append((chapter_id, chapter_path))
+            print(f"[assemble] ch{chapter_id:04d}: {len(items)} rows -> {chapter_path}", flush=True)
+    finally:
+        renderer.close()
 
     elapsed = time.perf_counter() - started
     rtf = elapsed / audio_seconds if audio_seconds else 0.0
@@ -173,12 +214,35 @@ def main() -> None:
         "wall_seconds": round(elapsed, 1),
         "rtf": round(rtf, 3),
     }
+    book_wav: Path | None = None
     if chapter_paths:
-        book_path = out_dir / "book.wav"
-        assemble_chapters(chapter_paths, book_path, normalize=not args.no_normalize, target_lufs=args.target_lufs)
+        book_wav = out_dir / "book.wav"
+        assemble_chapters(chapter_paths, book_wav, normalize=not args.no_normalize, target_lufs=args.target_lufs)
         manifest["chapters"] = len(chapter_paths)
-        manifest["book"] = str(book_path)
-        print(f"[assemble] book -> {book_path}")
+        print(f"[assemble] book -> {book_wav}")
+
+    if book_wav is not None and args.audio_format != "wav":
+        from audiobook.tts import encode_lossy
+
+        for _chapter_id, wav_path in chapter_paths:
+            final = wav_path.with_suffix(f".{_EXT[args.audio_format]}")
+            encode_lossy(wav_path, final, fmt=args.audio_format, bitrate=args.bitrate)
+            print(f"[encode] {wav_path.name} -> {final.name} ({args.bitrate})", flush=True)
+        book_final = book_wav.with_suffix(f".{_EXT[args.audio_format]}")
+        encode_lossy(book_wav, book_final, fmt=args.audio_format, bitrate=args.bitrate)
+        manifest["book"] = str(book_final)
+        manifest["format"] = args.audio_format
+        manifest["bitrate"] = args.bitrate
+        print(
+            f"[encode] book -> {book_final} ({book_final.stat().st_size / 1e6:.1f} MB, was {book_wav.stat().st_size / 1e6:.1f} MB)",
+            flush=True,
+        )
+        if not args.keep_wav:
+            for wav_path in [book_wav, *[path for _, path in chapter_paths]]:
+                wav_path.unlink(missing_ok=True)
+    elif book_wav is not None:
+        manifest["book"] = str(book_wav)
+
     (out_dir / "render_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

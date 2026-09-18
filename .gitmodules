@@ -1,3 +1,6 @@
-[submodule "third_party/AuK"]
-	path = third_party/AuK
-	url = https://github.com/Tencent-Hunyuan/AuK
+[submodule "third_party/breeze-tts"]
+	path = third_party/breeze-tts
+	url = https://github.com/breezeblue-ai/breeze-tts.git
+[submodule "third_party/Breeze-TTS-2.cpp"]
+	path = third_party/Breeze-TTS-2.cpp
+	url = https://github.com/HoppouAI/Breeze-TTS-2.cpp.git

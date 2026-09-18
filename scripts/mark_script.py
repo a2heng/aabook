@@ -11,8 +11,8 @@ address, nicknames) is extracted and maintained at the START of every chapter; t
 marker always uses the canonical name. There are no passersby: minor people keep their
 name and can be turned into passerby voices later, at the TTS stage.
 
-    AUDIOBOOK_LLM_BASE_URL=http://127.0.0.1:8080/v1 AUDIOBOOK_LLM_MODEL=gemma-4-12b \
-    AUDIOBOOK_LLM_PROFILE=gemma-4-12b python scripts/mark_script.py 11 --count 5 --mode seq
+    AUDIOBOOK_LLM_BASE_URL=http://127.0.0.1:8080/v1 AUDIOBOOK_LLM_MODEL=qwen3.5-9b \
+    AUDIOBOOK_LLM_PROFILE=qwen3.5-9b python scripts/mark_script.py 11 --count 5 --batch 10
 """
 
 from __future__ import annotations
@@ -20,96 +20,784 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_ROOT))
 
 THINK = os.environ.get("AUDIOBOOK_THINK", "1").lower() not in ("0", "off", "false", "no")
-THINK_TOKEN = "<|think|>"  # Gemma: prepend to the system prompt
 
-from audiobook.llm import LLMClient, config_from_env  # noqa: E402
+from audiobook.llm import LLMClient, config_from_env, raw_log, reasoning_of  # noqa: E402
 from audiobook.marks import (  # noqa: E402
-    MARK_OPEN,
-    MARK_SEP,
     live_fragments,
     parse_marks,
     render_diff_html,
     render_html,
+    strip_quotes,
     unmarked_quotes,
 )
-from audiobook.live import Live  # noqa: E402
-from audiobook.mcp import MCPClient  # noqa: E402
+from audiobook.schema import Cast  # noqa: E402
+from audiobook.tts import VOCAL_EVENTS, is_event_tag, normalize_tag  # noqa: E402
 
-SYSTEM = """你是把「小说」改编成「有声剧台本」的编剧。目标：听众闭着眼也能听明白——**谁在说话、说了什么、怎么停顿**。
-程序用 ⦃角色名␟台词⦄ 表示台词，标记外一律旁白。你只指出"哪一处怎么改"，去引号/加逗号等机械动作由程序完成。
+OPEN = "“『「"
+CLOSE = "”』」"
 
-## 一、工具纪律
-- 只有一个工具 `edit`，**一次一处**；改完接着下一处；**禁止一次多条、禁止输出正文**。
-- 定位片段从正文**逐字复制**、**≤6 字**、唯一即可；抄整句必然 "not found"。
-- 通读全章、心里先分清"谁说了哪句"，再逐处处理；改过的地方不要再动。
-- **严格按这个顺序做**（每一步都从前往后扫）：
-  1）**标台词**：把人物说出的台词 speak 出来；
-  2）**去引号**：把不是台词的引号用 delete 去掉；
-  3）**加逗号**：最后统一补逗号、转听感标点（replace）。
-  不要跳步、不要边标台词边加逗号；定位片段不要跨越已标好的 ⦃…⦄。
+# Search tolerance: straight and curly quotes are treated as equal (the model often
+# types ASCII quotes while the text uses “ ”). Length is preserved, so indices map.
+_CANON = {}
+for _char in '“”"＂「」『』':
+    _CANON[ord(_char)] = '"'
+for _char in "‘’'":
+    _CANON[ord(_char)] = "'"
+_QUOTE_CANON = str.maketrans(_CANON)
 
-## 二、台词怎么标（关键）
-- 人物**说出**的话（引号内）→ `edit(op="speak", text="“引号连内容”", role="规范名")`：
-  **只去掉引号**；引号前后的字（包括「人名：」「他说」）**全部保留，绝不删除**。
-- **长台词**：按句拆成**多次 speak**（同一 role），每次给一小段（≤20 字、逐字复制）；程序会把相邻同角色片段**自动拼成一条**。
-- 台词被旁白/动作打断：`“A，”他顿了顿，“B。”` → 分两次 speak（同一 role），中间旁白**保留不动**。
-- 「人名：」只有**光秃秃的人名+冒号**（如「高文：」「赫蒂：」）→ 工具**自动删掉**；若带动作/神态/心理（「赫蒂抬起头说道：」「他心想：」）→ **保留不动**。
 
-## 三、不是台词的引号 → delete（**只去引号，不删字**）
-术语、绰号、强调、拟声（“铮”“轰”）→ 去引号、留词；引号里只有标点（“……”“——”“！”）→ 才整段删。
-**除了引号/纯标点，任何字都不许删**（旁白、动作、神态一律保留）。
+class ScriptServer:
+    def __init__(self) -> None:
+        self.text = ""
+        self.edits: list[dict] = []
+        self._refused_deletes: set[str] = set()
 
-## 四、怎么判断说话人
-- 找紧邻提示语 `X说/道/问/答/喊/笑道/低声道/自言自语…`（引号前后都算）。
-- 对话一来一往；问话/应答之后的引号多半是对方。
-- 「姑妈」「先祖大人」是**称呼不是说话人**，换成词典规范名。
-- role 只能是词典**规范名**：不能是描述（"混血精灵"），不能带标点/冒号/人称。
-- 拿不准就选词典里最可能的人，**绝不新造名字**。
+    # ---- tools ---------------------------------------------------------------
+    def set_text(self, text: str) -> dict:
+        self.text = text or ""
+        self._refused_deletes = set()
+        return {"chars": len(self.text)}
 
-## 五、让句子更短、更好听（用 replace，重点）
-- **气口加逗号**：人物说话太长时，在换气/停顿处补 `，`，把长句断开（要多补）。
-- 台词里表停顿/拖音的连续省略号 `……` → 换成 `，`；结巴式单个 `…`（“我…我…”）保留。
-- 多个叹号/问号 `！！！`/`？？？` → 只留一个 `！`/`？`；破折号 `——`（打断）→ 换成 `，`。
-- **不动**句末标点有无、不改词、不重写句子；引号外独行的纯标点（“……”“——”单独成段）→ 删掉。
+    def get_marked(self) -> dict:
+        return {"text": self.text}
 
-## 六、正反例
-✓ `赫蒂说道：“先祖大人，您回来了。”` → speak(role=赫蒂)，`赫蒂说道：` 保留为旁白
-✓ `“我不同意，”他攥紧拳头，“但我服从。”` → 两次 speak（同一人），`他攥紧拳头，` 保留
-✓ 长台词分多次 speak，程序自动拼合
-✓ `“你……别过来！！！”` → replace `……`→`，`、`！！！`→`！`
-✗ 删掉旁白/动作（`delete(text="他攥紧拳头")`）——禁止
-✗ `edit(op="speak", role="混血精灵")`（role 是描述，不是规范名）
-✗ `edit(op="speak", find="他还记得城门口发生过的所有事情")`（定位太长，必失败）
+    def edit(self, op: str = "", text: str = "", role: str = "", tag: str = "", find: str = "", replace: str = "") -> dict:
+        """The one editing tool. ``op`` is inferred when omitted."""
+        op = op or ("speak" if role else "replace" if (find or replace) else "delete")
+        if op == "speak":
+            # Prefer whichever argument still carries the quotes, so the whole quoted
+            # span is consumed (inner-only text would leave stray “ ” behind).
+            target = find if any(char in find for char in OPEN + CLOSE) else (text or find)
+            return self._mark_speaker(target, role, tag)
+        if op == "replace":
+            return self._replace(find or text, replace)
+        return self._delete(text or find)
+
+    # ---- primitives ----------------------------------------------------------
+    def _mark_speaker(self, text: str, role: str, tag: str = "") -> dict:
+        # Mark EXACTLY the given fragment -- never guess/expand (a long speech is marked in
+        # several speak calls and adjacent same-role fragments are merged downstream).
+        index = self._find_index(text)
+        if index < 0:
+            return {"ok": False, "reason": "not found", "text": text}
+        start, end = index, index + len(text)
+        open_lt = self.text.rfind("<", 0, start)
+        if open_lt >= 0:
+            open_gt = self.text.find(">", open_lt)
+            close_lt = self.text.find("<", end)
+            if open_gt != -1 and open_gt <= start and close_lt != -1 and self.text.startswith("</", close_lt):
+                return {"ok": True, "already": True, "role": self.text[open_lt + 1 : open_gt], "text": text[:24]}
+        body = self.text[start:end]
+        while body[:1] in OPEN:  # stray quote at a chunk edge -> consumed, not kept
+            body = body[1:]
+        while body[-1:] in CLOSE:
+            body = body[:-1]
+        # fragment sits fully inside a quoted span -> consume that quote pair too
+        if start >= 1 and self.text[start - 1] in OPEN and end < len(self.text) and self.text[end] in CLOSE:
+            start -= 1
+            end += 1
+        cut = start
+        if cut >= 1 and self.text[cut - 1] == "：":  # drop ONLY a bare 「人名：」
+            k = cut - 1
+            while k > 0 and self.text[k - 1] not in "。！？\n“”‘’「」『』 \t，,；;：":
+                k -= 1
+            name = self.text[k : cut - 1]
+            if self._is_pure_name(name, role):
+                cut = k
+        if not any(char.isalnum() for char in body):
+            return {"ok": False, "reason": '引号里只有标点，不是台词；请用 edit(op="delete") 去掉引号'}
+        if is_event_tag(tag):
+            body = f"[{normalize_tag(tag)}]{body}"
+        canonical = self._canonical_role(role) or (role or "").strip()
+        if not canonical:
+            return {"ok": False, "reason": "role 不能为空"}
+        wrapped = f"<{canonical}>{body}</{canonical}>"
+        self.text = self.text[:cut] + wrapped + self.text[end:]
+        self.edits.append({"op": "speak", "role": canonical, "text": text, "tag": tag, "attribution": cut < start})
+        return {"ok": True, "role": canonical, "text": body[:24]}
+
+    _SPEECH_TAIL_RE = re.compile(
+        r"(说道|问道|答道|喊道|叫道|笑道|叹道|应道|喝道|骂道|吼道|念道|回答|低语|喃喃|嘟囔|传来|开口|说)[，,：:]?$"
+    )
+    _NON_SPEECH_COLON_RE = re.compile(r"(写着|写到|标着|刻着|印着|注着|列出|注明|写着|标注)$")
+
+    def _looks_like_speech(self, start: int) -> bool:
+        """Code guard: a quote right after speech cues is dialogue -- refuse to delete it."""
+        ctx = self.text[max(0, start - 14) : start]
+        if self._SPEECH_TAIL_RE.search(ctx):
+            return True
+        return ctx.endswith("：") and not self._NON_SPEECH_COLON_RE.search(ctx[:-1])
+
+    def _empty_quote_pair(self, start: int, end: int, inside: bool) -> tuple[int, int] | None:
+        """Empty / punctuation-only quote pair inside the target span, or starting right after it."""
+        base = start if inside else end
+        limit = end if inside else min(len(self.text), end + 1)
+        open_at = next((i for i in range(base, limit) if self.text[i] in OPEN), -1)
+        if open_at < 0:
+            return None
+        close_at = next((i for i in range(open_at + 1, len(self.text)) if self.text[i] in CLOSE), -1)
+        if close_at < 0:
+            return None
+        content = self.text[open_at + 1 : close_at]
+        if any(char.isalnum() for char in content) or len(content) > 20:
+            return None
+        return open_at, close_at + 1
+
+    def _delete(self, target: str) -> dict:
+        if not target:
+            return {"ok": False, "reason": "empty"}
+        span = None
+        if any(char in target for char in OPEN + CLOSE):
+            index = self._find_index(target)
+            if index >= 0:
+                span = (index, index + len(target))
+        if span is None:
+            span = self._locate(target, strip=True)
+        if span is not None:
+            start, end = span
+            # empty quote pair: inside the target (「他说道：“”」) or right after it
+            # (delete target 「他说道：」, no quotes needed) -> shrink to that pair
+            pair = self._empty_quote_pair(start, end, inside=any(char in OPEN + CLOSE for char in self.text[start:end]))
+            if pair is not None:
+                start, end = pair
+            inner = self.text[start:end]
+            body = inner[1:-1] if (inner[:1] in OPEN and inner[-1:] in CLOSE) else inner
+            keep = any(char.isalnum() for char in body)
+            if keep and self._looks_like_speech(start) and target not in self._refused_deletes:
+                self._refused_deletes.add(target)
+                return {
+                    "ok": False,
+                    "reason": "这看起来是对话引号（前面有说话提示），请改用 edit(op=speak, role=规范名)；确认不是人物对话就再 delete 一次",
+                    "text": target[:24],
+                }
+            cut = start
+            if not keep and cut >= 1 and self.text[cut - 1] == "：":
+                # empty / punctuation-only quote: the dangling 「…说道：」 before it goes too
+                k = cut - 1
+                while k > 0 and self.text[k - 1] not in "。！？\n“”‘’「」『』 \t，,；;：":
+                    k -= 1
+                attribution = self.text[k : cut - 1]
+                if attribution and (self._SPEECH_TAIL_RE.search(attribution) or attribution in self._known_names()):
+                    cut = k
+            self.text = self.text[:cut] + (body if keep else "") + self.text[end:]
+            self.edits.append({"op": "delete", "text": target, "kept": keep})
+            return {"ok": True, "kept" if keep else "removed": body or inner}
+        index = self._find_index(target)  # plain characters (stray punctuation)
+        if index < 0:
+            return {"ok": False, "reason": "not found", "text": target}
+        self.text = self.text[:index] + self.text[index + len(target) :]
+        self.edits.append({"op": "delete", "text": target})
+        return {"ok": True, "removed": target}
+
+    def _replace(self, find: str, replace: str) -> dict:
+        index = self._find_index(find)
+        if index < 0:
+            return {"ok": False, "reason": "not found", "find": find}
+        self.text = self.text[:index] + replace + self.text[index + len(find) :]
+        self.edits.append({"op": "replace", "find": find, "replace": replace})
+        return {"ok": True}
+
+    # ---- helpers -------------------------------------------------------------
+    def _name_index(self) -> dict[str, str]:
+        """label/alias -> canonical name (from roles.json)."""
+        book = os.environ.get("AUDIOBOOK_BOOK", "dawn")
+        roles = APP_ROOT / "outputs" / book / "script" / "roles.json"
+        cache_key = str(roles)
+        if getattr(self, "_index_path", None) == cache_key:
+            return self._index_cache
+        index: dict[str, str] = {}
+        if roles.is_file():
+            for canonical, labels in json.loads(roles.read_text(encoding="utf-8")).items():
+                index[canonical] = canonical
+                for label in labels:
+                    index.setdefault(str(label), canonical)
+        self._index_cache, self._index_path = index, cache_key
+        return index
+
+    def _canonical_role(self, role: str) -> str | None:
+        return self._name_index().get((role or "").strip())
+
+    def _known_names(self) -> set[str]:
+        """All canonical names + labels from the dictionary (roles.json, cast.json fallback)."""
+        book = os.environ.get("AUDIOBOOK_BOOK", "dawn")
+        roles = APP_ROOT / "outputs" / book / "script" / "roles.json"
+        cache_key = str(roles)
+        if getattr(self, "_names_path", None) == cache_key:
+            return self._names_cache
+        names: set[str] = set()
+        if roles.is_file():
+            for canonical, labels in json.loads(roles.read_text(encoding="utf-8")).items():
+                names.add(canonical)
+                names.update(str(label) for label in labels)
+        else:
+            cast_path = APP_ROOT / "outputs" / book / "cast.json"
+            if cast_path.is_file():
+                cast = Cast.load(str(cast_path))
+                for item in cast.roles.values():
+                    names.add(item.name)
+                    names.update(item.aliases)
+        self._names_cache, self._names_path = names, cache_key
+        return names
+
+    def _is_pure_name(self, name: str, role: str) -> bool:
+        """True only for a bare person name (so 「高文：」 is dropped but 「赫蒂抬起头说道：」 is kept)."""
+        if not name or len(name) > 8:
+            return False
+        return name == role or name in self._known_names()
+
+    def _find_index(self, needle: str) -> int:
+        if not needle:
+            return -1
+        index = self.text.find(needle)
+        if index >= 0:
+            return index
+        index = self.text.translate(_QUOTE_CANON).find(needle.translate(_QUOTE_CANON))
+        if index >= 0:
+            return index
+        # tolerate a needle that accidentally includes mark syntax characters
+        if "<" in needle or ">" in needle:
+            plain = needle.replace("<", "").replace(">", "").replace("/", "")
+            if plain:
+                return self.text.find(plain)
+        return -1
+
+    def _locate(self, text: str, strip: bool = False) -> tuple[int, int] | None:
+        text = (text or "").strip()
+        if not text:
+            return None
+        for opener, closer in zip(OPEN, CLOSE):
+            quoted = f"{opener}{text}{closer}"
+            index = self._find_index(quoted)
+            if index >= 0:
+                return index, index + len(quoted)
+        index = self._find_index(text)
+        if index < 0:
+            return None
+        start, end = index, index + len(text)
+        if self.text[start : start + 1] in OPEN:  # anchor starts at the opening quote: expand
+            close_index = -1
+            for char in CLOSE:
+                pos = self.text.find(char, end)
+                if pos >= 0 and (close_index < 0 or pos < close_index):
+                    close_index = pos
+            if close_index >= 0:
+                return start, close_index + 1
+        if strip and start > 0 and self.text[start - 1] in OPEN:
+            close_index = -1
+            for char in CLOSE:
+                pos = self.text.find(char, end)
+                if pos >= 0 and (close_index < 0 or pos < close_index):
+                    close_index = pos
+            if close_index >= 0:
+                return start - 1, close_index + 1
+        return start, end
+
+    def call(self, name: str, args: dict) -> dict:
+        tools = {"set_text": self.set_text, "edit": self.edit, "get_marked": self.get_marked}
+        if name not in tools:
+            raise ValueError(f"unknown tool: {name}")
+        return tools[name](**args)
+
+    def tool_specs(self) -> list[dict]:
+        return [
+            {
+                "name": "edit",
+                "description": (
+                    "编辑工具（一次一处）。speak：人物对话——text 给**不带引号**的对话原文 + role"
+                    "（结合上下文判断的说话人），两侧引号由 MCP 自动识别并清除；delete：非对话的注意性引号——"
+                    "text 给**不带引号**的词/短语，只去引号留字；空的引号「“”」则 text 给前面的「某某说道：」，"
+                    "MCP 会连空引号一起删；禁止整段/批量删除；replace：给 ≤6 字定位和替换。"
+                    '示例：{"op":"speak","text":"你来了。","role":"高文"} / '
+                    '{"op":"delete","text":"固定视角"} / '
+                    '{"op":"replace","find":"没想到","replace":"没想到，"}'
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "op": {"type": "string", "enum": ["speak", "delete", "replace"]},
+                        "text": {
+                            "type": "string",
+                            "description": "一律不带引号：speak=对话原文；delete=词/短语，或空引号前的「某某说道：」",
+                        },
+                        "role": {"type": "string", "description": "speak 时的规范名"},
+                        "tag": {
+                            "type": "string",
+                            "enum": sorted(VOCAL_EVENTS),
+                            "description": "speak 的非语言声（可选），程序会写成 [tag] 前置到台词",
+                        },
+                        "find": {"type": "string", "description": "replace 的定位片段（≤6 字）"},
+                        "replace": {"type": "string", "description": "replace 的替换内容"},
+                    },
+                    "required": ["op"],
+                },
+            }
+        ]
+
+
+class MCPClient:
+    """In-process adapter over :class:`ScriptServer` (no subprocess/IPC)."""
+
+    def __init__(self, argv=None) -> None:
+        self.server = ScriptServer()
+
+    def initialize(self) -> None:
+        return None
+
+    def openai_tools(self) -> list[dict]:
+        return [
+            {
+                "type": "function",
+                "function": {"name": t["name"], "description": t["description"], "parameters": t["inputSchema"]},
+            }
+            for t in self.server.tool_specs()
+        ]
+
+    def call(self, name: str, args: dict) -> str:
+        return json.dumps(self.server.call(name, args), ensure_ascii=False)
+
+
+HTML = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mark_script · live</title>
+<style>
+:root{color-scheme:dark;--bg:#0d1017;--panel:#151a23;--panel2:#1b2230;--line:#26303f;--fg:#e6ecf3;--dim:#8b97a8;
+  --accent:#5aa9ff;--ok:#43c785;--warn:#ffb454}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;overflow:hidden}
+header{height:46px;display:flex;gap:12px;align-items:center;padding:0 18px;border-bottom:1px solid var(--line)}
+.brand{font-weight:700}.brand small{color:var(--dim);font-weight:400;margin-left:8px}
+header .grow{flex:1}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}
+#main{display:grid;grid-template-columns:1fr 380px;height:calc(100dvh - 46px)}
+#left{display:flex;flex-direction:column;min-width:0;min-height:0;border-right:1px solid var(--line)}
+#chbar{display:flex;gap:10px;align-items:center;padding:7px 16px;border-bottom:1px solid var(--line);font-size:12.5px;color:var(--dim)}
+#chbar select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:3px 8px;font-size:13px}
+#chbar button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:3px 10px;cursor:pointer;font-size:12.5px}
+#chbar button.on{background:var(--accent);color:#0b0f15;border-color:var(--accent);font-weight:700}
+#article{overflow:auto;min-height:0;padding:20px 30px 60px;flex:1;font-size:15.5px;line-height:2.05;white-space:pre-wrap;word-break:break-word}
+.who{display:inline-block;font-size:11.5px;font-weight:700;color:#9fd0ff;background:#16314f;border-radius:6px;padding:0 7px;margin:0 3px 0 2px;vertical-align:1px;line-height:1.7}
+.speech{background:#152238;border-radius:8px;padding:2px 6px;box-shadow:inset 0 0 0 1px #2b4a72}
+del{color:#ff9d9d;background:#2a1414;text-decoration:line-through;border-radius:5px;padding:1px 3px}
+ins{color:#9fe6c1;background:#122a1c;text-decoration:none;border-radius:5px;padding:1px 5px}
+.new{animation:appear .65s cubic-bezier(.2,.9,.3,1.1) both}
+@keyframes appear{0%{opacity:0;filter:blur(4px)}55%{opacity:1}100%{opacity:1;filter:blur(0)}}
+#chat{overflow:hidden;min-height:0;padding:10px 12px;display:flex;flex-direction:column;justify-content:flex-end;gap:5px}
+.ev{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:5px 9px;font-size:12.5px;line-height:1.55;word-break:break-word}
+.ico{display:inline-block;width:15px;margin-right:5px;text-align:center;opacity:.9}
+.think{color:var(--dim);background:#12161d}.think summary{cursor:pointer;font-size:12px}
+.call{border-color:#25415f;background:#101a26}
+.dict{border-color:#5c4620;background:#241d10}
+.res{border-color:#234;background:#111720;color:var(--dim);font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px}
+.res.ok{border-color:#1f4a33;color:#9fe6c1}.res.bad{border-color:#5a2626;color:#ffb3b3;background:#1d1212}
+.sum{border-color:#3b3560;background:linear-gradient(180deg,#1b1830,#151a23)}
+.ev code{font-size:11px;padding:0 3px}
+.badge{display:inline-block;font-size:10.5px;font-weight:700;padding:0 5px;border-radius:6px;margin-right:5px}
+.b-speak{background:#17345a;color:#8fc4ff}.b-delete{background:#4a2a12;color:#ffba75}.b-replace{background:#33234a;color:#c9a6ff}
+code{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d1219;border:1px solid var(--line);border-radius:5px;padding:0 4px;font-size:12px}
+.role{color:var(--accent);font-weight:600}.sp{color:var(--dim)}.chap{color:var(--accent);font-weight:700;font-size:11.5px;margin-right:6px}
+/* phone / narrow: stack vertically -- article on top, chat as a fixed-height stream below */
+@media (max-width:820px){
+  #main{grid-template-columns:1fr;grid-template-rows:1fr minmax(28dvh,38dvh)}
+  #left{border-right:none;border-bottom:1px solid var(--line)}
+  #article{padding:14px 16px 40px;font-size:16px;line-height:1.95}
+  #chat{padding:8px 10px;gap:4px}
+  .ev{font-size:12px;padding:4px 8px}
+  #chbar{gap:8px;padding:6px 12px;font-size:12px;overflow-x:auto;white-space:nowrap}
+  header{padding:0 12px}.brand{font-size:14px}
+}
+</style></head><body>
+<header>
+  <div class="brand">mark_script <small id="book">· live</small></div>
+  <span class="grow"></span>
+  <nav style="display:flex;gap:12px;align-items:center;font-size:13px">
+    <a href="live.html" style="color:#e6ecf3;font-weight:700;text-decoration:none">台本实时</a>
+    <a href="llm_raw.html" target="_blank" style="color:#5aa9ff;text-decoration:none">原始 I/O ↗</a>
+    <a href="/dashboard" target="_blank" style="color:#5aa9ff;text-decoration:none">看板 ↗</a>
+    <a href="/" target="_blank" style="color:#5aa9ff;text-decoration:none">文件库 ↗</a>
+    <a id="breeze" href="#" target="_blank" style="color:#5aa9ff;text-decoration:none">Breeze ↗</a>
+  </nav>
+  <span class="dot"></span>
+</header>
+<div id="main">
+  <div id="left">
+    <div id="chbar">
+      <select id="chs"></select>
+      <button id="follow" class="on">跟随最新</button>
+      <span id="finfo"></span>
+    </div>
+    <div id="article"><span class="sp">等待正文……</span></div>
+  </div>
+  <div id="chat"></div>
+</div>
+<script>
+const BASE='__LIVE_BASE__', MAXCHAT=32;
+document.getElementById('breeze').href='http://'+location.hostname+':8137/';
+const article=document.getElementById('article'), chat=document.getElementById('chat'), chs=document.getElementById('chs');
+const book=document.getElementById('book'), followBtn=document.getElementById('follow'), finfo=document.getElementById('finfo');
+let offset=0, follow=true, selected=null, current=null, prevSig='', idxSig='', seen=new Set();
+function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function fragHTML(f,isNew){const c=isNew?' new':'';
+  if(f.kind==='speech')return '<span class="speech'+c+'"><span class="who">'+esc(f.role||'?')+'</span>'+esc(f.text)+'</span>';
+  if(f.kind==='deleted')return '<del'+c+'>'+esc(f.text)+'</del>';
+  if(f.kind==='inserted')return '<ins'+c+'>'+esc(f.text)+'</ins>';
+  return '<span'+c+'>'+esc(f.text)+'</span>';}
+function renderArticle(s){
+  if(!s||!s.fragments||document.hidden)return;
+  const sig=JSON.stringify(s.fragments); if(sig===prevSig)return;
+  if(seen.chapter!==s.chapter){seen=new Set();seen.chapter=s.chapter;}
+  const top=article.scrollTop; let html='';
+  for(const f of s.fragments){const key=f.kind+'|'+(f.role||'')+'|'+f.text;const isNew=!seen.has(key);seen.add(key);html+=fragHTML(f,isNew);}
+  article.innerHTML=html; article.scrollTop=top; prevSig=sig;
+  finfo.textContent=(s.chars||0)+' 字 · '+s.fragments.length+' 片段';
+}
+let pending=[];
+function pushChat(e){
+  const row=document.createElement('div'); row.className='ev '+e.cls;
+  row.innerHTML=(e.icon?'<span class="ico">'+e.icon+'</span>':'')+(e.chapter?'<span class="chap">ch'+e.chapter+'</span>':'')+e.html;
+  pending.push(row);
+}
+function flushChat(){
+  if(!pending.length)return;
+  const frag=document.createDocumentFragment();
+  for(const row of pending)frag.appendChild(row);
+  pending=[]; chat.appendChild(frag);
+  let extra=chat.childElementCount-MAXCHAT;
+  while(extra-->0)chat.removeChild(chat.firstChild);
+}
+function fmtCall(a){const x=a&&a.args||{};
+  const op=x.op||(x.role?'speak':(x.find!==undefined||x.replace!==undefined)?'replace':'delete');
+  if(op==='speak')return '<span class="badge b-speak">speak</span><span class="role">'+esc(x.role||'?')+'</span> <code>'+esc(x.text||'')+'</code>';
+  if(op==='replace')return '<span class="badge b-replace">replace</span><code>'+esc(x.find||'')+'</code> <span class="sp">→</span> <code>'+esc(x.replace||'')+'</code>';
+  return '<span class="badge b-delete">delete</span><code>'+esc(x.text||'')+'</code>';}
+function handle(e){
+  if(e.type==='start'){book.textContent='· '+(e.book||'live');return;}
+  if(e.type==='chapter'){current=e.chapter;if(follow)selected=e.chapter;return;}
+  if(e.type==='roster'){pushChat({cls:'dict',icon:'✦',chapter:e.chapter,html:'词典 <b>+'+e.added+'</b> 标签 · 词条 '+e.roles});return;}
+  if(e.type==='assistant'){pushChat({cls:'think',icon:'🧠',chapter:e.chapter,html:'<details><summary>思考</summary>'+esc(e.content)+'</details>'});return;}
+  if(e.type==='tool'){pushChat({cls:'call',chapter:e.chapter,html:fmtCall(e.args)});return;}
+  if(e.type==='result'){pushChat({cls:'res '+(e.ok?'ok':'bad'),icon:e.ok?'✓':'✗',chapter:e.chapter,html:esc(e.result)});return;}
+  if(e.type==='done'){pushChat({cls:'sum',icon:'📝',chapter:e.chapter,html:'<b>本章完成</b> <span class="sp">'+esc(e.summary||'')+'</span>'});return;}}
+function handleText(txt){
+  for(const line of txt.split('\n')){if(!line.trim())continue;let e;try{e=JSON.parse(line);}catch(_){continue;}handle(e);}
+}
+async function tickChat(){
+  try{const r=await fetch(BASE+'live.jsonl',{headers:{'Range':'bytes='+offset+'-'},cache:'no-store'});
+    if(r.status===416){                                   // 到了 EOF：可能只是没新数据
+      const h=await fetch(BASE+'live.jsonl',{method:'HEAD',cache:'no-store'});
+      const size=+(h.headers.get('Content-Length')||0);
+      if(size<offset){                                    // 文件变小 -> 被截断（新一次运行）
+        const fb=await (await fetch(BASE+'live.jsonl',{cache:'no-store'})).arrayBuffer();
+        offset=0;chat.innerHTML='';pending=[];
+        handleText(new TextDecoder().decode(fb)); offset=fb.byteLength;
+      } else { offset=size; }
+    }
+    else if(r.status===206||offset===0){const buf=await r.arrayBuffer();offset+=buf.byteLength;
+      handleText(new TextDecoder().decode(buf));}
+  }catch(err){}
+  flushChat();
+  setTimeout(tickChat,1200);
+}
+async function tickIndex(){
+  try{const r=await fetch(BASE+'live_index.json?t='+Date.now(),{cache:'no-store'});
+    if(!r.ok)return; const idx=await r.json();
+    const cur=idx.current; if(cur&&follow)selected=cur;
+    const ids=Object.keys(idx.chapters||{}).map(Number).sort((a,b)=>a-b);
+    const listKey=ids.join(',');
+    if(listKey!==idxSig){idxSig=listKey;                  // rebuild only when the set changes
+      chs.innerHTML=ids.map(function(c){var d=idx.chapters[c]&&idx.chapters[c].done?' ✔':'';return '<option value="'+c+'">第 '+c+' 章'+d+'</option>';}).join('');}
+    const want=String(selected||cur||''); if(chs.value!==want)chs.value=want;
+  }catch(err){}
+  setTimeout(tickIndex,1500);
+}
+async function tickState(){
+  const cid=selected||current; if(!cid){setTimeout(tickState,800);return;}
+  try{const r=await fetch(BASE+'ch'+String(cid).padStart(3,'0')+'.json?t='+Date.now(),{cache:'no-store'});
+    if(r.ok)renderArticle(await r.json());}catch(err){}
+  setTimeout(tickState,800);
+}
+chs.addEventListener('change',function(){selected=+chs.value;follow=false;followBtn.classList.remove('on');prevSig='';});
+followBtn.addEventListener('click',function(){follow=true;followBtn.classList.add('on');if(current)selected=current;prevSig='';});
+tickChat();tickIndex();tickState();
+</script></body></html>
 """
 
-ROSTER_SYSTEM = """你在维护一部小说的「人物词典」：**规范名 → 若干标签**（正式名、简称、称呼、绰号、头衔、代称）。
-输入是「已有词典」和「本章正文」。请把本章出现、**指向人物**的称呼，归并到同一个人名下补进词典。
 
-规则：
-- 规范名取这个人**最完整/最正式**的称呼（如"高文·塞西尔"）；简称/昵称/称呼/头衔都进标签。
-- 只收**指人**的称呼；地名、组织、物品、种族、群体（如"暗影界""塞西尔家族""巨龙""人群""卫兵""一个声音"）**不收**。
-- 同一个人的多个称呼必须并入**同一条**，不要重复建条目。
-- 已有条目**只增补标签**，不改名、不删除。
-- 没有任何新增就输出 {}。
-
-只输出 JSON：{"规范名": ["新标签", ...]}。
-示例：{"高文·塞西尔": ["老祖宗","先祖大人"], "赫蒂": ["姑妈"]}
+RAW_HTML = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mark_script · 原始 LLM I/O</title>
+<style>
+:root{color-scheme:dark;--bg:#0d1017;--panel:#151a23;--line:#26303f;--fg:#e6ecf3;--dim:#8b97a8;--accent:#5aa9ff;--bad:#ff7b7b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.65 system-ui,-apple-system,"Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+header{position:sticky;top:0;z-index:6;display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:8px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+header b{font-size:14px}
+nav{display:flex;gap:12px;font-size:13px}
+nav a{color:var(--accent);text-decoration:none}nav a.on{color:var(--fg);font-weight:700}
+header .grow{flex:1}.dim{color:var(--dim)}
+header input{background:#0f141b;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:4px 9px;font-size:12.5px}
+header button{background:#1b2230;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:4px 10px;font-size:12.5px;cursor:pointer}
+header button.on{background:var(--accent);border-color:var(--accent);color:#0b0f15;font-weight:700}
+#feed{padding:12px 16px 80px;display:flex;flex-direction:column;gap:10px;max-width:1080px;margin:0 auto}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+.card.fail{border-color:#6b2b2b;background:#1a1212}
+.hd{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;color:#9fd0ff}
+.tool{color:#9fe6c1;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
+.failmsg{color:var(--bad);font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all}
+details{margin-top:4px}
+summary{cursor:pointer;color:var(--dim)}
+pre{white-space:pre-wrap;word-break:break-word;background:#0f141b;border:1px solid #1f2836;border-radius:8px;padding:8px 10px;margin:4px 0;font-size:12.5px}
+.role{color:#ffb454}.reason{color:var(--dim)}.msg{border-left:2px solid #2b4a72;padding-left:8px;margin:4px 0}
+</style></head><body>
+<header>
+  <b>原始 LLM I/O</b>
+  <nav>
+    <a href="live.html">台本实时</a>
+    <a class="on" href="llm_raw.html">原始 I/O</a>
+    <a href="/dashboard" target="_blank">看板</a>
+    <a href="/" target="_blank">文件库</a>
+    <a id="breeze" href="#" target="_blank">Breeze</a>
+  </nav>
+  <span class="grow"></span>
+  <input id="q" placeholder="过滤…（ch/step/正文/失败）">
+  <button id="follow" class="on">跟随最新</button>
+  <span class="dim" id="meta"></span>
+</header>
+<div id="feed"></div>
+<script>
+const BASE='__LIVE_BASE__';
+document.getElementById('breeze').href='http://'+location.hostname+':8137/';
+const feed=document.getElementById('feed'), meta=document.getElementById('meta');
+const q=document.getElementById('q'), followBtn=document.getElementById('follow');
+let offset=0, pending=null, follow=true, shown=0, lastCards=[];
+function esc(s){return (s==null?'':String(s)).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+function msgSummary(m){return '<span class="role">'+esc(m.role||'?')+'</span> <span class="dim">'+((m.content||'').length)+' 字'+(m.tool_calls?(' · 工具调用×'+m.tool_calls.length):'')+(m.tool_call_id?' · 工具结果':'')+'</span>';}
+function pairCard(req,res){
+  const card=document.createElement('div'); card.className='card';
+  const where=(res.chapter!=null?'ch'+res.chapter+' · step'+res.step:(res.source||'llm'));
+  const tc=(res.tool_calls||[]).map(function(t){return '<div class="tool">'+esc(t.name)+' '+esc(t.arguments)+'</div>';}).join('');
+  card.innerHTML='<div class="hd"><b>'+esc(where)+'</b><span class="dim">'+esc(res.duration_s||'')+'s · finish='+esc(res.finish_reason||'')+(res.tool_calls?(' · 工具×'+res.tool_calls.length):'')+'</span></div>'
+    +'<details class="out" open><summary>输出</summary>'+(res.reasoning?('<div class="reason">思考</div><pre>'+esc(res.reasoning)+'</pre>'):'')
+    +'<pre>'+esc(res.content||'')+'</pre>'+tc+'</details>'
+    +'<details class="in"><summary>输入 · '+(req&&req.messages?req.messages.length:0)+' 条消息</summary><div class="msgs"></div></details>';
+  card.dataset.text=(where+' '+(res.content||'')+' '+(res.reasoning||'')+' '+tc).toLowerCase();
+  const msgs=card.querySelector('.msgs');
+  card.querySelector('.in').addEventListener('toggle',function(){
+    if(this.open&&!msgs.childElementCount&&req){
+      req.messages.forEach(function(m){
+        const d=document.createElement('details'); d.className='msg';
+        d.innerHTML='<summary>'+msgSummary(m)+'</summary><pre>'+esc(m.content||'')+'</pre>';
+        msgs.appendChild(d);});
+    }
+  });
+  return card;
+}
+function tailResults(e,n){
+  const out=[], msgs=e.messages||[];
+  for(let i=msgs.length-1;i>=0&&out.length<n;i--){const m=msgs[i];
+    if(m.role==='tool'||(m.role==='user'&&(m.content||'').indexOf('工具结果：')===0))out.push(m);}
+  return out.reverse();
+}
+function markFail(card,message){
+  let raw=(message.content||''); if(raw.indexOf('工具结果：')===0)raw=raw.slice('工具结果：'.length);
+  try{const result=JSON.parse(raw||'{}'); if(result.ok!==false)return;
+    card.classList.add('fail');
+    const line=document.createElement('div'); line.className='failmsg';
+    line.textContent='✗ '+(result.reason||'')+' '+(result.text||result.find||'');
+    card.querySelector('.hd').appendChild(line);
+    card.dataset.text+=' fail '+String(result.reason||'').toLowerCase();
+  }catch(err){}
+}
+function prune(){while(feed.childElementCount>30)feed.removeChild(feed.firstChild);}
+function applyFilter(){const v=q.value.trim().toLowerCase();feed.querySelectorAll('.card').forEach(function(c){c.style.display=(!v||c.dataset.text.indexOf(v)>=0)?'':'none';});}
+function scrollBottom(){if(follow)window.scrollTo(0,document.body.scrollHeight);}
+function handle(e){
+  if(e.kind==='request'){
+    if(lastCards.length){tailResults(e,lastCards.length).forEach(function(m,i){if(lastCards[i])markFail(lastCards[i],m);});lastCards=[];}
+    pending=e; return;
+  }
+  if(e.kind==='response'){
+    const card=pairCard(pending,e); pending=null; feed.appendChild(card); shown++;
+    lastCards=(e.tool_calls||[]).map(function(){return card;});
+    prune(); applyFilter(); scrollBottom();
+    meta.textContent='已记录 '+shown+' 组 · 显示 '+feed.childElementCount;
+  }
+}
+function handleText(txt){for(const line of txt.split('\n')){if(!line.trim())continue;let e;try{e=JSON.parse(line);}catch(_){continue;}handle(e);}}
+async function tick(){
+  try{const r=await fetch(BASE+'llm_raw.jsonl',{headers:{'Range':'bytes='+offset+'-'},cache:'no-store'});
+    if(r.status===416){
+      const h=await fetch(BASE+'llm_raw.jsonl',{method:'HEAD',cache:'no-store'});
+      const size=+(h.headers.get('Content-Length')||0);
+      if(size<offset){const fb=await (await fetch(BASE+'llm_raw.jsonl',{cache:'no-store'})).arrayBuffer();offset=0;feed.innerHTML='';shown=0;handleText(new TextDecoder().decode(fb));offset=fb.byteLength;}
+      else offset=size;
+    } else if(r.status===206||offset===0){const buf=await r.arrayBuffer();offset+=buf.byteLength;
+      handleText(new TextDecoder().decode(buf));}
+  }catch(err){}
+  setTimeout(tick,1500);
+}
+q.addEventListener('input',applyFilter);
+followBtn.addEventListener('click',function(){follow=!follow;followBtn.classList.toggle('on',follow);scrollBottom();});
+window.addEventListener('scroll',function(){if(!follow)return;if(document.documentElement.scrollHeight-window.scrollY-window.innerHeight>160){follow=false;followBtn.classList.remove('on');}});
+tick();
+</script></body></html>
 """
 
-SUMMARY_SYSTEM = """你在为长篇小说的台本标注维护「前情摘要」（把整条阅读脉络压缩成一段）。
-给定「已有摘要」和「本章正文」，输出更新后的滚动摘要：一段中文，尽量短（≤400 字）。
-保留对判断「谁在说话」有用的信息：新出场人物的身份、人物关系、称呼与绰号、称呼变化、剧情要点。不要复述全文，不要漏掉新人物。
+
+def write_page(directory: Path) -> Path:
+    """Write ``live.html`` for a script directory (callable without touching the log)."""
+    app_root = Path(__file__).resolve().parent.parent
+    base = "/" + str(directory.resolve().relative_to(app_root)) + "/"
+    page = directory / "live.html"
+    page.write_text(HTML.replace("__LIVE_BASE__", base), encoding="utf-8")
+    return page
+
+
+def write_raw_page(directory: Path) -> Path:
+    """Write ``llm_raw.html`` (raw request/response viewer) for a script directory."""
+    app_root = Path(__file__).resolve().parent.parent
+    base = "/" + str(directory.resolve().relative_to(app_root)) + "/"
+    page = directory / "llm_raw.html"
+    page.write_text(RAW_HTML.replace("__LIVE_BASE__", base), encoding="utf-8")
+    return page
+
+
+class Live:
+    """Event log + per-chapter fragments + a self-refreshing visual page."""
+
+    def __init__(self, path: Path) -> None:
+        self.dir = path.parent
+        self.path = path
+        self.index_path = self.dir / "live_index.json"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+        self.index: dict = {"current": 0, "chapters": {}}
+        self._write_index()
+        write_page(self.dir)
+        write_raw_page(self.dir)
+
+    def _write_index(self) -> None:
+        tmp = self.index_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.index, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, self.index_path)
+
+    def emit(self, type: str, **event) -> None:  # noqa: A002 - 'type' matches the wire format
+        event["type"] = type
+        event["ts"] = round(time.time(), 3)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def set_state(self, chapter: int, chars: int, fragments: list[dict], done: bool = False) -> None:
+        """Overwrite this chapter's canvas state (atomic) and refresh the index."""
+        entry = self.index["chapters"].setdefault(str(chapter), {"chars": chars, "done": done})
+        entry["chars"] = chars
+        entry["done"] = entry.get("done", False) or done
+        self.index["current"] = chapter
+        payload = json.dumps({"chapter": chapter, "chars": chars, "fragments": fragments}, ensure_ascii=False)
+        tmp = (self.dir / f"ch{chapter:03d}.json").with_suffix(".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, self.dir / f"ch{chapter:03d}.json")
+        self._write_index()
+
+
+LIVE_PORT = int(os.environ.get("AUDIOBOOK_LIVE_PORT", "8899"))
+
+
+def ensure_live_server(port: int = LIVE_PORT) -> None:
+    """Start the LAN/live file server if it is not already answering."""
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/live", timeout=2)
+        return
+    except Exception:  # noqa: BLE001 - not up yet
+        pass
+    log_path = APP_ROOT / ".cache" / "logs" / "serve_files.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        subprocess.Popen(
+            [sys.executable, "scripts/serve_files.py", "--dir", str(APP_ROOT), "--port", str(port)],
+            cwd=APP_ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    print(f"[live] serving http://127.0.0.1:{port}/live", flush=True)
+
+
+LOCAL_SYSTEM = """你只做一件事：清理【本章正文】里的引号，并把人物对话标成台词。
+前面可能附带其它章节原文（前情），那只是给你判断说话人用的：**前情里的引号已经全部处理过，
+不要对前情调用任何工具**，也不要处理前情里的内容。
+正文里的引号分两种，处理方式不同：
+- **人物对话**：结合上下文（说/道/问/答/喊 等提示、前后文、人物词典）判断说话人是谁，
+  用 edit(op="speak", text="不带引号的对话原文", role="规范名") 剥离；text **一定不带引号**，
+  两侧引号由 MCP 自动识别并清除；对话必须**完整**，一字不漏、标点照抄。
+- **引起读者注意的引号**（术语、强调、外号等，不是人物说出的话）：
+  用 edit(op="delete", text="不带引号的这个词/短语") 直接去掉两边引号，文字保留（朗读不需要引号）；
+  如果引号里是空的（“”），text 给前面悬空的「某某说道：」，MCP 会连空引号一起删。
+- **同一个人的话被「某某说道」或旁白隔成多段引号时，每段单独 speak，绝对不要拼成一句**；
+  相邻同角色的台词 MCP 会自动合并。
+没有引号的内容一律不动。一次一处，处理完本章停下，不要解释，不要整段批量去引号。"""
+
+FEW_SHOT = [
+    {"role": "user", "content": "示例1 正文：\n他叹道：“你终于来了。”"},
+    {"role": "assistant", "content": '{"op":"speak","text":"你终于来了。","role":"高文"}'},
+    {"role": "user", "content": "示例2 正文（后文可知这个年轻女声是琥珀）：\n一个年轻的女声慌张道：“别，先别杀我啊！”"},
+    {"role": "assistant", "content": '{"op":"speak","text":"别，先别杀我啊！","role":"琥珀"}'},
+    {"role": "user", "content": "示例3 正文：\n他把“固定视角”当成口头禅。"},
+    {"role": "assistant", "content": '{"op":"delete","text":"固定视角"}'},
+    {"role": "user", "content": "示例4 正文：\n他愣了一下，叹道：“”屋子里没人接话。"},
+    {"role": "assistant", "content": '{"op":"delete","text":"叹道："}'},
+    {
+        "role": "user",
+        "content": "示例5 正文（同一个人的话被旁白隔成两段引号，要分两次 speak，不能拼成一句）：\n“别用火球术！”高文高声提醒，“用大范围的法术！”",
+    },
+    {"role": "assistant", "content": '{"op":"speak","text":"别用火球术！","role":"高文"}'},
+]
+
+STEP_MARK = "现在只处理【本章正文】的引号：对话 speak（不带引号的原文 + 规范名），注意性引号 delete（不带引号）；前情里的引号已处理，不要动。处理完停下。"
+
+ROSTER_SYSTEM = """你在维护一部小说的「人物词典 + 声线档案」。输入是「已有词典」和「本章正文」。
+对本章出现、能指向具体人物的人物，输出规范名、别名和一份声线档案。
+
+## 一、人物词典
+- 规范名：此人最完整/最正式的姓名（如"高文·塞西尔"）；同一人只留一条。
+- **输出 JSON 的键必须全部是人物规范名**；禁止出现 aliases/voice/name 这类字段名当键。
+- aliases 只收两类，**共 3~5 个，宁少勿多**：模糊名称（简称/部分写法）+ 具体称谓（能唯一定位的称呼/头衔/绰号）。
+- **已有词典里能对上的就是同一人，必须沿用已有规范名**：已有「高文·塞西尔」就把「高文/老祖宗」并进去，
+  禁止新增「高文」；已有「瑞贝卡·塞西尔」就不要新增「瑞贝卡」。
+- **绝不收**代词/描述性短语/整句/泛称（大人/老爷/小姐/先生/骑士）；不收地名/组织/物品/种族/群体
+  （混血精灵/士兵/众人这类一律不收，只收有名有姓的个人）。
+- 已有条目只增补，不改名、不删除。
+
+## 二、声线档案 voice —— 只定**性别与年龄**（整体、稳定，不受本章剧情影响）
+- age：少年|青年|中年|老年
+- gender：男|女
+- sample：一句**中性陈述**自我介绍，≤30 字，含规范名，**不带情绪/动作/态度称呼**，
+  例："我是高文·塞西尔，很高兴见到你。"
+- **不要**写音色、语速、态度、语气。
+
+只输出 JSON：
+{"规范名": {"aliases": ["高文", "老祖宗"], "voice": {"age": "青年", "gender": "男", "sample": "我是高文·塞西尔，很高兴见到你。"}}}
 """
 
 TOOLS = ["edit"]
+MAX_ALIASES = 5  # per canonical name: fuzzy name + a few specific forms of address
+
+SUMMARY_SYSTEM = """你在维护一部长篇小说的「前情摘要」，供后续章节判断「谁在说话」时做背景。
+输入：上一版摘要、新增章节的出场角色与正文（可能多章）。输出新摘要（≤400 字），只保留判断说话人需要的信息：
+- 人物关系/身份、当前地点与处境、正在发生的事件；新出现的称呼点明归属。
+- 上一版里已经过时或无关的信息删掉；不要文学赏析，不要剧透后文。
+只输出 JSON：{"summary": "……"}"""
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,13 +806,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--count", type=int, default=1)
     parser.add_argument("--book", default="dawn")
     parser.add_argument(
-        "--mode",
-        choices=["seq", "sep"],
-        default="seq",
-        help="seq=reuse one annotation context across chapters; sep=fresh per chapter",
+        "--batch",
+        type=int,
+        default=10,
+        help="rolling context window in chapters: first N chapters are fed in full, then a rolling summary takes over",
     )
     parser.add_argument("--max-steps", type=int, default=200, help="tool steps per chapter")
     parser.add_argument("--force", action="store_true", help="redo chapters that already have a marked file")
+    parser.add_argument("--no-live", action="store_true", help="do not start the live page server")
+    parser.add_argument("--live-port", type=int, default=LIVE_PORT)
     return parser.parse_args()
 
 
@@ -138,66 +828,162 @@ def load_roster(book: str) -> dict[str, list[str]]:
     if not path.is_file():
         return {}
     data = json.loads(path.read_text(encoding="utf-8"))
-    return {name: [label for label in labels if label] for name, labels in data.items()}
+    clean: dict[str, list[str]] = {}
+    # Longest names first: a more complete name wins over its short form when merging duplicates
+    # (e.g. 「高文·塞西尔」 already lists 「高文」).
+    for name in sorted(data, key=len, reverse=True):
+        labels = data[name]
+        if name.lower() in ROSTER_STRUCT_KEYS or not isinstance(labels, list):
+            continue
+        tokens = [name, *(str(label).strip() for label in labels if str(label).strip())]
+        canonical = _merge_canonical(clean, name)
+        if canonical == name:
+            clean[name] = [name] + [label for label in tokens[1:] if label != name][:MAX_ALIASES]
+            continue
+        bucket = clean[canonical]
+        for label in tokens:
+            if label != canonical and label not in bucket:
+                bucket.append(label)
+        clean[canonical] = [canonical] + [label for label in bucket if label != canonical][:MAX_ALIASES]
+    return clean
 
 
-def dict_text(roster: dict[str, list[str]], chapter_text: str) -> str:
-    """Inline only the dictionary entries whose labels appear in this chapter."""
-    lines = []
-    for name, labels in roster.items():
-        if any(label and label in chapter_text for label in labels):
-            lines.append(f"{name}（{'、'.join(dict.fromkeys(labels))}）")
-    return "人物词典（规范名（标签…），role 只能写规范名）：\n- " + "\n- ".join(lines)
+def load_profiles(book: str) -> dict[str, dict]:
+    """Resume per-role voice profiles (age/gender/timbre/pace/sample) from the script dir."""
+    path = APP_ROOT / "outputs" / book / "script" / "voice_profiles.json"
+    if not path.is_file():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data if isinstance(data, dict) else {}
 
 
-def maintain_roster(llm: LLMClient, roster: dict[str, list[str]], chapter_text: str) -> int:
-    """Extract this chapter's new labels and merge them into the dictionary (in place)."""
-    existing = "\n".join(f"{name}: {'、'.join(labels)}" for name, labels in roster.items())
+def save_profiles(book: str, profiles: dict[str, dict]) -> None:
+    path = APP_ROOT / "outputs" / book / "script" / "voice_profiles.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(profiles, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _canonicalize_profiles(profiles: dict[str, dict], roster: dict[str, list[str]]) -> dict[str, dict]:
+    """Move profile entries of merged names onto their canonical entry."""
+    clean: dict[str, dict] = {}
+    for name, profile in profiles.items():
+        clean.setdefault(_merge_canonical(roster, name), profile)
+    return clean
+
+
+def load_summary(book: str) -> str:
+    path = APP_ROOT / "outputs" / book / "script" / "summary.txt"
+    return path.read_text(encoding="utf-8").strip() if path.is_file() else ""
+
+
+def save_summary(book: str, summary: str) -> None:
+    path = APP_ROOT / "outputs" / book / "script" / "summary.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(summary.strip() + "\n", encoding="utf-8")
+
+
+def load_summary_upto(book: str) -> int:
+    path = APP_ROOT / "outputs" / book / "script" / "summary_upto.txt"
+    try:
+        return int(path.read_text(encoding="utf-8").strip()) if path.is_file() else 0
+    except ValueError:
+        return 0
+
+
+def save_summary_upto(book: str, chapter: int) -> None:
+    path = APP_ROOT / "outputs" / book / "script" / "summary_upto.txt"
+    path.write_text(str(chapter), encoding="utf-8")
+
+
+def compress(llm: LLMClient, chapter_text: str, roles: list[str], previous: str) -> str:
+    """One small call per chapter: fold this chapter into the rolling summary (≤400 chars)."""
+    try:
+        result = llm.chat_json(
+            SUMMARY_SYSTEM,
+            f"【上一版摘要】\n{previous or '（无）'}\n\n【本章出场角色】\n{'、'.join(dict.fromkeys(roles)) or '（无）'}\n\n"
+            f"【本章正文】\n{chapter_text}",
+            max_tokens=1024,
+            thinking=False,
+        )
+    except Exception as error:  # noqa: BLE001 - summary is best-effort, keep the old one
+        print(f"  [summary] 压缩失败：{str(error)[:120]}", flush=True)
+        return previous
+    if isinstance(result, dict):
+        summary = str(result.get("summary") or result.get("摘要") or "").strip()
+    else:
+        summary = str(result).strip()
+    return summary or previous
+
+
+# Keys the model sometimes emits as if they were character names; never roster entries.
+ROSTER_STRUCT_KEYS = frozenset(
+    {"aliases", "alias", "voice", "name", "age", "gender", "sample", "规范名", "别名", "声线", "人物", "词典"}
+)
+
+
+def _merge_canonical(roster: dict[str, list[str]], name: str) -> str:
+    """Existing canonical that already lists ``name`` as a label, else ``name`` itself.
+
+    Conservative: only merges when the new name is a known alias of an existing entry, so a
+    model-invented label (e.g. a race) can never capture an existing character."""
+    return next((canonical for canonical, existing in roster.items() if name in existing), name)
+
+
+def maintain_roster(llm: LLMClient, roster: dict[str, list[str]], profiles: dict[str, dict], chapter_text: str) -> int:
+    """Extract this chapter's labels + voice profiles and merge them in place."""
+    existing = "\n".join(
+        f"{name}: {'、'.join(labels)}" + (f"  voice={profiles[name]}" if name in profiles else "")
+        for name, labels in roster.items()
+    )
     try:
         result = llm.chat_json(
             ROSTER_SYSTEM,
-            f"【已有词典】\n{existing}\n\n【本章正文】\n{chapter_text}",
-            thinking=THINK,
+            f"【已有词典】\n{existing or '（空）'}\n\n【本章正文】\n{chapter_text}",
+            thinking=False,  # extraction task: thinking only risks echoing the prompt / truncating JSON
         )
     except Exception as error:  # noqa: BLE001 - dictionary is best-effort
         print(f"  [roster] 维护失败：{str(error)[:120]}", flush=True)
         return 0
-    if not isinstance(result, dict):
+    if isinstance(result, dict):  # tolerate wrapper keys the model likes to add
+        for key in ("人物词典", "roles", "人物", "characters", "roster"):
+            if key in result and isinstance(result[key], (dict, list)):
+                result = result[key]
+                break
+        items = list(result.items())
+    elif isinstance(result, list):  # tolerate [{"规范名": ..., "aliases": [...]}, ...]
+        items = [
+            (item.get("规范名") or item.get("name") or item.get("canonical") or "", item)
+            for item in result
+            if isinstance(item, dict)
+        ]
+    else:
         return 0
     added = 0
-    for name, labels in result.items():
+    for name, entry in items:
         name = str(name).strip()
-        if not name:
+        if not name or name.lower() in ROSTER_STRUCT_KEYS:
             continue
-        bucket = roster.setdefault(name, [name])
-        for label in labels if isinstance(labels, list) else []:
-            label = str(label).strip()
-            if label and label not in bucket:
+        if isinstance(entry, dict):
+            labels = [str(label).strip() for label in entry.get("aliases") or [] if str(label).strip()]
+            voice = entry.get("voice") or {}
+        elif isinstance(entry, list):  # tolerate the older {"name": [labels]} shape
+            labels, voice = [str(label).strip() for label in entry if str(label).strip()], {}
+        else:
+            labels, voice = [], {}
+        canonical = _merge_canonical(roster, name)
+        if canonical != name and name in profiles and canonical not in profiles:
+            profiles[canonical] = profiles.pop(name)
+        bucket = roster.setdefault(canonical, [canonical])
+        for label in [name, *labels]:
+            if label and label != canonical and label not in bucket:
                 bucket.append(label)
                 added += 1
-    if added:
-        print(f"  [roster] 新增 {added} 个标签，词条 {len(roster)}", flush=True)
+        roster[canonical] = [canonical] + [label for label in bucket if label != canonical][:MAX_ALIASES]
+        if isinstance(voice, dict) and voice.get("sample"):
+            profiles.setdefault(canonical, {key: str(value).strip() for key, value in voice.items() if value})
+    if added or profiles:
+        print(f"  [roster] +{added} 标签 · 词条 {len(roster)} · 声线 {len(profiles)}", flush=True)
     return added
-
-
-def update_summary(llm: LLMClient, summary: str, chapter_text: str) -> str:
-    """Fold this chapter into the rolling summary, AT THE CHAPTER'S START.
-
-    The result is used twice: as reading context for marking this chapter, and as the
-    rolling memory carried into the next one (reused, not recomputed).
-    """
-    try:
-        return llm.chat(
-            [
-                {"role": "system", "content": SUMMARY_SYSTEM},
-                {"role": "user", "content": f"【已有摘要】\n{summary or '（无）'}\n\n【本章正文】\n{chapter_text[-5000:]}"},
-            ],
-            max_tokens=700,
-            thinking=False,
-        ).strip()
-    except Exception as error:  # noqa: BLE001 - summary is best-effort
-        print(f"  [summary] 失败：{str(error)[:120]}", flush=True)
-        return summary
 
 
 def resolve_label(roster: dict[str, list[str]], name: str) -> str:
@@ -211,14 +997,67 @@ def resolve_label(roster: dict[str, list[str]], name: str) -> str:
     return name
 
 
+_THOUGHT_RE = re.compile(r"<\|?channel\|?>.*?<\|?channel\|>", re.DOTALL)
+
+
+def _clean_assistant(content: str) -> str:
+    """Strip gemma's leaked thought channel from assistant content before it enters history."""
+    content = _THOUGHT_RE.sub("", content or "")
+    for token in ("<|channel>", "<channel|>", "<|channel|>"):
+        content = content.replace(token, "")
+    return content.strip()
+
+
+def _parse_args(raw: str | None) -> dict | None:
+    try:
+        data = json.loads(raw or "{}")
+    except Exception:  # noqa: BLE001 - malformed tool-call JSON
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _extract_edit(content: str) -> dict | None:
+    """E4B often writes the edit as a JSON object in the text instead of a tool call."""
+    from audiobook.llm import extract_json
+
+    try:
+        data = extract_json(content)
+    except Exception:  # noqa: BLE001 - no JSON in the reply
+        return None
+    if isinstance(data, dict) and ("op" in data or "role" in data or "find" in data or "text" in data):
+        return data
+    return None
+
+
+def pending_quotes(marked: str) -> list[str]:
+    """Quoted spans worth sending back to the model: empty / punctuation-only spans carry no
+    dialogue (they are cleaned mechanically at chapter end) and only cause hallucinated targets."""
+    return [span for span in unmarked_quotes(marked) if any(char.isalnum() for char in span[1:-1])]
+
+
 def run_turn(
     client, config, tools, mcp, messages, max_steps, counters, live: Live | None = None, chapter: int = 0, original: str = ""
-) -> None:
-    """Tool loop until the model stops calling tools. Guards against a failing retry loop."""
+) -> int:
+    """Tool loop until the model stops calling tools. Guards against a failing retry loop.
+
+    Returns the number of successful edits (0 = nothing changed)."""
     errors = 0
+    edits_ok = 0
     last_sig, repeats, fail_total = "", 0, 0
     for _step in range(1, max_steps + 1):
         started = time.perf_counter()
+        raw_log(
+            {
+                "kind": "request",
+                "source": "mark",
+                "chapter": chapter,
+                "step": _step,
+                "model": config.model,
+                "thinking": THINK,
+                "messages": messages,
+                "tools": [tool["function"]["name"] for tool in tools or []],
+            }
+        )
         try:
             response = client.chat.completions.create(
                 model=config.model,
@@ -234,28 +1073,99 @@ def run_turn(
             errors += 1
             print(f"  [llm] error {errors}: {str(error)[:140]}", flush=True)
             if errors > 6:
-                return
+                return edits_ok
             messages.append({"role": "user", "content": "上一条工具调用参数 JSON 非法；请一次只改一处后重试。"})
             continue
-        counters["llm_s"] += time.perf_counter() - started
+        duration = time.perf_counter() - started
+        counters["llm_s"] += duration
         counters["llm_calls"] += 1
         message = response.choices[0].message
+        raw_log(
+            {
+                "kind": "response",
+                "source": "mark",
+                "chapter": chapter,
+                "step": _step,
+                "model": config.model,
+                "duration_s": round(duration, 2),
+                "content": message.content,
+                "reasoning": reasoning_of(message),
+                "finish_reason": response.choices[0].finish_reason,
+                "tool_calls": [
+                    {"name": call.function.name, "arguments": call.function.arguments} for call in (message.tool_calls or [])
+                ],
+                "usage": response.usage.model_dump() if response.usage else None,
+            }
+        )
+        content = _clean_assistant(message.content or "")
         tool_calls = [
             {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
             for tc in (message.tool_calls or [])
         ]
-        messages.append({"role": "assistant", "content": message.content or "", "tool_calls": tool_calls or None})
-        if live is not None and message.content:
-            live.emit("assistant", chapter=chapter, content=message.content[:2000])
+        messages.append({"role": "assistant", "content": content, "tool_calls": tool_calls or None})
+        if live is not None and content:
+            live.emit("assistant", chapter=chapter, content=content[:2000])
         if not tool_calls:
-            return
-        for call in tool_calls:
+            edit = _extract_edit(content)  # E4B often writes the edit as text JSON
+            if edit is None:
+                return edits_ok
+            if "role" in edit and "op" not in edit:
+                edit["op"] = "speak"
             try:
-                arguments = json.loads(call["function"]["arguments"] or "{}")
-            except json.JSONDecodeError:
-                arguments = {}
+                result = mcp.call("edit", edit)
+            except Exception as error:  # noqa: BLE001
+                result = json.dumps({"ok": False, "reason": f"tool error: {error}"}, ensure_ascii=False)
+            counters["tool_calls"] += 1
+            print(f"  edit(text) {str(edit)[:60]} -> {result[:70]}", flush=True)
+            if live is not None:
+                live.emit("tool", chapter=chapter, call="edit", args=edit)
+                live.emit(
+                    "result", chapter=chapter, ok=('"ok": false' not in result and "not found" not in result), result=result[:500]
+                )
+            messages.append({"role": "user", "content": f"工具结果：{result}"})
+            sig = json.dumps(edit, ensure_ascii=False, sort_keys=True)
+            if '"ok": false' in result or "not found" in result:
+                fail_total += 1
+                repeats = repeats + 1 if sig == last_sig else 0
+                last_sig = sig
+                left = pending_quotes(json.loads(mcp.call("get_marked", {}))["text"])
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "找不到目标。还没处理的引号：\n"
+                        + "\n".join(left[:40])
+                        + "\n逐字复制其中一段；被旁白或归属隔开的多段不要拼在一起，一段一次 speak；"
+                        "不在列表里的说明已处理，不要重试；没有就停下。",
+                    }
+                )
+                if repeats >= 3 or fail_total >= 12:
+                    return edits_ok
+            else:
+                edits_ok += 1
+                last_sig, repeats = "", 0
+            continue
+        for call in tool_calls:
+            arguments = _parse_args(call["function"]["arguments"])
+            if arguments is None:  # malformed JSON: tell the model and move on (never crash)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": '{"ok": false, "reason": "arguments 不是合法 JSON，请一次只改一处，用 {"op":...} 重发"}',
+                    }
+                )
+                messages.append({"role": "user", "content": "上一条工具调用参数不是合法 JSON；请一次只改一处后重试。"})
+                errors += 1
+                if errors > 12:
+                    return edits_ok
+                continue
+            if "role" in arguments and "op" not in arguments:
+                arguments["op"] = "speak"
             sig = call["function"]["name"] + call["function"]["arguments"]
-            result = mcp.call(call["function"]["name"], arguments)
+            try:
+                result = mcp.call(call["function"]["name"], arguments)
+            except Exception as error:  # noqa: BLE001 - bad args must not kill the run
+                result = json.dumps({"ok": False, "reason": f"tool error: {error}"}, ensure_ascii=False)
             counters["tool_calls"] += 1
             print(f"  {call['function']['name']} {str(arguments)[:60]} -> {result[:70]}", flush=True)
             if live is not None:
@@ -270,21 +1180,38 @@ def run_turn(
                 fail_total += 1
                 repeats = repeats + 1 if sig == last_sig else 0
                 last_sig = sig
-                left = unmarked_quotes(json.loads(mcp.call("get_marked", {}))["text"])
+                left = pending_quotes(json.loads(mcp.call("get_marked", {}))["text"])
                 messages.append(
                     {
                         "role": "user",
                         "content": "找不到目标。当前还没处理的引号是：\n"
                         + "\n".join(left[:40])
-                        + "\n\n只从这些里挑一处，用 ≤6 个字的片段重试；没有就结束。",
+                        + "\n\n逐字复制其中一段重试；被旁白或归属隔开的多段不要拼在一起，一段一次 speak；"
+                        "不在列表里的说明已处理，不要重试；没有就结束。",
                     }
                 )
                 if fail_total >= 5:
-                    return
+                    return edits_ok
+            else:
+                edits_ok += 1
+    return edits_ok
+
+
+def _stage_note(book: str, status: str, note: str) -> None:
+    import json as _json
+    import time as _time
+
+    path = APP_ROOT / "outputs" / book / "pipeline.json"
+    data = _json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {"stages": {}}
+    data.setdefault("stages", {})["script"] = {"status": status, "note": note, "ts": _time.time()}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def main() -> None:
     args = parse_args()
+    if not args.no_live:
+        ensure_live_server(args.live_port)
     config = config_from_env()
     if config is None:
         raise SystemExit("no LLM configured")
@@ -300,92 +1227,140 @@ def main() -> None:
     chapters = APP_ROOT / "outputs" / args.book / "chapters"
     out_dir = APP_ROOT / "outputs" / args.book / "script"
     out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "llm_raw.jsonl").write_text("", encoding="utf-8")
+    os.environ["AUDIOBOOK_LLM_RAW_LOG"] = str(out_dir / "llm_raw.jsonl")
     if args.count > 0:
         ids = [cid for cid in range(args.chapter, args.chapter + args.count) if (chapters / f"ch{cid:03d}.txt").is_file()]
     else:  # count<=0 -> every chapter from `chapter` to the end
         ids = [cid for cid in sorted(int(p.stem[2:]) for p in chapters.glob("ch*.txt")) if cid >= args.chapter]
 
     live = Live(out_dir / "live.jsonl")
-    live.emit("start", total=len(ids), book=args.book, mode=args.mode)
+    live.emit("start", total=len(ids), book=args.book, batch=args.batch)
     roster = load_roster(args.book)
+    profiles = _canonicalize_profiles(load_profiles(args.book), roster)
+    if roster:
+        print(f"[resume] 已有词条 {len(roster)}", flush=True)
     counters = {"llm_s": 0.0, "llm_calls": 0, "tool_calls": 0}
     started = time.perf_counter()
     phases: list[dict] = []
-    summary = ""  # seq: one rolling conversation, compressed after every chapter
+
+    window = max(1, args.batch)  # first `window` chapters are fed in full, then the summary rolls
+    summary = load_summary(args.book)
+    summary_upto = load_summary_upto(args.book)
+    if summary:
+        print(f"[resume] 前情摘要 {len(summary)} 字（已含至第 {summary_upto} 章）", flush=True)
+
+    def chapter_path(cid: int) -> Path:
+        return chapters / f"ch{cid:03d}.txt"
+
+    def roles_in(cid: int) -> list[str]:
+        marked = out_dir / f"ch{cid:03d}.marked.txt"
+        if not marked.is_file():
+            return []
+        return [seg["role_name"] for seg in parse_marks(marked.read_text(encoding="utf-8")) if seg["kind"] == "speech"]
+
+    def seed_summary() -> None:
+        """First summary, built from the whole accumulated window in one call."""
+        nonlocal summary, summary_upto
+        block = "\n\n".join(f"【第 {k} 章】\n{chapter_path(k).read_text(encoding='utf-8')}" for k in range(1, window + 1))
+        summary = compress(llm, block, [role for k in range(1, window + 1) for role in roles_in(k)], "")
+        summary_upto = window
+        save_summary(args.book, summary)
+        save_summary_upto(args.book, summary_upto)
+        print(f"  [summary] 窗口前 {window} 章 -> {len(summary)} 字", flush=True)
+
+    def fold_through(cid: int) -> None:
+        """Make the summary cover chapters 1..cid; no-op while the window is still filling."""
+        nonlocal summary, summary_upto
+        if cid < window:
+            return
+        if summary_upto < window:
+            seed_summary()
+        while summary_upto < cid:
+            k = summary_upto + 1
+            summary = compress(llm, chapter_path(k).read_text(encoding="utf-8"), roles_in(k), summary)
+            summary_upto = k
+            save_summary(args.book, summary)
+            save_summary_upto(args.book, summary_upto)
+            print(f"  [summary] +第 {k} 章 -> {len(summary)} 字", flush=True)
+
+    def prior_context(cid: int) -> str:
+        """Full previous chapters while the window fills; the rolling summary afterwards."""
+        if cid <= window:
+            prior = "\n\n".join(f"【第 {k} 章】\n{chapter_path(k).read_text(encoding='utf-8')}" for k in range(1, cid))
+            return (
+                f"【前情（第 1..{cid - 1} 章原文，仅用于判断说话人；这些章节的引号都已处理，不要处理）】\n{prior}"
+                if prior
+                else "（本章是开头）"
+            )
+        return f"【前情摘要】\n{summary or '（无）'}"
 
     for cid in ids:
         target = out_dir / f"ch{cid:03d}.marked.txt"
-        if target.is_file() and not args.force:  # resumable: skip chapters already marked
+        raw_text = chapter_path(cid).read_text(encoding="utf-8")
+        skipped = target.is_file() and not args.force
+        if skipped:  # resumable: skip chapters already marked
+            snapshot = target.read_text(encoding="utf-8")
             if not (out_dir / f"ch{cid:03d}.json").is_file():  # backfill canvas state for the picker
-                done = target.read_text(encoding="utf-8")
-                live.set_state(
-                    cid, len(done), live_fragments((chapters / f"ch{cid:03d}.txt").read_text(encoding="utf-8"), done), done=True
-                )
+                live.set_state(cid, len(snapshot), live_fragments(raw_text, snapshot), done=True)
             print(f"[skip] ch{cid:03d} 已存在", flush=True)
-            continue
-        text = (chapters / f"ch{cid:03d}.txt").read_text(encoding="utf-8")
-        live.emit("chapter", chapter=cid, chars=len(text))
-        live.set_state(cid, len(text), live_fragments(text, text))
-        added = maintain_roster(llm, roster, text)  # mine characters when the big text is injected
-        live.emit("roster", chapter=cid, added=added, roles=len(roster))
-        summary = update_summary(llm, summary, text)  # rolling summary: reused for marking AND next chapter
-        (out_dir / "summary.txt").write_text(summary, encoding="utf-8")
-        system = (THINK_TOKEN if THINK else "") + SYSTEM + "\n\n" + dict_text(roster, text)
-        preface = f"【前情摘要】\n{summary}\n\n" if (args.mode == "seq" and summary) else ""
-        mcp.call("set_text", {"text": text})
-        run_turn(
-            client,
-            config,
-            tools,
-            mcp,
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": f"{preface}处理第 {cid} 章：\n{text}"},
-            ],
-            args.max_steps,
-            counters,
-            live,
-            cid,
-            text,
-        )
-        for _ in range(3):  # completeness: re-feed leftover quotes until none remain
-            left = unmarked_quotes(json.loads(mcp.call("get_marked", {}))["text"])
-            if not left:
-                break
-            run_turn(
-                client,
-                config,
-                tools,
-                mcp,
-                [
-                    {"role": "system", "content": system},
+        else:
+            # Per-chapter dictionary: only this chapter's text, so the model keeps a small context.
+            added = maintain_roster(llm, roster, profiles, raw_text)
+            (out_dir / "roles.json").write_text(json.dumps(roster, ensure_ascii=False, indent=2), encoding="utf-8")
+            save_profiles(args.book, profiles)
+            live.emit("roster", chapter=cid, added=added, roles=len(roster))
+            names = "、".join(roster)  # consistency hint, not a gate: new names are registered as seen
+            hint = f"已有人物（尽量沿用这些名字）：{names}\n\n" if names else ""
+            live.emit("chapter", chapter=cid, chars=len(raw_text))
+            live.set_state(cid, len(raw_text), live_fragments(raw_text, raw_text))
+            mcp.call("set_text", {"text": raw_text})
+            fold_through(cid - 1)  # summary must cover everything before this chapter
+            think = config.thinking_system_token if THINK else ""  # profile-driven (Gemma: "<|think|>", Qwen: none)
+            messages = [
+                {"role": "system", "content": f"{think}{LOCAL_SYSTEM}\n\n{hint}"},
+                *FEW_SHOT,
+                {"role": "user", "content": f"{prior_context(cid)}\n\n【本章正文（只处理这里的引号）】\n{raw_text}"},
+                {"role": "user", "content": STEP_MARK},
+            ]
+            run_turn(client, config, tools, mcp, messages, args.max_steps, counters, live, cid, raw_text)
+            snapshot = json.loads(mcp.call("get_marked", {}))["text"]
+            # Completeness: only quotes STILL in the current text are unhandled. A quote already
+            # handled (speak consumed it / delete removed the marks) must not be sent again.
+            for _round in range(3):
+                pending = pending_quotes(snapshot)
+                if not pending:
+                    break
+                messages.append(
                     {
                         "role": "user",
-                        "content": "还有这些引号没处理（是台词就 edit(op=speak)，否则 edit(op=delete)，逐处调用）：\n"
-                        + "\n".join(left[:60]),
-                    },
-                ],
-                args.max_steps,
-                counters,
-                live,
-                cid,
-                text,
-            )
-        snapshot = json.loads(mcp.call("get_marked", {}))["text"]
-        for seg in parse_marks(snapshot):  # normalise any label/alias to the canonical name
-            if seg["kind"] != "speech":
-                continue
-            canonical = resolve_label(roster, seg["role_name"])
-            if canonical != seg["role_name"]:
-                snapshot = snapshot.replace(f"{MARK_OPEN}{seg['role_name']}{MARK_SEP}", f"{MARK_OPEN}{canonical}{MARK_SEP}")
-        (out_dir / f"ch{cid:03d}.marked.txt").write_text(snapshot, encoding="utf-8")
-        (out_dir / "roles.json").write_text(json.dumps(roster, ensure_ascii=False, indent=2), encoding="utf-8")
-        left = len(unmarked_quotes(snapshot))
-        phases.append({"chapter": cid, "chars": len(snapshot), "leftover": left, "roles": len(roster)})
-        print(f"[{args.mode}] ch{cid:03d} chars={len(snapshot)} leftover={left} 词条={len(roster)}", flush=True)
-        live.set_state(cid, len(snapshot), live_fragments(text, snapshot), done=True)
-        live.emit("done", chapter=cid, leftover=left, roles=len(roster), summary=summary)
-    (out_dir / "summary.txt").write_text(summary, encoding="utf-8")
+                        "content": f"当前文本里还有 {len(pending)} 处引号没处理（逐字复制，**不带引号**）：\n"
+                        + "\n".join(f"- {item[1:-1]}" for item in pending[:40])
+                        + "\n只处理下面列出的这些：是人物对话就 speak（原文 + 规范名，引号由 MCP 清除）；"
+                        "只是强调/术语就 delete（去引号留字）；列表之外的一律不要调用工具，也不要说找不到目标。处理完停下。",
+                    }
+                )
+                if run_turn(client, config, tools, mcp, messages, args.max_steps, counters, live, cid, raw_text) == 0:
+                    break  # no progress -> stop instead of looping on failing/hallucinated targets
+                snapshot = json.loads(mcp.call("get_marked", {}))["text"]
+            for seg in parse_marks(snapshot):  # normalise any label/alias to the canonical name
+                if seg["kind"] != "speech":
+                    continue
+                canonical = resolve_label(roster, seg["role_name"])
+                if canonical != seg["role_name"]:
+                    snapshot = snapshot.replace(f"<{seg['role_name']}>", f"<{canonical}>")
+            snapshot, leftover = strip_quotes(snapshot)  # safety net: attention quotes the model missed
+            if leftover:
+                print(f"  [clean] ch{cid:03d} 机械去除残留引号 {leftover} 处", flush=True)
+            (out_dir / f"ch{cid:03d}.marked.txt").write_text(snapshot, encoding="utf-8")
+            (out_dir / "roles.json").write_text(json.dumps(roster, ensure_ascii=False, indent=2), encoding="utf-8")
+            save_profiles(args.book, profiles)
+            phases.append({"chapter": cid, "chars": len(snapshot), "roles": len(roster)})
+            print(f"[mark] ch{cid:03d} chars={len(snapshot)} 词条={len(roster)}", flush=True)
+            _stage_note(args.book, "run", f"{len(phases)}/{len(ids)}")
+            live.set_state(cid, len(snapshot), live_fragments(raw_text, snapshot), done=True)
+        fold_through(cid)  # skipped or marked: keep the rolling summary current
+        live.emit("done", chapter=cid, roles=len(roster), summary=summary[:200])
 
     marked = "\n".join((out_dir / f"ch{cid:03d}.marked.txt").read_text(encoding="utf-8") for cid in ids)
     print(f"[check] 未标记的引号 {len(unmarked_quotes(marked))} 处", flush=True)
@@ -399,7 +1374,7 @@ def main() -> None:
     timing = {
         "start": args.chapter,
         "count": len(ids),
-        "mode": args.mode,
+        "batch": args.batch,
         "wall_s": round(time.perf_counter() - started, 1),
         "llm_s": round(counters["llm_s"], 1),
         "llm_calls": counters["llm_calls"],

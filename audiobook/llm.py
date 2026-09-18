@@ -10,7 +10,8 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Qwen3.8-27B README "Best Practices" - thinking mode sampling.
@@ -20,6 +21,99 @@ DEFAULT_TOP_K = 20
 DEFAULT_MIN_P = 0.0
 DEFAULT_PRESENCE_PENALTY = 0.0
 DEFAULT_REPETITION_PENALTY = 1.0
+
+
+@dataclass
+class ModelProfile:
+    key: str
+    repo: str
+    gguf: str
+    arch: str
+    context: int
+    temperature: float = 1.0
+    top_p: float = 0.95
+    top_k: int = 20
+    min_p: float = 0.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    max_tokens: int = 4096
+    thinking_off_kwargs: dict = field(default_factory=dict)
+    thinking_system_token: str = ""
+    notes: str = ""
+
+
+# Qwen3.5 official sampling (model card "Best Practices") + froggeric template for Qwen3.8.
+PROFILES: dict[str, ModelProfile] = {
+    "qwen3.5-9b": ModelProfile(
+        key="qwen3.5-9b",
+        repo="unsloth/Qwen3.5-9B-MTP-GGUF",
+        gguf="ckpts/llm/Qwen3.5-9B-UD-Q4_K_XL.gguf",
+        arch="qwen35 (dense, built-in MTP head)",
+        context=262144,
+        temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        min_p=0.0,
+        presence_penalty=1.5,
+        repetition_penalty=1.0,
+        thinking_off_kwargs={"enable_thinking": False},
+        thinking_system_token="",
+        notes="Official Qwen3.5 thinking-mode sampling; tool calls via the model's own chat template "
+        "(do NOT pass qwen_chat_template.jinja); MTP speculation: --spec-type draft-mtp --spec-draft-n-max 6.",
+    ),
+    "gemma-4-e4b": ModelProfile(
+        key="gemma-4-e4b",
+        repo="unsloth/gemma-4-E4B-it-qat-GGUF",
+        gguf="ckpts/llm/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf",
+        arch="gemma4 (E4B, QAT Q4, MTP)",
+        context=131072,
+        temperature=1.0,
+        top_p=0.95,
+        top_k=64,
+        min_p=0.0,
+        presence_penalty=0.0,
+        repetition_penalty=1.0,
+        thinking_off_kwargs={"enable_thinking": False},
+        thinking_system_token="<|think|>",
+        notes="Official sampling; thinking via <|think|> at system start; native MTP draft.",
+    ),
+    "ornith-1.5-9b": ModelProfile(
+        key="ornith-1.5-9b",
+        repo="ornith-ai/Ornith-1.5-9B-GGUF",
+        gguf="ckpts/llm/Ornith-1.5-9B-Q8_0.gguf",
+        arch="qwen3.5 (Ornith-1.5 9B dense, reasoning)",
+        context=262144,
+        temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        min_p=0.0,
+        presence_penalty=1.5,
+        repetition_penalty=1.0,
+        notes="Official sampling; built-in Qwen template (do not pass qwen_chat_template.jinja); "
+        "thinking by default, tool calls via <tool_call> parsed by llama.cpp --jinja.",
+    ),
+    "qwen3.8-27b": ModelProfile(
+        key="qwen3.8-27b",
+        repo="unsloth/Qwen3.8-27B-GGUF",
+        gguf="ckpts/llm/Qwen3.8-27B-UD-IQ4_XS.gguf",
+        arch="qwen3.8 (dense)",
+        context=262144,
+        temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        min_p=0.0,
+        presence_penalty=0.0,
+        repetition_penalty=1.0,
+        thinking_off_kwargs={"enable_thinking": False},
+        notes="assets/llm/qwen_chat_template.jinja (froggeric v22.5); reasoning in reasoning_content.",
+    ),
+}
+
+DEFAULT_PROFILE = "qwen3.5-9b"
+
+
+def get_profile(name: str | None = None) -> ModelProfile:
+    return PROFILES.get(name or DEFAULT_PROFILE, PROFILES[DEFAULT_PROFILE])
 
 
 @dataclass
@@ -34,11 +128,10 @@ class LLMConfig:
     presence_penalty: float = DEFAULT_PRESENCE_PENALTY
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY
     max_tokens: int = 4096
+    thinking_system_token: str = ""
 
 
 def config_from_env() -> LLMConfig | None:
-    from .models import get_profile
-
     base_url = os.environ.get("AUDIOBOOK_LLM_BASE_URL") or os.environ.get("LLM_BASE_URL")
     api_key = os.environ.get("AUDIOBOOK_LLM_API_KEY") or os.environ.get("LLM_API_KEY") or "sk-local"
     model = os.environ.get("AUDIOBOOK_LLM_MODEL") or os.environ.get("LLM_MODEL_NAME")
@@ -56,12 +149,37 @@ def config_from_env() -> LLMConfig | None:
         presence_penalty=profile.presence_penalty,
         repetition_penalty=profile.repetition_penalty,
         max_tokens=int(os.environ.get("AUDIOBOOK_LLM_MAX_TOKENS", profile.max_tokens)),
+        thinking_system_token=profile.thinking_system_token,
     )
 
 
 def prompt_hash(*parts: str) -> str:
     digest = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
     return digest[:16]
+
+
+def reasoning_of(message) -> str | None:
+    """``reasoning_content`` for llama.cpp ``--reasoning-format deepseek`` replies."""
+    value = getattr(message, "reasoning_content", None)
+    if value:
+        return str(value)
+    extra = getattr(message, "model_extra", None) or {}
+    return extra.get("reasoning_content")
+
+
+def raw_log(record: dict) -> None:
+    """Append one raw LLM I/O record to ``AUDIOBOOK_LLM_RAW_LOG`` (JSONL) when set."""
+    path = os.environ.get("AUDIOBOOK_LLM_RAW_LOG")
+    if not path:
+        return
+    record["ts"] = round(time.time(), 3)
+    try:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def extract_json(text: str) -> dict | list:
@@ -137,6 +255,18 @@ class LLMClient:
         extra: dict = {}
         if json_mode:
             extra["response_format"] = {"type": "json_object"}
+        raw_log(
+            {
+                "kind": "request",
+                "source": "llm",
+                "model": config.model,
+                "messages": messages,
+                "thinking": thinking,
+                "json_mode": json_mode,
+                "max_tokens": max_tokens or config.max_tokens,
+            }
+        )
+        started = time.perf_counter()
         response = self.client.chat.completions.create(
             model=config.model,
             messages=messages,
@@ -147,7 +277,20 @@ class LLMClient:
             extra_body=extra_body,
             **extra,
         )
-        text = response.choices[0].message.content or ""
+        message = response.choices[0].message
+        text = message.content or ""
+        raw_log(
+            {
+                "kind": "response",
+                "source": "llm",
+                "model": config.model,
+                "duration_s": round(time.perf_counter() - started, 2),
+                "content": message.content,
+                "reasoning": reasoning_of(message),
+                "finish_reason": response.choices[0].finish_reason,
+                "usage": response.usage.model_dump() if response.usage else None,
+            }
+        )
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_path.write_text(json.dumps({"text": text}, ensure_ascii=False), encoding="utf-8")
