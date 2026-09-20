@@ -46,6 +46,18 @@ from audiobook.marks import (  # noqa: E402
 )
 from audiobook.schema import Cast  # noqa: E402
 
+LLM_BASE_URL = os.environ.get("AUDIOBOOK_LLM_BASE_URL", "http://127.0.0.1:8080/v1")
+
+
+def _llm_health() -> bool:
+    """Check if the local LLM server is reachable (GET /models)."""
+    try:
+        req = urllib.request.Request(LLM_BASE_URL.rstrip("/") + "/models")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return resp.status == 200
+    except Exception:  # noqa: BLE001
+        return False
+
 
 OPEN = "“『「"
 CLOSE = "”』」"
@@ -1462,6 +1474,7 @@ INJECT_NEIGHBORS = os.environ.get("AUDIOBOOK_INJECT_NEIGHBORS", "1") == "1"
 OPENING_CHAPTERS = 5  # chapters 1-5 are marked with the whole 1..5 block as context
 PREV_CHAPTERS = 4  # from chapter 6 on: a rolling window of the previous 4 chapters
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("chapter", type=int, help="first chapter id")
@@ -1507,9 +1520,7 @@ def load_roster(book: str) -> dict[str, list[str]]:
 
 
 # Keys the model sometimes emits as if they were character names; never roster entries.
-ROSTER_STRUCT_KEYS = frozenset(
-    {"aliases", "alias", "name", "规范名", "别名", "人物", "词典"}
-)
+ROSTER_STRUCT_KEYS = frozenset({"aliases", "alias", "name", "规范名", "别名", "人物", "词典"})
 
 
 def _same_person(roster: dict[str, list[str]], existing: str, name: str, labels: list[str]) -> bool:
@@ -1932,6 +1943,11 @@ def main() -> None:
 
     live = Live(out_dir / "live.jsonl")
     live.emit("start", total=len(ids), book=args.book, batch=args.batch)
+    # write initial progress
+    (out_dir / "progress.json").write_text(
+        json.dumps({"current": 0, "total": len(ids), "done": 0, "phase": "starting"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
     roster = load_roster(args.book)
     if roster:
         print(f"[resume] 已有词条 {len(roster)}", flush=True)
@@ -1964,7 +1980,18 @@ def main() -> None:
                 parts.append(f"【前文·第 {other} 章（仅供判断人物/称呼，不要标注）】\n{path.read_text(encoding='utf-8')}")
         return "\n\n".join(parts)
 
+    pause_file = out_dir / ".paused"
     for cid in ids:
+        # --- pause gate: sleep until .paused is removed ---
+        while pause_file.is_file():
+            print(f"[pause] ch{cid:03d} 暂停中，等待恢复…", flush=True)
+            live.emit("pause", chapter=cid)
+            time.sleep(3)
+        # --- LLM health gate: stop if LLM is down ---
+        if not _llm_health():
+            print(f"[stop] ch{cid:03d} LLM 不可用，停止标注", flush=True)
+            live.emit("stop", chapter=cid, reason="LLM 不可用")
+            break
         target = out_dir / f"ch{cid:03d}.marked.txt"
         raw_text = chapter_path(cid).read_text(encoding="utf-8")
         skipped = target.is_file() and not args.force
@@ -2045,6 +2072,9 @@ def main() -> None:
             live.emit("missed", chapter=cid, count=len(missed), samples=[item["text"][:20] for item in missed[:5]])
             _stage_note(args.book, "run", f"{len(phases)}/{len(ids)}")
             live.set_state(cid, len(snapshot), live_fragments(raw_text, snapshot), done=True)
+            # write progress for dashboard polling
+            progress = {"current": cid, "total": len(ids), "done": len(phases), "phase": "marking"}
+            (out_dir / "progress.json").write_text(json.dumps(progress, ensure_ascii=False), encoding="utf-8")
         live.emit("done", chapter=cid, roles=len(roster))
 
     marked = "\n".join((out_dir / f"ch{cid:03d}.marked.txt").read_text(encoding="utf-8") for cid in ids)
@@ -2068,6 +2098,14 @@ def main() -> None:
     }
     print(f"\n[timing] {json.dumps(timing, ensure_ascii=False)}")
     print(f"[html] {out_dir / f'{stem}.html'}")
+    # final progress + cleanup
+    (out_dir / "progress.json").write_text(
+        json.dumps({"current": ids[-1] if ids else 0, "total": len(ids), "done": len(ids), "phase": "done"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    pause_file = out_dir / ".paused"
+    if pause_file.is_file():
+        pause_file.unlink()
 
 
 if __name__ == "__main__":

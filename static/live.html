@@ -56,6 +56,12 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d1219;border
 </style></head><body>
 <header>
   <div class="brand">实时标记 <small id="book">· live</small></div>
+  <div style="display:flex;align-items:center;gap:8px;font-size:12px">
+    <span class="dot" id="llmDot" style="width:6px;height:6px;border-radius:50%;background:var(--dim)"></span>
+    <span id="llmLabel" class="muted">LLM: ?</span>
+    <span style="color:var(--line)">|</span>
+    <span id="scriptLabel" class="muted">标注: ?</span>
+  </div>
   <span class="grow"></span>
   <nav>
     <a href="/dashboard">看板</a>
@@ -64,7 +70,6 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d1219;border
     <a id="rawpage" href="#">LLM原始IO</a>
     <a id="ttslink" href="/tts">TTS测试</a>
   </nav>
-  <span class="dot"></span>
 </header>
 <div id="main">
   <div id="left">
@@ -228,5 +233,17 @@ async function tickState(){
 }
 chs.addEventListener('change',function(){selected=+chs.value;follow=false;followBtn.classList.remove('on');prevSig='';});
 followBtn.addEventListener('click',function(){follow=true;followBtn.classList.add('on');if(current)selected=current;prevSig='';});
+async function pollStatus(){
+  try{
+    const st = await (await fetch("/status.json?book="+encodeURIComponent(BOOK)+"&t="+Date.now(),{cache:"no-store"})).json();
+    const llmDot=document.getElementById("llmDot"), llmLabel=document.getElementById("llmLabel"), scriptLabel=document.getElementById("scriptLabel");
+    if(st.llm&&st.llm.up){llmDot.style.background="var(--ok)";llmLabel.textContent="LLM: 已启动";llmLabel.style.color="var(--ok)";}
+    else{llmDot.style.background="var(--bad)";llmLabel.textContent="LLM: 未启动";llmLabel.style.color="var(--dim)";}
+    const sc=st.script||{};
+    if(sc.running){scriptLabel.textContent="标注: "+(sc.paused?"已暂停":"运行中");scriptLabel.style.color=sc.paused?"var(--warn)":"var(--ok)";}
+    else{scriptLabel.textContent="标注: 未启动";scriptLabel.style.color="var(--dim)";}
+  }catch(e){}
+}
+pollStatus(); setInterval(pollStatus,3000);
 tickChat();tickIndex();tickState();
 </script></body></html>

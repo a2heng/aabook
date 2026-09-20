@@ -6,10 +6,13 @@
   --accent:#5aa9ff;--ok:#43c785;--warn:#ffb454;--bad:#ff7b7b}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,-apple-system,"Noto Sans CJK SC","Microsoft YaHei",sans-serif}
-header{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#101319;z-index:5}
-.brand{font-weight:700}.brand small{color:var(--dim);font-weight:400;margin-left:6px}
+header{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#101319;z-index:6}
+.brand{font-weight:700;font-size:15px}.brand small{color:var(--dim);font-weight:400;margin-left:6px}
 input,button,select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:5px 9px;font-size:13px}
 button{cursor:pointer}button:hover{border-color:var(--accent)}button.primary{background:var(--accent);color:#0b0f15;font-weight:700}
+button.ok-btn{background:var(--ok);color:#08130c;font-weight:700}
+button.warn-btn{background:var(--warn);color:#1a1000;font-weight:700}
+button:disabled{opacity:.5;cursor:not-allowed}
 .chips{display:flex;gap:8px;flex-wrap:wrap}
 .chip{font-size:12px;border:1px solid var(--line);border-radius:999px;padding:3px 10px;color:var(--dim);background:var(--panel)}
 .chip.ok{border-color:#1f4a33;color:var(--ok)}.chip.run{border-color:#25415f;color:var(--accent)}.chip.pending{opacity:.6}
@@ -20,8 +23,7 @@ main{padding:0 0 60px}
 section{display:none}section.on{display:block}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
 .ch{border:1px solid var(--line);border-radius:8px;padding:7px 9px;background:var(--panel);font-size:12.5px;cursor:pointer}
-.ch:hover{border-color:var(--accent)}.ch.done{border-color:#1f4a33}.ch.cur{border-color:var(--accent)}
-.ch b{display:block;font-size:13px}.ch small{color:var(--dim)}
+.ch:hover{border-color:var(--accent)}.ch.done{border-color:#1f4a33}.ch.cur{border-color:var(--accent)}.ch.active{background:#101a26}
 table{border-collapse:collapse;width:100%;font-size:13px}
 th,td{border:1px solid var(--line);padding:5px 8px;vertical-align:top;text-align:left}
 th{background:var(--panel2);color:var(--dim)}
@@ -32,17 +34,22 @@ pre{white-space:pre-wrap;background:#0f141b;border:1px solid var(--line);border-
 @media(max-width:900px){.two{grid-template-columns:1fr}}
 .muted{color:var(--dim)}
 .pipe{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.status-bar{display:flex;gap:16px;align-items:center;padding:8px 16px;background:var(--panel);border:1px solid var(--line);border-radius:10px;margin:12px 16px 0;font-size:13px}
+.status-item{display:flex;align-items:center;gap:6px}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot.on{background:var(--ok);box-shadow:0 0 6px var(--ok)}.dot.off{background:var(--bad)}.dot.busy{background:var(--warn);animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.progress-bar{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden;margin:8px 0}
+.progress-fill{height:100%;background:var(--accent);border-radius:3px;transition:width .5s}
+.log-panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:14px 16px}
+.log-panel h3{margin:0 0 8px;font-size:13px;color:var(--dim)}
+.log-content{background:#0f141b;border:1px solid var(--line);border-radius:8px;padding:8px;font-size:12px;max-height:200px;overflow:auto;font-family:ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
 </style></head><body>
 <header>
-  <div class="brand">LLM看板 <small id="bk">—</small></div>
+  <div class="brand">有声书看板 <small id="bk">—</small></div>
   <select id="booksel" onchange="document.getElementById('book').value=this.value;load()"></select>
   <input id="book" placeholder="book 名" style="width:150px">
-  <button onclick="load()">加载项目</button>
-  <button onclick="llmUp()">启动 LLM</button>
-  <button onclick="llmDown()">停止 LLM</button>
-  <button class="primary" onclick="startScript()">启动标注</button>
-  <span id="llmState" class="muted" style="font-size:12px">LLM: ?</span>
-  <div class="chips" id="stages"></div>
+  <button onclick="load()">加载</button>
   <span style="flex:1"></span>
   <nav>
     <a class="on" href="/dashboard">看板</a>
@@ -52,6 +59,23 @@ pre{white-space:pre-wrap;background:#0f141b;border:1px solid var(--line);border-
     <a id="navTts" href="/tts">TTS测试</a>
   </nav>
 </header>
+
+<!-- Status Bar -->
+<div class="status-bar" id="statusBar">
+  <div class="status-item"><span class="dot off" id="llmDot"></span>LLM: <span id="llmLabel" class="muted">?</span>
+    <button id="llmBtn" onclick="toggleLLM()" style="font-size:11px;padding:2px 8px">启动</button></div>
+  <div class="status-item"><span class="dot off" id="breezeDot"></span>Breeze: <span id="breezeLabel" class="muted">?</span></div>
+  <div class="status-item"><span class="dot off" id="scriptDot"></span>标注: <span id="scriptLabel" class="muted">未启动</span></div>
+  <div id="scriptControls" style="display:none">
+    <button id="scriptBtn" onclick="toggleScript()" style="font-size:11px;padding:2px 8px">暂停</button>
+    <button onclick="stopScript()" style="font-size:11px;padding:2px 8px;border-color:var(--bad);color:var(--bad)">停止</button>
+  </div>
+  <div id="progressInfo" style="display:none;flex:1;max-width:200px">
+    <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:0"></div></div>
+    <span id="progressLabel" class="muted" style="font-size:11px"></span>
+  </div>
+</div>
+
 <div style="max-width:1280px;margin:0 auto;padding:14px 16px 0">
   <div style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:14px">
     <div style="font-size:14px;color:#9fd0ff;font-weight:700;margin-bottom:10px">准备书籍</div>
@@ -63,7 +87,26 @@ pre{white-space:pre-wrap;background:#0f141b;border:1px solid var(--line);border-
       <button onclick="prepareBook()">准备（切章）</button>
       <span id="prepMsg" class="muted" style="font-size:12px"></span>
     </div>
+    <div class="chips" id="stages" style="margin-top:8px"></div>
   </div>
+
+  <!-- Marking Control -->
+  <div style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:14px">
+    <div style="font-size:14px;color:#9fd0ff;font-weight:700;margin-bottom:10px">标注控制</div>
+    <div class="pipe">
+      <button class="primary" id="markBtn" onclick="startMarking()">启动标注</button>
+      <label style="color:var(--dim);font-size:12px">起始章</label>
+      <input id="markStart" type="number" value="1" min="1" style="width:60px">
+      <label style="color:var(--dim);font-size:12px">数量</label>
+      <input id="markCount" type="number" value="0" min="0" style="width:60px" title="0=全部">
+      <span id="markMsg" class="muted" style="font-size:12px"></span>
+    </div>
+    <div style="margin-top:8px;font-size:12px;color:var(--dim)">
+      标注需要 LLM 已启动。batch=5（前5章全文，之后滚动摘要）。
+      停止后再次启动会跳过已有标记的章节。
+    </div>
+  </div>
+
   <div class="tabs">
     <div class="tab on" data-t="ch">章节进度</div>
     <div class="tab" data-t="dict">人物词典</div>
@@ -78,14 +121,151 @@ pre{white-space:pre-wrap;background:#0f141b;border:1px solid var(--line);border-
     <section id="viewer"><pre id="view"></pre></section>
   </main>
 </div>
+
+<!-- Log Panel -->
+<div class="log-panel">
+  <h3>后台日志 <button onclick="refreshLog()" style="font-size:11px;padding:1px 6px">刷新</button></h3>
+  <div class="log-content" id="logContent">加载中…</div>
+</div>
+
 <script>
 const BASE = "/";
 const qs = new URLSearchParams(location.search);
 let book = qs.get("book") || "";
 document.getElementById("book").value = book;
+let scriptState = {running: false, paused: false};
+let llmUp = false;
 
 async function jget(p){ try{ const sep = p.indexOf("?") >= 0 ? "&" : "?"; const r = await fetch(BASE + p + sep + "t=" + Date.now(), {cache:"no-store"}); if(!r.ok) return null; const t = await r.text(); try{ return JSON.parse(t); }catch(e){ return null; } }catch(e){ return null; } }
 
+// ── Unified status polling ────────────────────────────────────────────────
+async function pollStatus(){
+  const b = book || "";
+  try{
+    const st = await (await fetch("/status.json?book=" + encodeURIComponent(b) + "&t=" + Date.now(), {cache:"no-store"})).json();
+    // LLM
+    llmUp = !!(st.llm && st.llm.up);
+    const llmDot = document.getElementById("llmDot");
+    const llmLabel = document.getElementById("llmLabel");
+    const llmBtn = document.getElementById("llmBtn");
+    if(llmUp){
+      llmDot.className = "dot on"; llmLabel.textContent = "已启动"; llmLabel.style.color = "var(--ok)";
+      llmBtn.textContent = "停止"; llmBtn.className = "";
+    } else {
+      llmDot.className = "dot off"; llmLabel.textContent = "未启动"; llmLabel.style.color = "var(--dim)";
+      llmBtn.textContent = "启动"; llmBtn.className = "primary";
+    }
+    // Breeze
+    const breezeDot = document.getElementById("breezeDot");
+    const breezeLabel = document.getElementById("breezeLabel");
+    if(st.breeze && st.breeze.up){
+      breezeDot.className = "dot on"; breezeLabel.textContent = "已启动"; breezeLabel.style.color = "var(--ok)";
+    } else {
+      breezeDot.className = "dot off"; breezeLabel.textContent = "未启动"; breezeLabel.style.color = "var(--dim)";
+    }
+    // Script
+    const sc = st.script || {};
+    scriptState = sc;
+    const scriptDot = document.getElementById("scriptDot");
+    const scriptLabel = document.getElementById("scriptLabel");
+    const scriptControls = document.getElementById("scriptControls");
+    const progressInfo = document.getElementById("progressInfo");
+    const markBtn = document.getElementById("markBtn");
+    if(sc.running){
+      scriptDot.className = sc.paused ? "dot busy" : "dot on";
+      scriptLabel.textContent = sc.paused ? "已暂停" : "运行中";
+      scriptLabel.style.color = sc.paused ? "var(--warn)" : "var(--ok)";
+      scriptControls.style.display = "flex";
+      const scriptBtn = document.getElementById("scriptBtn");
+      scriptBtn.textContent = sc.paused ? "恢复" : "暂停";
+      scriptBtn.className = sc.paused ? "ok-btn" : "warn-btn";
+      markBtn.textContent = "运行中…"; markBtn.disabled = true;
+      progressInfo.style.display = "block";
+      const prog = sc.progress || {};
+      const done = prog.done || 0, total = prog.total || 0;
+      const pct = total > 0 ? Math.round(done / total * 100) : 0;
+      document.getElementById("progressFill").style.width = pct + "%";
+      document.getElementById("progressLabel").textContent = done + "/" + total + " 章 (" + pct + "%)";
+    } else {
+      scriptDot.className = "dot off";
+      scriptLabel.textContent = "未启动";
+      scriptLabel.style.color = "var(--dim)";
+      scriptControls.style.display = "none";
+      progressInfo.style.display = "none";
+      markBtn.textContent = "启动标注"; markBtn.disabled = false;
+    }
+  }catch(e){}
+}
+
+// ── LLM toggle ───────────────────────────────────────────────────────────
+async function toggleLLM(){
+  if(llmUp){
+    if(!confirm("停止 LLM？标注等任务会中断。")) return;
+    document.getElementById("llmLabel").textContent = "停止中…";
+    try{ await fetch("/llm/down", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"}); }catch(e){}
+  } else {
+    document.getElementById("llmLabel").textContent = "启动中…";
+    try{ await fetch("/llm/up", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"}); }catch(e){}
+  }
+  setTimeout(pollStatus, 1000);
+}
+
+// ── Script control ───────────────────────────────────────────────────────
+async function startMarking(){
+  const b = book || document.getElementById("booksel").value;
+  if(!b){ alert("请先选书"); return; }
+  // Double-check LLM status from server
+  try{
+    const st = await (await fetch("/status.json?book=" + encodeURIComponent(b), {cache:"no-store"})).json();
+    if(!st.llm || !st.llm.up){ alert("LLM 未启动，请先启动 LLM"); return; }
+    if(st.script && st.script.running){ alert("标注已在运行中，请先停止或等待完成"); return; }
+  }catch(e){}
+  if(!confirm("启动标注？")) return;
+  const start = parseInt(document.getElementById("markStart").value) || 1;
+  const count = parseInt(document.getElementById("markCount").value) || 0;
+  try{
+    const r = await fetch("/script", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({book: b, start, count})});
+    const d = await r.json();
+    if(!d.ok){ alert(d.message || "启动失败"); }
+    else { document.getElementById("markMsg").textContent = d.message; }
+  }catch(e){ alert("失败: " + e.message); }
+  setTimeout(pollStatus, 500);
+}
+
+async function toggleScript(){
+  const b = book || "";
+  if(!b) return;
+  if(scriptState.paused){
+    try{ await fetch("/script/resume", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({book:b})}); }catch(e){}
+  } else {
+    try{ await fetch("/script/pause", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({book:b})}); }catch(e){}
+  }
+  setTimeout(pollStatus, 500);
+}
+
+async function stopScript(){
+  const b = book || "";
+  if(!b || !confirm("停止标注？")) return;
+  try{ await fetch("/script/stop", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({book:b})}); }catch(e){}
+  setTimeout(pollStatus, 500);
+}
+
+// ── Log viewer ───────────────────────────────────────────────────────────
+async function refreshLog(){
+  const b = book || "";
+  if(!b){ document.getElementById("logContent").textContent = "请先选书"; return; }
+  try{
+    const r = await fetch("/stage/log", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({name: "script-" + b})});
+    const d = await r.json();
+    const el = document.getElementById("logContent");
+    el.textContent = d.content || "(空)";
+    el.scrollTop = el.scrollHeight;
+  }catch(e){}
+}
+
+// ── Load data ────────────────────────────────────────────────────────────
 async function load(){
   book = document.getElementById("book").value.trim() || document.getElementById("booksel").value;
   if(!book){ return; }
@@ -109,16 +289,18 @@ async function load(){
   renderDict(roles);
   renderSummaries(sums);
   renderResults(manifest, root);
+  pollStatus();
+  refreshLog();
 }
 
 function renderStages(pipe){
   const order = ["prepare","global","script","convert","voicebank","render"];
   const st = (pipe && pipe.stages) || {};
-  document.getElementById("stages").innerHTML = order.map(s=>{
+  document.getElementById("stages") && (document.getElementById("stages").innerHTML = order.map(s=>{
     const v = st[s]; const cls = !v ? "pending" : (v.status === "done" ? "ok" : "run");
     const note = v && v.note ? " " + v.note : "";
     return `<span class="chip ${cls}">${s}${note}</span>`;
-  }).join("");
+  }).join(""));
 }
 
 function renderChapters(idx, root, allIds){
@@ -140,7 +322,6 @@ async function view(c, root){
   document.querySelectorAll("section").forEach(s=>s.classList.remove("on"));
   document.getElementById("viewer").classList.add("on");
   document.getElementById("view").textContent = txt || "(空)";
-  const tab = document.createElement("div"); // allow going back
   document.getElementById("viewer").scrollIntoView();
 }
 
@@ -199,48 +380,6 @@ async function prepareBook(){
     loadBooks().then(()=>{ document.getElementById("booksel").value=book; load(); });
   }catch(e){ document.getElementById("prepMsg").textContent = String(e); }
 }
-async function llmUp(){
-  document.getElementById("llmState").textContent = "LLM: 启动中…";
-  try{
-    const r = await fetch("/llm/up", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
-    if(!r.ok) throw new Error(await r.text());
-    const d = await r.json();
-    document.getElementById("llmState").textContent = d.message;
-  }catch(e){ document.getElementById("llmState").textContent = String(e); }
-  tickLLM();
-}
-async function llmDown(){
-  if(!confirm("停止 LLM？")) return;
-  document.getElementById("llmState").textContent = "LLM: 停止中…";
-  try{
-    const r = await fetch("/llm/down", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
-    if(!r.ok) throw new Error(await r.text());
-    const d = await r.json();
-    document.getElementById("llmState").textContent = d.message;
-  }catch(e){ document.getElementById("llmState").textContent = String(e); }
-  tickLLM();
-}
-async function tickLLM(){
-  try{
-    const d = await (await fetch("/llm/status.json?t="+Date.now(),{cache:"no-store"})).json();
-    document.getElementById("llmState").textContent = d.up ? "LLM: 已启动" : "LLM: 未启动";
-    document.getElementById("llmState").style.color = d.up ? "var(--ok)" : "var(--dim)";
-  }catch(e){}
-}
-async function startScript(){
-  const btn = document.querySelector('[onclick="startScript()"]');
-  const b = book || document.getElementById("booksel").value;
-  if(!b){ alert("请先选书"); return; }
-  if(!confirm("启动标注？需要 LLM 已启动。")) return;
-  btn.disabled = true; btn.textContent = "启动中…";
-  try{
-    const r = await fetch("/script", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({book:b})});
-    const d = await r.json();
-    if(!d.ok){ alert(d.message || "启动失败"); }
-    else { alert(d.message); }
-  }catch(e){ alert("失败: " + e.message); }
-  btn.disabled = false; btn.textContent = "启动标注";
-}
 
 document.querySelectorAll(".tab").forEach(t=>t.addEventListener("click",()=>{
   document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));
@@ -256,6 +395,7 @@ async function loadBooks(){
 }
 loadBooks().then(()=>{ if(book){ document.getElementById("booksel").value=book; load(); } });
 loadTxtList();
-tickLLM();
-setInterval(()=>{ if(book) load(); }, 5000);
+pollStatus();
+setInterval(()=>{ pollStatus(); if(book) load(); }, 3000);
+setInterval(refreshLog, 5000);
 </script></body></html>

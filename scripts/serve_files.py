@@ -28,7 +28,7 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_ROOT))
@@ -149,10 +149,7 @@ class RunLock:
                 if stat_path.is_file():
                     state = stat_path.read_text(encoding="utf-8").rsplit(") ", 1)[-1][:1]
                     if state != "Z":
-                        self.rejected = (
-                            f"后台已有标注任务运行中（PID {old_pid}）。"
-                            "请先重启 LLM 或点击「LLM原始IO」查看当前任务。"
-                        )
+                        self.rejected = f"后台已有标注任务运行中（PID {old_pid}）。请先重启 LLM 或点击「LLM原始IO」查看当前任务。"
                         return self
             except (ValueError, OSError):
                 pass
@@ -787,28 +784,74 @@ class FileBrowser(SimpleHTTPRequestHandler):
         return {"ok": True, "message": f"{stage} 已启动", "log": f"/stage/log?name={log_name}-{book}"}
 
     def _script_status(self, book: str) -> dict:
-        """Check if an annotation task is running for this book."""
+        """Check if an annotation task is running for this book, with progress."""
         if not book:
-            return {"running": False}
-        pidfile = APP_ROOT / "outputs" / book / "script" / "run.pid"
+            return {"running": False, "paused": False}
+        base = APP_ROOT / "outputs" / book / "script"
+        pidfile = base / "run.pid"
+        pause_file = base / ".paused"
+        progress_file = base / "progress.json"
+        result: dict[str, Any] = {"running": False, "paused": pause_file.is_file()}
+        # read progress if available
+        if progress_file.is_file():
+            try:
+                result["progress"] = json.loads(progress_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pass
         if not pidfile.is_file():
-            return {"running": False}
+            return result
         try:
             pid = int(pidfile.read_text(encoding="utf-8").strip())
             stat_path = Path(f"/proc/{pid}/stat")
             if stat_path.is_file():
                 state = stat_path.read_text(encoding="utf-8").rsplit(") ", 1)[-1][:1]
                 if state != "Z":
-                    return {"running": True, "pid": pid}
+                    result["running"] = True
+                    result["pid"] = pid
         except (ValueError, OSError):
             pass
-        return {"running": False}
+        return result
+
+    def _script_pause(self, book: str) -> dict:
+        """Pause the running annotation task for this book."""
+        if not book:
+            raise ValueError("book 不能为空")
+        base = APP_ROOT / "outputs" / book / "script"
+        pidfile = base / "run.pid"
+        if not pidfile.is_file():
+            return {"ok": False, "message": "标注未在运行"}
+        try:
+            pid = int(pidfile.read_text(encoding="utf-8").strip())
+            stat_path = Path(f"/proc/{pid}/stat")
+            if not stat_path.is_file():
+                return {"ok": False, "message": "标注进程已结束"}
+        except (ValueError, OSError):
+            return {"ok": False, "message": "标注未在运行"}
+        pause_file = base / ".paused"
+        pause_file.write_text(str(pid), encoding="utf-8")
+        return {"ok": True, "message": "标注已暂停", "paused": True}
+
+    def _script_resume(self, book: str) -> dict:
+        """Resume the paused annotation task for this book."""
+        if not book:
+            raise ValueError("book 不能为空")
+        base = APP_ROOT / "outputs" / book / "script"
+        pause_file = base / ".paused"
+        if not pause_file.is_file():
+            return {"ok": True, "message": "标注未暂停", "paused": False}
+        pause_file.unlink()
+        return {"ok": True, "message": "标注已恢复", "paused": False}
 
     def _script_stop(self, book: str) -> dict:
         """Stop the running annotation task for this book."""
         if not book:
             raise ValueError("book 不能为空")
-        pidfile = APP_ROOT / "outputs" / book / "script" / "run.pid"
+        base = APP_ROOT / "outputs" / book / "script"
+        pidfile = base / "run.pid"
+        # clean up pause file
+        pause_file = base / ".paused"
+        if pause_file.is_file():
+            pause_file.unlink()
         if not pidfile.is_file():
             return {"ok": True, "message": "标注未在运行"}
         try:
@@ -1124,9 +1167,9 @@ class FileBrowser(SimpleHTTPRequestHandler):
             return
         if route.startswith("/api/"):
             # /api/<book>/<filepath> — serve raw data from outputs/<book>/script/
-            parts = route[len("/api/"):].split("/", 1)
-            book = parts[0] if parts else ""
-            subpath = parts[1] if len(parts) > 1 else ""
+            parts = route[len("/api/") :].split("/", 1)
+            book = unquote(parts[0]) if parts else ""
+            subpath = unquote(parts[1]) if len(parts) > 1 else ""
             if not book or not subpath:
                 self._fail(HTTPStatus.BAD_REQUEST, "用法: /api/<book>/<file>")
                 return
@@ -1138,6 +1181,39 @@ class FileBrowser(SimpleHTTPRequestHandler):
             if subpath.endswith(".jsonl"):
                 ct = "application/x-ndjson; charset=utf-8"
             self._send_file(target, ct)
+            return
+        # ── Prompt test API (book-independent) ────────────────────────────────────
+        if route == "/prompt/defaults":
+            try:
+                self._send_json(self._prompt_defaults())
+            except Exception as error:  # noqa: BLE001
+                self._fail(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if route == "/prompt/versions":
+            try:
+                self._send_json(self._prompt_versions())
+            except Exception as error:  # noqa: BLE001
+                self._fail(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if route.startswith("/prompt/version/"):
+            vid = route[len("/prompt/version/") :]
+            try:
+                self._send_json(self._prompt_version_get(vid))
+            except Exception as error:  # noqa: BLE001
+                self._fail(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if route == "/prompt/history":
+            try:
+                self._send_json(self._prompt_history())
+            except Exception as error:  # noqa: BLE001
+                self._fail(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if route.startswith("/prompt/run/"):
+            rid = route[len("/prompt/run/") :]
+            try:
+                self._send_json(self._prompt_run_get(rid))
+            except Exception as error:  # noqa: BLE001
+                self._fail(HTTPStatus.BAD_REQUEST, str(error))
             return
         # ── Static pages (all from static/) ──────────────────────────────────────
         _pages = {
@@ -1187,6 +1263,20 @@ class FileBrowser(SimpleHTTPRequestHandler):
             query = parse_qs(parsed.query)
             book = (query.get("book") or [""])[0]
             self._send_json(self._script_status(book))
+            return
+        if route == "/status.json":
+            query = parse_qs(parsed.query)
+            book = (query.get("book") or [""])[0]
+            llm = self._llm_status()
+            _, breeze_health = _breeze()
+            script = self._script_status(book) if book else {"running": False, "paused": False}
+            self._send_json(
+                {
+                    "llm": llm,
+                    "breeze": {"up": breeze_health is not None, "health": breeze_health or {}},
+                    "script": script,
+                }
+            )
             return
         if route == "/llm/serve.log":
             log = APP_ROOT / ".cache" / "logs" / "llm_serve.log"
@@ -1239,6 +1329,40 @@ class FileBrowser(SimpleHTTPRequestHandler):
                 payload = self._read_json()
                 book = str(payload.get("book") or "").strip()
                 self._send_json(self._script_stop(book))
+            except Exception as error:  # noqa: BLE001
+                self._fail(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if route == "/script/pause":
+            try:
+                payload = self._read_json()
+                book = str(payload.get("book") or "").strip()
+                self._send_json(self._script_pause(book))
+            except Exception as error:  # noqa: BLE001
+                self._fail(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if route == "/script/resume":
+            try:
+                payload = self._read_json()
+                book = str(payload.get("book") or "").strip()
+                self._send_json(self._script_resume(book))
+            except Exception as error:  # noqa: BLE001
+                self._fail(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if route == "/prompt/version":
+            try:
+                self._send_json(self._prompt_version_save(self._read_json()))
+            except Exception as error:  # noqa: BLE001
+                self._fail(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if route == "/prompt/restore":
+            try:
+                self._send_json(self._prompt_restore(self._read_json()))
+            except Exception as error:  # noqa: BLE001
+                self._fail(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if route == "/prompt/run":
+            try:
+                self._send_json(self._prompt_run(self._read_json()))
             except Exception as error:  # noqa: BLE001
                 self._fail(HTTPStatus.BAD_REQUEST, str(error))
             return
@@ -1384,6 +1508,170 @@ class FileBrowser(SimpleHTTPRequestHandler):
         self.send_header("Location", "/dashboard")
         self.end_headers()
         return None
+
+    # ── Prompt test helpers ─────────────────────────────────────────────────
+    def _prompt_test_dir(self) -> Path:
+        return Path(self.directory) / "prompt_test"
+
+    def _prompt_defaults(self) -> dict:
+        """Return Python code's default prompts + default input text."""
+        # Import mark_script to get its constants
+        sys.path.insert(0, str(Path(self.directory)))
+        try:
+            from scripts.mark_script import LOCAL_SYSTEM, STEP_MARK, CHECK_MARK  # type: ignore[import-not-found]
+        except ImportError:
+            LOCAL_SYSTEM = STEP_MARK = CHECK_MARK = ""
+        default_input = ""
+        inp = self._prompt_test_dir() / "default_input.txt"
+        if inp.is_file():
+            default_input = inp.read_text(encoding="utf-8")
+        return {
+            "ok": True,
+            "prompts": {"LOCAL_SYSTEM": LOCAL_SYSTEM, "STEP_MARK": STEP_MARK, "CHECK_MARK": CHECK_MARK},
+            "input": default_input,
+        }
+
+    def _prompt_versions(self) -> dict:
+        """List saved prompt versions."""
+        vdir = self._prompt_test_dir() / "versions"
+        if not vdir.is_dir():
+            return {"ok": True, "versions": []}
+        versions = []
+        for p in sorted(vdir.glob("*.json"), reverse=True):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                data["id"] = p.stem
+                versions.append(data)
+            except Exception:  # noqa: BLE001
+                pass
+        return {"ok": True, "versions": versions}
+
+    def _prompt_version_get(self, vid: str) -> dict:
+        """Get a specific prompt version."""
+        vfile = self._prompt_test_dir() / "versions" / f"{vid}.json"
+        if not vfile.is_file():
+            raise ValueError(f"版本 {vid} 不存在")
+        data = json.loads(vfile.read_text(encoding="utf-8"))
+        data["id"] = vid
+        return {"ok": True, "version": data}
+
+    def _prompt_version_save(self, payload: dict) -> dict:
+        """Save a new prompt version."""
+        vdir = self._prompt_test_dir() / "versions"
+        vdir.mkdir(parents=True, exist_ok=True)
+        vid = payload.get("id") or f"v{int(time.time())}"
+        data = {
+            "label": payload.get("label", vid),
+            "prompts": payload.get("prompts", {}),
+            "input": payload.get("input", ""),
+            "params": payload.get("params", {}),
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        vfile = vdir / f"{vid}.json"
+        vfile.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"ok": True, "id": vid, "message": f"版本 {vid} 已保存"}
+
+    def _prompt_restore(self, payload: dict) -> dict:
+        """Restore prompts to defaults or a specific version."""
+        vid = payload.get("version_id")
+        if vid:
+            return self._prompt_version_get(vid)
+        return self._prompt_defaults()
+
+    def _prompt_run(self, payload: dict) -> dict:
+        """Run a test: save snapshot + execute marking in background."""
+        import subprocess
+
+        prompts = payload.get("prompts", {})
+        input_text = payload.get("input", "")
+        params = payload.get("params", {})
+        version_id = payload.get("version_id", f"v{int(time.time())}")
+
+        # Save run snapshot
+        rdir = self._prompt_test_dir() / "runs"
+        rdir.mkdir(parents=True, exist_ok=True)
+        run_id = f"run_{int(time.time())}"
+        run_data = {
+            "version_id": version_id,
+            "prompts": prompts,
+            "input": input_text,
+            "params": params,
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        run_file = rdir / f"{run_id}.json"
+        run_file.write_text(json.dumps(run_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # Write temporary workflow overlay for this test
+        test_book = "__prompt_test__"
+        test_out = Path(self.directory) / "outputs" / test_book
+        test_out.mkdir(parents=True, exist_ok=True)
+        test_chapters = test_out / "chapters"
+        test_chapters.mkdir(exist_ok=True)
+        # Write the input text as chapter 1
+        (test_chapters / "ch001.txt").write_text(input_text, encoding="utf-8")
+        # Write workflow overlay
+        wf = test_out / "workflow.json"
+        wf_data = {
+            "params": params,
+            "prompts": prompts,
+            "few_shot": payload.get("few_shot", []),
+        }
+        wf.write_text(json.dumps(wf_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Write empty roles.json
+        (test_out / "script" / "roles.json").write_text("{}", encoding="utf-8")
+        (test_out / "script").mkdir(exist_ok=True)
+
+        if not _llm_health():
+            return {"ok": False, "message": "LLM 未启动"}
+
+        base = Path(self.directory)
+        py = str(base / ".venv" / "bin" / "python")
+        log = base / ".cache" / "logs" / f"prompt-run-{run_id}.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        env = {**os.environ, "AUDIOBOOK_WORKFLOW_DIR": str(test_out)}
+        with log.open("w") as handle:
+            proc = subprocess.Popen(
+                [py, "-B", "scripts/mark_script.py", "1", "--count", "1", "--book", test_book, "--force"],
+                cwd=str(base),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+            )
+        # Save pid to run record
+        run_data["pid"] = proc.pid
+        run_data["log"] = f"prompt-run-{run_id}.log"
+        run_file.write_text(json.dumps(run_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"ok": True, "run_id": run_id, "pid": proc.pid, "message": "测试已启动"}
+
+    def _prompt_history(self) -> dict:
+        """List all test run records."""
+        rdir = self._prompt_test_dir() / "runs"
+        if not rdir.is_dir():
+            return {"ok": True, "runs": []}
+        runs = []
+        for p in sorted(rdir.glob("run_*.json"), reverse=True):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                data["id"] = p.stem
+                runs.append(data)
+            except Exception:  # noqa: BLE001
+                pass
+        return {"ok": True, "runs": runs[:50]}
+
+    def _prompt_run_get(self, rid: str) -> dict:
+        """Get a specific test run record."""
+        rfile = self._prompt_test_dir() / "runs" / f"{rid}.json"
+        if not rfile.is_file():
+            raise ValueError(f"记录 {rid} 不存在")
+        data = json.loads(rfile.read_text(encoding="utf-8"))
+        data["id"] = rid
+        # Try to read output from the test book
+        test_out = Path(self.directory) / "outputs" / "__prompt_test__" / "script"
+        out_file = test_out / "ch001.marked.txt"
+        if out_file.is_file():
+            data["output"] = out_file.read_text(encoding="utf-8")
+        return {"ok": True, "run": data}
 
     def log_message(self, format, *args):  # quieter logs
         return

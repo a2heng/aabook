@@ -66,14 +66,14 @@ audio{width:100%;margin-top:6px}
   <button onclick="loadAll()">加载</button>
   <button class="primary" onclick="runRender()">渲染</button>
   <span id="pipeMsg" class="hint" style="font-size:12px"></span>
-  <span id="breezeState" class="hint">Breeze: ?</span>
-  <button id="restartBtn" onclick="restartBreeze()">重启</button>
-  <button id="unloadBtn" onclick="unloadBreeze()">卸载</button>
-  <span class="hint">|</span>
-  <span id="llmState" class="hint">LLM: ?</span>
-  <button onclick="llmUp()">启动 LLM</button>
-  <button onclick="llmDown()">停止 LLM</button>
-  <span id="taskState" class="hint"></span>
+  <div style="display:flex;align-items:center;gap:8px;font-size:12px;margin-left:8px">
+    <span style="width:6px;height:6px;border-radius:50%;flex-shrink:0" id="llmDot"></span>
+    <span id="llmState" class="hint">LLM: ?</span>
+    <span style="color:var(--line)">|</span>
+    <span style="width:6px;height:6px;border-radius:50%;flex-shrink:0" id="breezeDot"></span>
+    <span id="breezeState" class="hint">Breeze: ?</span>
+    <span id="taskState" class="hint"></span>
+  </div>
   <span style="flex:1"></span>
   <nav>
     <a href="/dashboard">看板</a>
@@ -425,66 +425,23 @@ async function ttsUp(){
   }catch(e){ $("dmsg").textContent = String(e); $("dmsg").className = "err"; }
   finally{ btn.disabled = false; tickHealth(); }
 }
-async function restartBreeze(){
-  if(!confirm("重启 Breeze？正在合成的任务会被中断。")) return;
-  $("taskState").textContent = "重启中…"; $("taskState").className = "hint";
-  try{
-    const r = await fetch("/tts/restart", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
-    if(!r.ok) throw new Error(await r.text());
-    const d = await r.json();
-    $("taskState").textContent = d.message || "已重启"; $("taskState").className = "ok";
-  }catch(e){ $("taskState").textContent = String(e); $("taskState").className = "err"; }
-  tickHealth();
-}
-async function unloadBreeze(){
-  if(!confirm("卸载 Breeze？释放 GPU 显存，之后需要重新启动才能合成。")) return;
-  $("taskState").textContent = "卸载中…"; $("taskState").className = "hint";
-  try{
-    const r = await fetch("/tts/down", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
-    if(!r.ok) throw new Error(await r.text());
-    const d = await r.json();
-    $("taskState").textContent = d.message || "已卸载"; $("taskState").className = "ok";
-  }catch(e){ $("taskState").textContent = String(e); $("taskState").className = "err"; }
-  tickHealth();
-}
 async function tickHealth(){
   try{
-    const d = await (await fetch("/tts/status.json?t="+Date.now(),{cache:"no-store"})).json();
-    $("breezeState").textContent = d.up ? "Breeze: 已启动" : "Breeze: 未启动";
-    $("breezeState").className = d.up ? "ok" : "hint";
-    $("taskState").textContent = d.active ? ("⚙ 后台合成中 · " + (d.last||"")) : (d.up ? "· 空闲" : "");
-    $("taskState").className = d.active ? "ok" : "hint";
-    const btn = $("startBtn");
-    if(d.up){ btn.textContent = "Breeze 已启动"; btn.classList.add("done"); btn.disabled = false; }
-    else { btn.textContent = "启动 Breeze 服务"; btn.classList.remove("done"); }
-  }catch(e){ $("breezeState").textContent = "Breeze: ?"; }
-  try{
-    const d = await (await fetch("/llm/status.json?t="+Date.now(),{cache:"no-store"})).json();
-    $("llmState").textContent = d.up ? "LLM: 已启动" : "LLM: 未启动";
-    $("llmState").className = d.up ? "ok" : "hint";
-  }catch(e){ $("llmState").textContent = "LLM: ?"; }
-  setTimeout(tickHealth, 2000);
-}
-async function llmUp(){
-  $("llmState").textContent = "LLM: 启动中…"; $("llmState").className = "hint";
-  try{
-    const r = await fetch("/llm/up", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
-    if(!r.ok) throw new Error(await r.text());
-    const d = await r.json();
-    $("llmState").textContent = d.message; $("llmState").className = d.started ? "ok" : "hint";
-  }catch(e){ $("llmState").textContent = String(e); $("llmState").className = "err"; }
-  tickHealth();
-}
-async function llmDown(){
-  if(!confirm("停止 LLM？脚本标注等任务会中断。")) return;
-  $("llmState").textContent = "LLM: 停止中…"; $("llmState").className = "hint";
-  try{
-    const r = await fetch("/llm/down", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
-    if(!r.ok) throw new Error(await r.text());
-    const d = await r.json();
-    $("llmState").textContent = d.message; $("llmState").className = "ok";
-  }catch(e){ $("llmState").textContent = String(e); $("llmState").className = "err"; }
-  tickHealth();
+    const st = await (await fetch("/status.json?book="+encodeURIComponent(book)+"&t="+Date.now(),{cache:"no-store"})).json();
+    // Breeze
+    const bd = st.breeze || {};
+    $("breezeState").textContent = bd.up ? "Breeze: 已启动" : "Breeze: 未启动";
+    $("breezeState").className = bd.up ? "ok" : "hint";
+    $("breezeDot").style.background = bd.up ? "var(--ok)" : "var(--bad)";
+    $("taskState").textContent = bd.up ? "· 空闲" : "";
+    $("taskState").className = "hint";
+    // LLM
+    const ld = st.llm || {};
+    $("llmState").textContent = ld.up ? "LLM: 已启动" : "LLM: 未启动";
+    $("llmState").className = ld.up ? "ok" : "hint";
+    $("llmDot").style.background = ld.up ? "var(--ok)" : "var(--bad)";
+  }catch(e){}
+  setTimeout(tickHealth, 3000);
 }
 $("booksel").addEventListener("change", ()=>{ book=$("booksel").value; chapter=0; loadAll(); });
 $("chsel").addEventListener("change", ()=>{ chapter=parseInt($("chsel").value,10)||0; loadRows(); syncLinks(); });

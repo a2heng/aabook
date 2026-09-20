@@ -1,342 +1,357 @@
 <!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>提示词测试 · 结构与参数</title>
+<title>提示词测试</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1017;--panel:#151a23;--panel2:#1b2230;--line:#26303f;--fg:#e6ecf3;--dim:#8b97a8;
   --accent:#5aa9ff;--ok:#43c785;--warn:#ffb454;--bad:#ff7b7b}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,-apple-system,"Noto Sans CJK SC","Microsoft YaHei",sans-serif}
 header{position:sticky;top:0;z-index:6;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px 18px;background:#101319;border-bottom:1px solid var(--line)}
-.brand{font-weight:700;font-size:15px}.brand small{color:var(--dim);font-weight:400;margin-left:6px}
-header select,header button,header input{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:4px 10px;font-size:13px}
-header button{cursor:pointer}
-header button.primary{background:var(--accent);border-color:var(--accent);color:#0b0f15;font-weight:700}
+.brand{font-weight:700;font-size:15px}
+header .status{display:flex;gap:8px;align-items:center;font-size:12px;color:var(--dim)}
+header .st-dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+header .st-dot.on{background:var(--ok)}.header .st-dot.off{background:var(--bad)}
 header .grow{flex:1}
-a{color:var(--accent);text-decoration:none}
 nav a{color:var(--accent);text-decoration:none;margin-right:12px;font-size:13px}nav a.on{color:var(--fg);font-weight:700}
-main{padding:16px 18px 80px;max-width:1500px;margin:0 auto}
-.product{display:flex;gap:14px;align-items:center;flex-wrap:wrap;background:linear-gradient(90deg,#12233a,#151a23);border:1px solid #2b4a72;border-radius:12px;padding:10px 14px}
-.product b{color:#9fd0ff}
-.chip{display:inline-block;background:#0f1720;border:1px solid var(--line);border-radius:999px;padding:1px 10px;margin:2px;font-size:12.5px}
-.chip code{background:none;border:none;padding:0}
-.flow{display:flex;gap:10px;align-items:stretch;margin:16px 0;overflow-x:auto;padding-bottom:6px}
-.stage{min-width:250px;max-width:340px;flex:0 0 auto;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 12px}
-.stage.editable{border-color:#2b4a72;box-shadow:0 0 0 1px #1c3a5c inset}
-.stage h3{margin:0 0 4px;font-size:14px}
-.stage .script{color:var(--dim);font-size:12px}
-.stage .io{font-size:12.5px;margin:6px 0;color:#cfe3ff}
-.stage .io span{color:var(--dim)}
-.stage .detail{font-size:12.5px;color:var(--dim)}
-.arrow{display:flex;align-items:center;color:var(--dim);font-size:20px}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:14px 0}
-.panel h2{margin:0 0 10px;font-size:15px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}
-.field label{display:block;font-size:12.5px;color:var(--dim);margin-bottom:3px}
-.field input[type=number]{width:100%;background:#0f141b;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:5px 8px}
-.field input[type=text]{width:100%;background:#0f141b;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:5px 8px}
-.field textarea{width:100%;min-height:130px;background:#0f141b;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:8px;font:12.5px/1.6 ui-monospace,Menlo,Consolas,monospace}
-.overridden{color:var(--warn);font-size:11.5px}
-.prompts{display:grid;grid-template-columns:1fr;gap:12px;margin-top:8px}
-.cols{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.sub{margin:0 0 6px;font-size:13px;color:var(--dim)}
-.doc{background:#0f141b;border:1px solid var(--line);border-radius:10px;padding:10px 14px;max-height:420px;overflow:auto;font-size:14px;line-height:1.95;word-break:break-word}
-.doc p{margin:0 0 .55em;text-indent:2em}
-.doc p:empty{display:none}
-.doc .who{display:inline-block;font-size:11px;font-weight:700;color:#9fd0ff;background:#16314f;border-radius:6px;padding:0 6px;margin:0 2px;vertical-align:1px}
-.doc .speech{background:#152238;border-radius:8px;box-shadow:inset 0 0 0 1px #2b4a72;padding:1px 5px}
-.log{max-height:260px;overflow:auto}
-.log table{border-collapse:collapse;width:100%;font-size:12.5px}
-.log th,.log td{border-bottom:1px solid var(--line);padding:4px 8px;text-align:left;vertical-align:top}
-.log th{color:var(--dim);font-weight:500}
-code{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d1219;border:1px solid var(--line);border-radius:5px;padding:0 4px;font-size:12px}
-.toast{position:fixed;right:16px;bottom:16px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:8px 14px;display:none}
-.toast.ok{border-color:var(--ok)}.toast.bad{border-color:var(--bad)}
-@media (max-width:820px){main{padding:12px}.stage{min-width:220px}}
-</style></head><body>
+a{color:var(--accent);text-decoration:none}
+main{padding:16px 18px 80px;max-width:1600px;margin:0 auto}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+.card-title{font-weight:700;font-size:13px;color:var(--dim);margin-bottom:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+textarea{width:100%;background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:13px/1.5 monospace;resize:vertical;min-height:80px}
+textarea:focus{outline:none;border-color:var(--accent)}
+textarea[readonly]{opacity:.85;cursor:default}
+.btn{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:4px 12px;font-size:13px;cursor:pointer;transition:background .15s}
+.btn:hover{background:#26303f}.btn:disabled{opacity:.4;cursor:default}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#0b0f15;font-weight:700}
+.btn.primary:hover{background:#7abfff}
+.btn.warn{border-color:var(--warn);color:var(--warn)}
+.btn.danger{border-color:var(--bad);color:var(--bad)}
+.tag{display:inline-block;background:#0f1720;border:1px solid var(--line);border-radius:999px;padding:1px 8px;font-size:11px;color:var(--dim)}
+.tag.running{border-color:var(--ok);color:var(--ok)}
+.tag.done{border-color:var(--accent);color:var(--accent)}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.grow{flex:1}
+#statusBar{position:fixed;bottom:0;left:0;right:0;z-index:5;display:flex;gap:16px;align-items:center;padding:6px 18px;background:#101319;border-top:1px solid var(--line);font-size:12px;color:var(--dim)}
+#toast{position:fixed;bottom:40px;right:18px;z-index:10;background:var(--ok);color:#0b0f15;padding:6px 14px;border-radius:8px;font-size:13px;font-weight:600;display:none;animation:fadeIn .2s}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.history-item{padding:8px 12px;border-bottom:1px solid var(--line);cursor:pointer;display:flex;gap:10px;align-items:center;font-size:13px}
+.history-item:hover{background:var(--panel2)}
+.history-item.active{background:#1a2740;border-left:3px solid var(--accent)}
+.empty{color:var(--dim);font-size:13px;padding:20px;text-align:center}
+.params-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px}
+.param-item{display:flex;align-items:center;gap:6px;font-size:13px}
+.param-item label{color:var(--dim);min-width:80px}
+.param-item input{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 8px;font-size:13px;width:80px}
+.param-item input:focus{outline:none;border-color:var(--accent)}
+</style>
+</head>
+<body>
 <header>
-  <div class="brand">提示词测试 <small>产品 = 文本，章节只是标记</small></div>
-  <select id="booksel"></select>
-  <button id="reload">刷新</button>
-  <button id="save" class="primary">保存覆盖</button>
-  <button id="reset">清除覆盖</button>
-  <span style="flex:1"></span>
+  <div class="brand">提示词测试</div>
+  <div class="status">
+    <span id="llmSt" class="st-dot off" title="LLM"></span><span>LLM</span>
+    <span id="markSt" class="st-dot off" title="标注"></span><span>标注</span>
+  </div>
+  <div class="grow"></div>
   <nav>
     <a href="/dashboard">看板</a>
+    <a href="/live">实时标记</a>
+    <a href="/raw">LLM原始IO</a>
     <a class="on" href="/prompt">提示词测试</a>
-    <a id="liveLink" href="/live">实时标记</a>
-    <a id="rawLink" href="/raw">LLM原始IO</a>
-    <a id="ttsLink" href="/tts">TTS测试</a>
+    <a href="/tts">TTS测试</a>
   </nav>
 </header>
+
 <main>
-  <div class="product" id="product"><b>产品</b><span>加载中…</span></div>
-  <div id="flow" class="flow"></div>
-
-  <div class="panel">
-    <h2>可改参数（保存到覆盖层，mark_script 启动时读取）</h2>
-    <div class="grid" id="params"></div>
-  </div>
-
-  <div class="panel">
-    <h2>提示词（留空=用代码默认值）</h2>
-    <div class="prompts" id="prompts"></div>
-  </div>
-
-  <div class="panel">
-    <h2>例章 ch<span id="exlabel">003</span> · 输入 / 输出
-      <select id="exch" style="margin-left:8px"></select>
-      <button id="run" class="primary" style="float:right">保存覆盖并运行本章</button>
-      <span class="overridden" id="runstatus" style="float:right;margin-right:10px"></span>
-    </h2>
-    <div class="cols">
-      <div><h3 class="sub">输入（原文·段落流）</h3><div class="doc" id="rawdoc">加载中…</div></div>
-      <div><h3 class="sub">输出（marked·&lt;角色&gt; 标记）</h3><div class="doc" id="markeddoc">加载中…</div></div>
+  <!-- Version control -->
+  <div class="card" id="versionCard">
+    <div class="card-title">
+      版本
+      <select id="versionSel" style="background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:2px 6px;font-size:12px">
+        <option value="">Python 默认</option>
+      </select>
+      <button class="btn" onclick="restoreDefault()">恢复默认</button>
+      <button class="btn primary" onclick="saveVersion()">保存为新版本</button>
+      <span id="versionLabel" class="tag">default</span>
     </div>
-    <div class="detail" style="margin-top:8px">运行读取已保存的覆盖（workflow.json），日志：<a id="runlog" href="#" target="_blank">—</a> ·
-      原始 LLM I/O：<a id="rawio" href="#" target="_blank">—</a></div>
   </div>
 
-  <div class="panel">
-    <h2>Few-shot 示例（模型实际看到的示例；JSON：text / calls / results）<span class="overridden" id="fsstate"></span></h2>
-    <div class="field"><textarea id="fewshot" style="min-height:280px"></textarea></div>
+  <!-- Prompts (read-only from Python) -->
+  <div class="card">
+    <div class="card-title">提示词（Python 代码）<button class="btn" onclick="loadDefaults()" style="margin-left:auto">提取 Python 提示词</button></div>
+    <div style="margin-bottom:8px"><div style="color:var(--dim);font-size:12px;margin-bottom:3px">LOCAL_SYSTEM</div>
+      <textarea id="taLocal" rows="8" placeholder="LOCAL_SYSTEM"></textarea></div>
+    <div style="margin-bottom:8px"><div style="color:var(--dim);font-size:12px;margin-bottom:3px">STEP_MARK</div>
+      <textarea id="taStep" rows="4" placeholder="STEP_MARK"></textarea></div>
+    <div><div style="color:var(--dim);font-size:12px;margin-bottom:3px">CHECK_MARK</div>
+      <textarea id="taCheck" rows="4" placeholder="CHECK_MARK"></textarea></div>
   </div>
 
-  <div class="panel">
-    <h2>改动记录（双向可见）<span class="overridden" id="where"></span></h2>
-    <div class="log"><table id="logtable"><thead><tr><th>时间</th><th>来源</th><th>改动</th></tr></thead><tbody></tbody></table></div>
+  <!-- Params -->
+  <div class="card">
+    <div class="card-title">参数</div>
+    <div class="params-grid">
+      <div class="param-item"><label>batch</label><input id="pBatch" type="number" value="5" min="1" max="200"></div>
+      <div class="param-item"><label>max_steps</label><input id="pMaxSteps" type="number" value="120" min="1" max="5000"></div>
+      <div class="param-item"><label>check_steps</label><input id="pCheckSteps" type="number" value="100" min="0" max="500"></div>
+    </div>
+  </div>
+
+  <!-- Input text -->
+  <div class="card">
+    <div class="card-title">输入文章 <button class="btn" onclick="resetInput()" style="margin-left:auto">恢复默认输入</button></div>
+    <textarea id="taInput" rows="12" placeholder="输入文章内容…"></textarea>
+  </div>
+
+  <!-- Run -->
+  <div class="card">
+    <div class="card-title">
+      <button class="btn primary" id="runBtn" onclick="runTest()">运行章节测试</button>
+      <span id="runStatus" class="tag"></span>
+    </div>
+  </div>
+
+  <!-- History -->
+  <div class="card" style="display:flex;gap:0;min-height:300px">
+    <div style="width:280px;min-width:200px;border-right:1px solid var(--line);overflow-y:auto;max-height:500px" id="historyList">
+      <div class="card-title" style="padding:10px 12px;border-bottom:1px solid var(--line)">运行历史</div>
+      <div id="historyItems"><div class="empty">暂无记录</div></div>
+    </div>
+    <div style="flex:1;overflow-y:auto;max-height:500px;padding:14px" id="historyDetail">
+      <div class="empty">点击左侧记录查看详情</div>
+    </div>
   </div>
 </main>
-<div class="toast" id="toast"></div>
+
+<div id="statusBar">
+  <span>LLM: <span id="footLlm" style="color:var(--bad)">—</span></span>
+  <span>标注: <span id="footMark" style="color:var(--dim)">—</span></span>
+</div>
+<div id="toast"></div>
 
 <script>
-const $ = (id) => document.getElementById(id);
-const BASE = "/";
-let state = null, dirty = false;
+let currentVersion = "";  // "" = Python default
+let historyData = [];
+let pollTimer = null;
 
-function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
-function fmtTime(ts){if(!ts)return '';const d=new Date(ts*1000);return d.toLocaleString('zh-CN',{hour12:false});}
-function toast(msg, ok){const t=$('toast');t.textContent=msg;t.className='toast '+(ok?'ok':'bad');t.style.display='block';setTimeout(()=>{t.style.display='none';},2600);}
+function toast(msg){
+  const t=document.getElementById("toast"); t.textContent=msg; t.style.display="block";
+  setTimeout(()=>{ t.style.display="none"; },2000);
+}
 
-function renderProduct(p){
-  const tags=(p.tags||[]).map(t=>`<span class="chip">${esc(t.label)} <code>${esc(t.mark)}</code> <span style="color:var(--dim)">${esc(t.note)}</span></span>`).join('');
-  $('product').innerHTML = `<b>${esc(p.product.name)}</b><span style="color:var(--dim)">${esc(p.product.note)}</span><span>${tags}</span>`;
-}
-function renderFlow(p){
-  const parts=[];
-  (p.stages||[]).forEach((s,i)=>{
-    if(i) parts.push('<div class="arrow">→</div>');
-    parts.push(`<div class="stage ${s.editable?'editable':''}">
-      <h3>${esc(s.title)}</h3>
-      <div class="script">${esc(s.script)}</div>
-      <div class="io"><span>入</span> ${esc(s.input)}<br><span>出</span> ${esc(s.output)}</div>
-      <div class="detail">${esc(s.detail)}</div>
-      <div class="detail" style="margin-top:6px"><code>${esc(s.command)}</code></div>
-    </div>`);
-  });
-  $('flow').innerHTML = parts.join('');
-}
-function renderParams(st){
-  const defs = st.defaults.params, over = st.overlay.params || {};
-  const rows = [
-    ['batch','batch（前 N 章喂全文）', defs.batch, 1],
-    ['max_steps','max_steps（每章工具步数）', defs.max_steps, 1],
-    ['check_steps','check_steps（检查阶段工具步数，0=关闭）', defs.check_steps, 0],
-  ];
-  let html = rows.map(([key,label,val,min])=>`<div class="field"><label>${esc(label)} ${over[key]!==undefined?'<span class="overridden">已覆盖</span>':''}</label>
-    <input type="number" data-param="${key}" min="${min}" value="${esc(st.params[key])}"></div>`).join('');
-  $('params').innerHTML = html;
-  $('params').querySelectorAll('[data-param]').forEach(el=>{
-    el.addEventListener('input',()=>{dirty=true;});
-    el.addEventListener('change',()=>{dirty=true;});
-  });
-}
-function renderPrompts(st){
-  const defs = st.defaults.prompts, over = st.overlay.prompts || {};
-  const labels = {local_system:'人物词典提示词（LOCAL_SYSTEM）', step_mark:'任务提示词（STEP_MARK）', check_mark:'检查提示词（CHECK_MARK）'};
-  $('prompts').innerHTML = Object.keys(labels).map(key=>{
-    const value = over[key] !== undefined ? over[key] : defs[key];   // 预填当前生效文本，可直接改
-    return `<div class="field"><label>${esc(labels[key])} ${over[key]!==undefined?'<span class="overridden">已覆盖（保存即持久化）</span>':''}</label>
-      <textarea data-prompt="${key}">${esc(value)}</textarea></div>`;
-  }).join('');
-  $('prompts').querySelectorAll('[data-prompt]').forEach(el=>el.addEventListener('input',()=>{dirty=true;}));
-}
-function renderFewShot(st){
-  $('fewshot').value = JSON.stringify(st.few_shot || [], null, 2);
-  $('fsstate').textContent = st.few_shot_overridden ? '已覆盖（保存即持久化）' : '';
-}
-function renderLog(st){
-  const rows = (st.changelog||[]).map(e=>{
-    const changed=[];
-    Object.keys(e.params||{}).forEach(k=>changed.push(`param ${k}=${JSON.stringify(e.params[k])}`));
-    Object.keys(e.prompts||{}).forEach(k=>changed.push(`prompt ${k}`));
-    if(e.few_shot!==undefined) changed.push(`few_shot ×${e.few_shot}`);
-    if(e.cleared) changed.push('清除覆盖');
-    return `<tr><td>${fmtTime(e.ts)}</td><td>${esc(e.actor||'')}</td><td>${esc(changed.join(' · '))}</td></tr>`;
-  });
-  $('logtable').querySelector('tbody').innerHTML = rows.join('') || '<tr><td colspan="3" style="color:var(--dim)">暂无改动</td></tr>';
-  $('where').textContent = st.paths ? `覆盖文件：${st.paths.overlay}` : '';
-}
-let exampleChapter = Math.max(1, parseInt(new URLSearchParams(location.search).get('ch') || '3', 10) || 3);
-const pad = (n) => String(n).padStart(3, '0');
-function setExampleChapter(value){
-  exampleChapter = Math.max(1, parseInt(value, 10) || 1);
-  $('exlabel').textContent = pad(exampleChapter);
-  const url = new URL(location.href);
-  if(state) url.searchParams.set('book', state.book);
-  url.searchParams.set('ch', exampleChapter);
-  history.replaceState(null, '', url);
-  lastChapterSig = '';
-  loadChapter();
-}
-async function loadChapterList(){
-  const book = state && state.book;
-  if(!book) return;
+async function pollStatus(){
   try{
-    const data = await (await fetch('/chapters.json?book='+encodeURIComponent(book), {cache:'no-store'})).json();
-    const ids = data.chapters || [];
-    const sel = $('exch');
-    sel.innerHTML = ids.map(id=>`<option value="${id}">ch${pad(id)}</option>`).join('');
-    if(!ids.includes(exampleChapter)) sel.insertAdjacentHTML('afterbegin', `<option value="${exampleChapter}">ch${pad(exampleChapter)}</option>`);
-    sel.value = String(exampleChapter);
-  }catch(err){}
+    const r=await fetch("/status.json",{cache:"no-store"});
+    const d=await r.json();
+    const llmEl=document.getElementById("llmSt");
+    const markEl=document.getElementById("markSt");
+    if(d.llm&&d.llm.up){ llmEl.className="st-dot on"; document.getElementById("footLlm").textContent="up"; document.getElementById("footLlm").style.color="var(--ok)"; }
+    else{ llmEl.className="st-dot off"; document.getElementById("footLlm").textContent="down"; document.getElementById("footLlm").style.color="var(--bad)"; }
+    if(d.script&&d.script.running){ markEl.className="st-dot on"; document.getElementById("footMark").textContent=d.script.phase||"running"; document.getElementById("footMark").style.color="var(--ok)"; }
+    else{ markEl.className="st-dot off"; document.getElementById("footMark").textContent="idle"; document.getElementById("footMark").style.color="var(--dim)"; }
+  }catch(e){}
 }
 
-function renderDoc(text, marked){
-  const paras = String(text||'').split(/\n+/);
-  return paras.map(p=>{
-    const body = p.replace(/^[ \t\u3000]+/, '');
-    if(!body) return '';
-    let h = esc(body);
-    if(marked){
-      h = h.replace(/&lt;([^&<>]{1,24})&gt;/g, '<span class="who">$1</span><span class="speech">')
-           .replace(/&lt;\/([^&<>]{1,24})&gt;/g, '</span>');
+async function loadDefaults(){
+  try{
+    const r=await fetch("/prompt/defaults");
+    const d=await r.json();
+    if(!d.ok) return;
+    document.getElementById("taLocal").value=d.prompts.LOCAL_SYSTEM||"";
+    document.getElementById("taStep").value=d.prompts.STEP_MARK||"";
+    document.getElementById("taCheck").value=d.prompts.CHECK_MARK||"";
+    document.getElementById("taInput").value=d.input||"";
+    currentVersion="";
+    document.getElementById("versionSel").value="";
+    document.getElementById("versionLabel").textContent="default";
+    toast("已加载 Python 默认");
+  }catch(e){ toast("加载失败: "+e.message); }
+}
+
+function resetInput(){
+  loadDefaults();
+}
+
+async function loadVersions(){
+  try{
+    const r=await fetch("/prompt/versions");
+    const d=await r.json();
+    if(!d.ok) return;
+    const sel=document.getElementById("versionSel");
+    sel.innerHTML='<option value="">Python 默认</option>';
+    for(const v of d.versions){
+      const opt=document.createElement("option");
+      opt.value=v.id; opt.textContent=v.label||v.id;
+      sel.appendChild(opt);
     }
-    return `<p>${h}</p>`;
-  }).join('');
-}
-function fmtTs(ts){return ts?new Date(ts*1000).toLocaleString('zh-CN',{hour12:false}):'—';}
-let chapterTimer = null, lastChapterSig = '', lastStateSig = '';
-async function loadChapter(){
-  const book = state && state.book;
-  if(!book) return;
-  try{
-    const c = await (await fetch('/chapter.json?book='+encodeURIComponent(book)+'&chapter='+exampleChapter+'&t='+Date.now(),{cache:'no-store'})).json();
-    const sig = [c.raw.length, c.marked.length, c.marked_mtime, c.running].join('|');
-    if(sig === lastChapterSig) return;            // no change -> touch nothing (no flicker)
-    lastChapterSig = sig;
-    $('rawdoc').innerHTML = c.raw ? renderDoc(c.raw, false) : '<span style="color:var(--dim)">（无输入文件）</span>';
-    $('markeddoc').innerHTML = c.marked ? renderDoc(c.marked, true) : '<span style="color:var(--dim)">（尚未产出；点右上「保存覆盖并运行本章」）</span>';
-    $('runstatus').textContent = c.running ? ('运行中 pid '+c.pid) : (c.marked ? ('已产出 · '+fmtTs(c.marked_mtime)) : '未产出');
-  }catch(err){}
-}
-function render(st){
-  state = st;
-  renderProduct(st.pipeline);
-  renderFlow(st.pipeline);
-  renderParams(st);
-  renderPrompts(st);
-  renderFewShot(st);
-  renderLog(st);
-  const book = encodeURIComponent(st.book);
-  const b = "?book=" + book;
-  $('liveLink').href = "/live" + b;
-  $('rawLink').href = "/raw" + b;
-  $('ttsLink').href = "/tts" + b;
-  $('rawio').href = $('rawLink').href;
-  $('rawio').textContent = 'LLM原始IO';
-  lastChapterSig = '';
-  loadChapterList();
-  loadChapter();
-  if(chapterTimer) clearInterval(chapterTimer);
-  chapterTimer = setInterval(loadChapter, 3000);
-}
-async function runChapter(){
-  const book = state && state.book;
-  if(!book) return;
-  try{ await save(); }catch(err){ return; }
-  try{
-    const res = await (await fetch('/workflow/run', {method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({book, chapter:exampleChapter})})).json();
-    if(res.ok === false){ toast(res.message || '启动失败', false); return; }
-    $('runlog').href = "/" + res.log;
-    $('runlog').textContent = res.log;
-    toast('已启动 ch'+pad(exampleChapter), true);
-    loadChapter();
-  }catch(err){toast('启动失败：'+err, false);}
+  }catch(e){}
 }
 
-function collect(){
-  const params = {};
-  document.querySelectorAll('[data-param]').forEach(el=>{
-    const key = el.getAttribute('data-param');
-    if(el.type==='checkbox') params[key]=el.checked;
-    else { const v=parseInt(el.value,10); if(!Number.isNaN(v)) params[key]=v; }
-  });
-  const prompts = {};
-  document.querySelectorAll('[data-prompt]').forEach(el=>{
-    const v=el.value.trim();
-    if(v) prompts[el.getAttribute('data-prompt')]=v;   // empty = keep default
-  });
-  let fewShot = null;
-  try{ fewShot = JSON.parse($('fewshot').value); }
-  catch(err){ toast('few-shot JSON 解析失败：'+err.message, false); throw err; }
-  return {params, prompts, few_shot: fewShot};
-}
-async function loadBooks(){
+document.getElementById("versionSel").addEventListener("change", async function(){
+  const vid=this.value;
+  if(!vid){ loadDefaults(); return; }
   try{
-    const list = await (await fetch('/books.json?t='+Date.now(),{cache:'no-store'})).json();
-    const sel=$('booksel');
-    const qsBook = new URLSearchParams(location.search).get('book');
-    sel.innerHTML = list.map(x=>`<option value="${esc(x.book)}">${esc(x.book)}</option>`).join('');
-    if(qsBook) sel.value=qsBook;
-    sel.addEventListener('change',()=>{location.search='?book='+encodeURIComponent(sel.value);});
-    return sel.value;
-  }catch(err){toast('读取 books.json 失败', false); return '';}
-}
-async function loadState(){
-  const book = new URLSearchParams(location.search).get('book') || $('booksel').value;
-  if(!book) return;
-  if(!$('booksel').value) $('booksel').value=book;
-  const b = "?book=" + encodeURIComponent(book);
-  $("liveLink").href = "/live" + b;
-  $("rawLink").href = "/raw" + b;
-  $("ttsLink").href = "/tts" + b;
-  dirty=false;
+    const r=await fetch("/prompt/version/"+encodeURIComponent(vid));
+    const d=await r.json();
+    if(!d.ok) return;
+    const v=d.version;
+    document.getElementById("taLocal").value=v.prompts?.LOCAL_SYSTEM||"";
+    document.getElementById("taStep").value=v.prompts?.STEP_MARK||"";
+    document.getElementById("taCheck").value=v.prompts?.CHECK_MARK||"";
+    document.getElementById("taInput").value=v.input||"";
+    if(v.params){
+      if(v.params.batch) document.getElementById("pBatch").value=v.params.batch;
+      if(v.params.max_steps) document.getElementById("pMaxSteps").value=v.params.max_steps;
+      if(v.params.check_steps) document.getElementById("pCheckSteps").value=v.params.check_steps;
+    }
+    currentVersion=vid;
+    document.getElementById("versionLabel").textContent=v.label||vid;
+    toast("已加载版本 "+(v.label||vid));
+  }catch(e){ toast("加载失败"); }
+});
+
+async function saveVersion(){
+  const label=prompt("版本名称:", new Date().toLocaleString("zh-CN"));
+  if(label===null) return;
   try{
-    const st = await (await fetch('/workflow.json?book='+encodeURIComponent(book)+'&t='+Date.now(),{cache:'no-store'})).json();
-    const sig = JSON.stringify({p:st.params, r:st.prompts, o:st.overlay, c:st.changelog});
-    if(sig === lastStateSig) return;              // nothing changed -> no DOM churn
-    lastStateSig = sig;
-    render(st);
-  }catch(err){toast('读取 workflow.json 失败：'+err, false);}
+    const payload={
+      id: "v"+Date.now(),
+      label: label||undefined,
+      prompts:{
+        LOCAL_SYSTEM: document.getElementById("taLocal").value,
+        STEP_MARK: document.getElementById("taStep").value,
+        CHECK_MARK: document.getElementById("taCheck").value
+      },
+      input: document.getElementById("taInput").value,
+      params:{
+        batch: parseInt(document.getElementById("pBatch").value)||5,
+        max_steps: parseInt(document.getElementById("pMaxSteps").value)||120,
+        check_steps: parseInt(document.getElementById("pCheckSteps").value)||100
+      }
+    };
+    const r=await fetch("/prompt/version",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(d.ok){
+      currentVersion=payload.id;
+      document.getElementById("versionSel").value=currentVersion;
+      document.getElementById("versionLabel").textContent=payload.id;
+      await loadVersions();
+      toast("版本已保存");
+    }else toast("保存失败");
+  }catch(e){ toast("保存失败: "+e.message); }
 }
-async function save(){
-  const book = new URLSearchParams(location.search).get('book') || $('booksel').value;
+
+async function restoreDefault(){
+  if(!confirm("恢复到 Python 默认提示词？")) return;
+  await loadDefaults();
+  toast("已恢复默认");
+}
+
+async function runTest(){
+  const btn=document.getElementById("runBtn");
+  const st=document.getElementById("runStatus");
+  if(!confirm("运行章节测试？将自动保存当前状态。")) return;
+  btn.disabled=true; st.className="tag running"; st.textContent="运行中…";
   try{
-    const body = {book, ...collect()};
-    const st = await (await fetch('/workflow.json', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})).json();
-    lastStateSig = JSON.stringify({p:st.params, r:st.prompts, o:st.overlay, c:st.changelog});
-    render(st); toast('已保存覆盖', true); dirty=false;
-  }catch(err){toast('保存失败：'+err, false);}
+    const payload={
+      version_id: currentVersion||("v"+Date.now()),
+      prompts:{
+        LOCAL_SYSTEM: document.getElementById("taLocal").value,
+        STEP_MARK: document.getElementById("taStep").value,
+        CHECK_MARK: document.getElementById("taCheck").value
+      },
+      input: document.getElementById("taInput").value,
+      params:{
+        batch: parseInt(document.getElementById("pBatch").value)||5,
+        max_steps: parseInt(document.getElementById("pMaxSteps").value)||120,
+        check_steps: parseInt(document.getElementById("pCheckSteps").value)||100
+      }
+    };
+    const r=await fetch("/prompt/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(d.ok){
+      st.className="tag done"; st.textContent="已完成 (PID "+d.pid+")";
+      toast("测试已启动");
+      setTimeout(loadHistory,1000);
+    }else{
+      st.className="tag"; st.textContent="失败";
+      toast(d.message||"启动失败");
+    }
+  }catch(e){ st.className="tag"; st.textContent="失败"; toast("失败: "+e.message); }
+  btn.disabled=false;
 }
-async function reset(){
-  const book = new URLSearchParams(location.search).get('book') || $('booksel').value;
-  if(!book || !confirm('清除 '+book+' 的提示词/参数覆盖？')) return;
+
+async function loadHistory(){
   try{
-    const st = await (await fetch('/workflow.json', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({book, action:'clear'})})).json();
-    lastStateSig = JSON.stringify({p:st.params, r:st.prompts, o:st.overlay, c:st.changelog});
-    render(st); toast('已清除覆盖', true); dirty=false;
-  }catch(err){toast('清除失败：'+err, false);}
+    const r=await fetch("/prompt/history");
+    const d=await r.json();
+    if(!d.ok) return;
+    historyData=d.runs;
+    const el=document.getElementById("historyItems");
+    if(!d.runs.length){ el.innerHTML='<div class="empty">暂无记录</div>'; return; }
+    el.innerHTML="";
+    for(const run of d.runs){
+      const item=document.createElement("div");
+      item.className="history-item";
+      item.dataset.id=run.id;
+      item.innerHTML=`<span style="color:var(--dim);font-size:12px">${run.started_at||""}</span>
+        <span class="tag">${run.version_id||"-"}</span>
+        <span style="flex:1"></span>
+        <span style="color:var(--dim);font-size:11px">${run.id}</span>`;
+      item.onclick=()=>viewRun(run.id);
+      el.appendChild(item);
+    }
+  }catch(e){}
 }
-$('save').addEventListener('click', save);
-$('reset').addEventListener('click', reset);
-$('reload').addEventListener('click', ()=>{dirty=false; loadState();});
-$('run').addEventListener('click', runChapter);
-$('exch').addEventListener('change', ()=>setExampleChapter($('exch').value));
-$('fewshot').addEventListener('input', ()=>{dirty=true;});
-$('exlabel').textContent = pad(exampleChapter);
-window.addEventListener('beforeunload',(e)=>{if(dirty){e.preventDefault();e.returnValue='';}});
-loadBooks().then(loadState);
-setInterval(()=>{ if(!dirty) loadState(); }, 5000);
-</script></body></html>
+
+async function viewRun(rid){
+  try{
+    const r=await fetch("/prompt/run/"+encodeURIComponent(rid));
+    const d=await r.json();
+    if(!d.ok) return;
+    const run=d.run;
+    const el=document.getElementById("historyDetail");
+    // Highlight active
+    document.querySelectorAll(".history-item").forEach(e=>e.classList.toggle("active",e.dataset.id===rid));
+    el.innerHTML=`
+      <div style="margin-bottom:12px">
+        <div style="font-weight:700;margin-bottom:4px">记录 ${run.id}</div>
+        <div style="color:var(--dim);font-size:12px">版本: ${run.version_id||"-"} · ${run.started_at||""}</div>
+      </div>
+      <div style="margin-bottom:10px">
+        <div style="color:var(--dim);font-size:12px;margin-bottom:3px">LOCAL_SYSTEM</div>
+        <div style="background:var(--panel2);border-radius:6px;padding:8px;font-size:12px;white-space:pre-wrap;max-height:150px;overflow-y:auto">${esc(run.prompts?.LOCAL_SYSTEM||"")}</div>
+      </div>
+      <div style="margin-bottom:10px">
+        <div style="color:var(--dim);font-size:12px;margin-bottom:3px">STEP_MARK</div>
+        <div style="background:var(--panel2);border-radius:6px;padding:8px;font-size:12px;white-space:pre-wrap;max-height:100px;overflow-y:auto">${esc(run.prompts?.STEP_MARK||"")}</div>
+      </div>
+      <div style="margin-bottom:10px">
+        <div style="color:var(--dim);font-size:12px;margin-bottom:3px">CHECK_MARK</div>
+        <div style="background:var(--panel2);border-radius:6px;padding:8px;font-size:12px;white-space:pre-wrap;max-height:100px;overflow-y:auto">${esc(run.prompts?.CHECK_MARK||"")}</div>
+      </div>
+      <div style="margin-bottom:10px">
+        <div style="color:var(--dim);font-size:12px;margin-bottom:3px">输入文章</div>
+        <div style="background:var(--panel2);border-radius:6px;padding:8px;font-size:12px;white-space:pre-wrap;max-height:150px;overflow-y:auto">${esc(run.input||"")}</div>
+      </div>
+      ${run.output?`<div>
+        <div style="color:var(--dim);font-size:12px;margin-bottom:3px">输出结果</div>
+        <div style="background:var(--panel2);border-radius:6px;padding:8px;font-size:12px;white-space:pre-wrap;max-height:200px;overflow-y:auto">${esc(run.output)}</div>
+      </div>`:'<div class="empty">输出尚未完成或不可用</div>'}
+    `;
+  }catch(e){ document.getElementById("historyDetail").innerHTML='<div class="empty">加载失败</div>'; }
+}
+
+function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+// Init
+(async()=>{
+  await pollStatus();
+  await loadDefaults();
+  await loadVersions();
+  await loadHistory();
+  pollTimer = setInterval(pollStatus, 3000);
+})();
+</script>
+</body></html>

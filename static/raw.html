@@ -37,6 +37,12 @@ pre{white-space:pre-wrap;word-break:break-word;background:#0f141b;border:1px sol
   <input id="q" placeholder="过滤…（step/正文/失败）">
   <button id="follow" class="on">跟随最新</button>
   <span class="dim" id="meta"></span>
+  <div style="display:flex;align-items:center;gap:8px;font-size:12px;margin-left:8px">
+    <span style="width:6px;height:6px;border-radius:50%;flex-shrink:0" id="llmDot"></span>
+    <span id="llmLabel" class="dim">LLM: ?</span>
+    <span style="color:#26303f">|</span>
+    <span id="scriptLabel" class="dim">标注: ?</span>
+  </div>
   <span class="grow"></span>
   <nav>
     <a href="/dashboard">看板</a>
@@ -169,5 +175,18 @@ async function tick(){
 q.addEventListener('input',applyFilter);
 followBtn.addEventListener('click',function(){follow=!follow;followBtn.classList.toggle('on',follow);scrollBottom();});
 window.addEventListener('scroll',function(){if(!follow)return;if(document.documentElement.scrollHeight-window.scrollY-window.innerHeight>160){follow=false;followBtn.classList.remove('on');}});
+// ── Status polling ──────────────────────────────────────────────────────
+async function pollStatus(){
+  try{
+    const st = await (await fetch('/status.json?book='+encodeURIComponent(BOOK)+'&t='+Date.now(),{cache:'no-store'})).json();
+    const llmDot=$('llmDot'), llmLabel=$('llmLabel'), scriptLabel=$('scriptLabel');
+    if(st.llm&&st.llm.up){llmDot.style.background='var(--ok)';llmLabel.textContent='LLM: 已启动';llmLabel.style.color='var(--ok)';}
+    else{llmDot.style.background='var(--bad)';llmLabel.textContent='LLM: 未启动';llmLabel.style.color='var(--dim)';}
+    const sc=st.script||{};
+    if(sc.running){scriptLabel.textContent='标注: '+(sc.paused?'已暂停':'运行中');scriptLabel.style.color=sc.paused?'var(--warn)':'var(--ok)';}
+    else{scriptLabel.textContent='标注: 未启动';scriptLabel.style.color='var(--dim)';}
+  }catch(e){}
+}
+pollStatus(); setInterval(pollStatus,3000);
 tick();
 </script></body></html>
