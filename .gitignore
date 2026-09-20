@@ -12,3 +12,7 @@ benchmarks/
 opencode.json
 assets
 pyrightconfig.json
+
+# Prompt test runtime data
+prompt_test/runs/
+prompt_test/versions/
