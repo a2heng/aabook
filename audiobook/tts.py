@@ -423,6 +423,16 @@ def start_server(
     ]
     if config.webui:
         cmd.append("--webui")
+    # The binary's RUNPATH may be stale (the repo moved): point LD_LIBRARY_PATH at the libs
+    # that were built next to it, so the server always finds libggml/libggml-cuda.
+    env = dict(os.environ)
+    lib_dirs = [
+        binary.parent,
+        binary.parent / "third_party" / "ggml" / "src",
+        binary.parent / "third_party" / "ggml" / "src" / "ggml-cuda",
+    ]
+    existing = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = ":".join([str(d) for d in lib_dirs if d.is_dir()] + ([existing] if existing else []))
     log(f"[breeze] starting server -> {log_path}")
     with log_path.open("a", encoding="utf-8") as handle:
         process = subprocess.Popen(
@@ -431,6 +441,7 @@ def start_server(
             stdout=handle,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=env,
         )
     try:
         deadline = time.time() + wait
@@ -516,6 +527,63 @@ def voice_map_from_args(spec: list[str] | None) -> dict[str, str]:
         if role.strip() and Path(path).is_file():
             voices[role.strip()] = path.strip()
     return voices
+
+
+def trim_reference(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Strict VAD cleanup for a DESIGNED reference voice.
+
+    Keeps only speech spans (drops leading/trailing breath and internal silence), trims the
+    edges at a strict amplitude threshold and fades the tail -- otherwise the clone inherits
+    the breathing tail of the reference.
+    """
+    try:
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+    except Exception:  # noqa: BLE001 - VAD unavailable: keep the audio as-is
+        return samples
+    mono = np.asarray(samples, dtype=np.float32)
+    if mono.ndim > 1:
+        mono = mono.mean(axis=1)
+    target = 16000
+    if sample_rate != target:
+        from math import gcd
+
+        from scipy.signal import resample_poly
+
+        divisor = gcd(sample_rate, target)
+        audio = resample_poly(mono, target // divisor, sample_rate // divisor)
+        scale = sample_rate / target
+    else:
+        audio, scale = mono, 1.0
+    options = VadOptions(
+        threshold=0.5,
+        min_speech_duration_ms=200,
+        min_silence_duration_ms=60,
+        speech_pad_ms=30,
+    )
+    stamps = get_speech_timestamps(audio, options, sampling_rate=target)
+    spans = [(int(stamp["start"] * scale), int(stamp["end"] * scale)) for stamp in stamps]
+    if spans:
+        fade = int(0.005 * sample_rate)
+        gap = np.zeros(int(0.03 * sample_rate), dtype=np.float32)
+        parts: list[np.ndarray] = []
+        for start, end in spans:
+            segment = mono[max(0, start) : min(len(mono), end)].astype(np.float32).copy()
+            edge = min(fade, len(segment) // 2)
+            if edge > 0:
+                segment[:edge] *= np.linspace(0.0, 1.0, edge, dtype=np.float32)
+                segment[-edge:] *= np.linspace(1.0, 0.0, edge, dtype=np.float32)
+            if parts and gap.size:
+                parts.append(gap)
+            parts.append(segment)
+        if parts:
+            mono = np.concatenate(parts)
+    loud = np.where(np.abs(mono) > 0.02)[0]
+    if loud.size:
+        mono = mono[loud[0] : loud[-1] + 1]
+    fade = min(len(mono), int(0.03 * sample_rate))
+    if fade:
+        mono[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+    return mono
 
 
 class BreezeRenderer:
@@ -610,7 +678,10 @@ class BreezeRenderer:
         return np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32768.0, rate
 
     def design_voice(self, text: str, instruction: str, *, seed: int | None = None):
-        """Synthesize a fresh voice from a description (no reference audio)."""
+        """Synthesize a fresh voice from a description (no reference audio).
+
+        The result is VAD-trimmed (``trim_reference``): a reference with a breathing tail makes
+        every clone inherit that breath."""
         if not instruction.strip():
             raise ValueError("voice design requires an instruction")
         fields = {
@@ -619,7 +690,8 @@ class BreezeRenderer:
             "cfg_scale": str(self.config.cfg_scale),
             "seed": str(self.config.seed if seed is None else seed),
         }
-        return self._post(fields, None, "design")
+        samples, rate = self._post(fields, None, "design")
+        return trim_reference(samples, rate), rate
 
     def synth(self, row: ScriptRow, voice_ref: str, ref_text: str = "", role_style: str = ""):
         cfg = self.cfg_for(row.tts_text)

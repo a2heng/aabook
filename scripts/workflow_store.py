@@ -21,7 +21,7 @@ from pathlib import Path
 APP_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_ROOT))
 
-PROMPT_KEYS = ("local_system", "step_mark", "roster_system", "check_mark")
+PROMPT_KEYS = ("local_system", "step_mark", "check_mark")
 FEW_SHOT_KEYS = ("text", "calls", "results")
 PARAM_RANGES = {"batch": (1, 200), "max_steps": (1, 5000), "check_steps": (0, 500)}
 
@@ -118,12 +118,10 @@ def defaults() -> dict:
             "batch": 5,  # mark_script `--batch`: first N chapters fed in full, then the summary rolls
             "max_steps": 1000,
             "check_steps": mark_script.DEFAULT_CHECK_STEPS,
-            "think": mark_script.THINK,
         },
         "prompts": {
             "local_system": mark_script.LOCAL_SYSTEM,
             "step_mark": mark_script.STEP_MARK,
-            "roster_system": mark_script.ROSTER_SYSTEM,
             "check_mark": mark_script.CHECK_MARK,
         },
     }
@@ -187,9 +185,6 @@ def merged(book: str, base: Path | None = None) -> dict:
 def _clean_params(params: dict) -> dict:
     clean: dict = {}
     for key, value in (params or {}).items():
-        if key == "think":
-            clean[key] = bool(value)
-            continue
         if key not in PARAM_RANGES:
             raise ValueError(f"unknown param: {key}")
         if isinstance(value, bool) or not isinstance(value, int):

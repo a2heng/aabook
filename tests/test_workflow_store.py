@@ -41,10 +41,10 @@ class WorkflowStoreTest(unittest.TestCase):
             workflow_store.save("b", {"prompts": {"nope": "x"}}, base=self.base)
 
     def test_clear_removes_overlay(self):
-        workflow_store.save("b", {"params": {"think": False}}, base=self.base)
-        self.assertFalse(workflow_store.merged("b", self.base)["params"]["think"])
+        workflow_store.save("b", {"params": {"check_steps": 7}}, base=self.base)
+        self.assertEqual(workflow_store.merged("b", self.base)["params"]["check_steps"], 7)
         state = workflow_store.clear("b", actor="agent", base=self.base)
-        self.assertEqual(state["params"]["think"], state["defaults"]["params"]["think"])
+        self.assertEqual(state["params"]["check_steps"], state["defaults"]["params"]["check_steps"])
         self.assertTrue(state["changelog"][0]["cleared"])
 
     def test_few_shot_defaults_and_save(self):

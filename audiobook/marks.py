@@ -217,6 +217,14 @@ def render_diff_html(original: str, marked: str, path, title: str = "改后 / �
     )
 
 
+_TTS_QUOTE_STRIP = str.maketrans("", "", "“”‘’「」『』")
+
+
+def tts_text_of(text: str) -> str:
+    """Text sent to TTS: quotes stay in ``raw_text`` but are not read aloud."""
+    return text.translate(_TTS_QUOTE_STRIP)
+
+
 def to_script_rows(
     text: str,
     cast: Cast,
@@ -239,7 +247,7 @@ def to_script_rows(
                 role_id=role.role_id if role else "narrator",
                 role_name=role.name if role else segment["role_name"],
                 raw_text=segment["text"],
-                tts_text=segment["text"],
+                tts_text=tts_text_of(segment["text"]),
                 voice_ref=role.voice_ref if role else "",
                 style_desc=role.style_desc if role else "",
                 target_duration_s=round(_estimate(segment["text"]), 3),

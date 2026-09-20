@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-lufs", type=float, default=-16.0)
     parser.add_argument("--start", type=int, default=0, help="first chapter id (script stage)")
     parser.add_argument("--end", type=int, default=0, help="last chapter id (script stage)")
-    parser.add_argument("--limit", type=int, default=20, help="only N chapters (global+script); 0 = whole book")
+    parser.add_argument("--limit", type=int, default=0, help="only N chapters (global+script); 0 = whole book")
     parser.add_argument("--force", action="store_true", help="rebuild completed chapters")
     return parser.parse_args()
 

@@ -1,19 +1,20 @@
 <!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>有声书流水线 · 结构与参数</title>
+<title>提示词测试 · 结构与参数</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1017;--panel:#151a23;--panel2:#1b2230;--line:#26303f;--fg:#e6ecf3;--dim:#8b97a8;
   --accent:#5aa9ff;--ok:#43c785;--warn:#ffb454;--bad:#ff7b7b}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,-apple-system,"Noto Sans CJK SC","Microsoft YaHei",sans-serif}
-header{position:sticky;top:0;z-index:6;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px 18px;background:var(--panel);border-bottom:1px solid var(--line)}
-header b{font-size:15px}
+header{position:sticky;top:0;z-index:6;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px 18px;background:#101319;border-bottom:1px solid var(--line)}
+.brand{font-weight:700;font-size:15px}.brand small{color:var(--dim);font-weight:400;margin-left:6px}
 header select,header button,header input{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:4px 10px;font-size:13px}
 header button{cursor:pointer}
 header button.primary{background:var(--accent);border-color:var(--accent);color:#0b0f15;font-weight:700}
 header .grow{flex:1}
 a{color:var(--accent);text-decoration:none}
+nav a{color:var(--accent);text-decoration:none;margin-right:12px;font-size:13px}nav a.on{color:var(--fg);font-weight:700}
 main{padding:16px 18px 80px;max-width:1500px;margin:0 auto}
 .product{display:flex;gap:14px;align-items:center;flex-wrap:wrap;background:linear-gradient(90deg,#12233a,#151a23);border:1px solid #2b4a72;border-radius:12px;padding:10px 14px}
 .product b{color:#9fd0ff}
@@ -54,18 +55,18 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d1219;border
 @media (max-width:820px){main{padding:12px}.stage{min-width:220px}}
 </style></head><body>
 <header>
-  <b>有声书流水线</b>
-  <span>产品 = 文本，章节只是标记</span>
-  <span class="grow"></span>
+  <div class="brand">提示词测试 <small>产品 = 文本，章节只是标记</small></div>
   <select id="booksel"></select>
   <button id="reload">刷新</button>
   <button id="save" class="primary">保存覆盖</button>
   <button id="reset">清除覆盖</button>
-  <nav style="display:flex;gap:12px;font-size:13px">
+  <span style="flex:1"></span>
+  <nav>
     <a href="/dashboard">看板</a>
-    <a id="live" href="#">Live</a>
-    <a id="raw" href="#">原始 I/O</a>
-    <a href="/">文件库</a>
+    <a class="on" href="/prompt">提示词测试</a>
+    <a id="liveLink" href="/live">实时标记</a>
+    <a id="rawLink" href="/raw">LLM原始IO</a>
+    <a id="ttsLink" href="/tts">TTS测试</a>
   </nav>
 </header>
 <main>
@@ -144,9 +145,6 @@ function renderParams(st){
   ];
   let html = rows.map(([key,label,val,min])=>`<div class="field"><label>${esc(label)} ${over[key]!==undefined?'<span class="overridden">已覆盖</span>':''}</label>
     <input type="number" data-param="${key}" min="${min}" value="${esc(st.params[key])}"></div>`).join('');
-  const thinkOver = over.think!==undefined?'<span class="overridden">已覆盖</span>':'';
-  html += `<div class="field"><label>think（模型思考） ${thinkOver}</label>
-    <input type="checkbox" data-param="think" ${st.params.think?'checked':''}> 启用</div>`;
   $('params').innerHTML = html;
   $('params').querySelectorAll('[data-param]').forEach(el=>{
     el.addEventListener('input',()=>{dirty=true;});
@@ -155,7 +153,7 @@ function renderParams(st){
 }
 function renderPrompts(st){
   const defs = st.defaults.prompts, over = st.overlay.prompts || {};
-  const labels = {local_system:'主提示词（LOCAL_SYSTEM）', step_mark:'任务提示词（STEP_MARK）', roster_system:'人物词典提示词（ROSTER_SYSTEM）', check_mark:'检查提示词（CHECK_MARK）'};
+  const labels = {local_system:'人物词典提示词（LOCAL_SYSTEM）', step_mark:'任务提示词（STEP_MARK）', check_mark:'检查提示词（CHECK_MARK）'};
   $('prompts').innerHTML = Object.keys(labels).map(key=>{
     const value = over[key] !== undefined ? over[key] : defs[key];   // 预填当前生效文本，可直接改
     return `<div class="field"><label>${esc(labels[key])} ${over[key]!==undefined?'<span class="overridden">已覆盖（保存即持久化）</span>':''}</label>
@@ -241,10 +239,12 @@ function render(st){
   renderFewShot(st);
   renderLog(st);
   const book = encodeURIComponent(st.book);
-  $('live').href = "/live?book=" + book;
-  $('raw').href = "/outputs/" + book + "/script/llm_raw.html";
-  $('rawio').href = $('raw').href;
-  $('rawio').textContent = 'llm_raw.html';
+  const b = "?book=" + book;
+  $('liveLink').href = "/live" + b;
+  $('rawLink').href = "/raw" + b;
+  $('ttsLink').href = "/tts" + b;
+  $('rawio').href = $('rawLink').href;
+  $('rawio').textContent = 'LLM原始IO';
   lastChapterSig = '';
   loadChapterList();
   loadChapter();
@@ -258,6 +258,7 @@ async function runChapter(){
   try{
     const res = await (await fetch('/workflow/run', {method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({book, chapter:exampleChapter})})).json();
+    if(res.ok === false){ toast(res.message || '启动失败', false); return; }
     $('runlog').href = "/" + res.log;
     $('runlog').textContent = res.log;
     toast('已启动 ch'+pad(exampleChapter), true);
@@ -297,6 +298,10 @@ async function loadState(){
   const book = new URLSearchParams(location.search).get('book') || $('booksel').value;
   if(!book) return;
   if(!$('booksel').value) $('booksel').value=book;
+  const b = "?book=" + encodeURIComponent(book);
+  $("liveLink").href = "/live" + b;
+  $("rawLink").href = "/raw" + b;
+  $("ttsLink").href = "/tts" + b;
   dirty=false;
   try{
     const st = await (await fetch('/workflow.json?book='+encodeURIComponent(book)+'&t='+Date.now(),{cache:'no-store'})).json();

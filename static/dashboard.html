@@ -1,0 +1,261 @@
+<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>有声书看板</title>
+<style>
+:root{color-scheme:dark;--bg:#0d1017;--panel:#151a23;--panel2:#1b2230;--line:#26303f;--fg:#e6ecf3;--dim:#8b97a8;
+  --accent:#5aa9ff;--ok:#43c785;--warn:#ffb454;--bad:#ff7b7b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,-apple-system,"Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+header{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#101319;z-index:5}
+.brand{font-weight:700}.brand small{color:var(--dim);font-weight:400;margin-left:6px}
+input,button,select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:5px 9px;font-size:13px}
+button{cursor:pointer}button:hover{border-color:var(--accent)}button.primary{background:var(--accent);color:#0b0f15;font-weight:700}
+.chips{display:flex;gap:8px;flex-wrap:wrap}
+.chip{font-size:12px;border:1px solid var(--line);border-radius:999px;padding:3px 10px;color:var(--dim);background:var(--panel)}
+.chip.ok{border-color:#1f4a33;color:var(--ok)}.chip.run{border-color:#25415f;color:var(--accent)}.chip.pending{opacity:.6}
+.tabs{display:flex;gap:6px;padding:10px 18px 0}
+.tab{padding:5px 12px;border:1px solid var(--line);border-bottom:none;border-radius:8px 8px 0 0;color:var(--dim);cursor:pointer;font-size:13px}
+.tab.on{color:var(--fg);background:var(--panel);border-color:var(--accent)}
+main{padding:0 0 60px}
+section{display:none}section.on{display:block}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
+.ch{border:1px solid var(--line);border-radius:8px;padding:7px 9px;background:var(--panel);font-size:12.5px;cursor:pointer}
+.ch:hover{border-color:var(--accent)}.ch.done{border-color:#1f4a33}.ch.cur{border-color:var(--accent)}
+.ch b{display:block;font-size:13px}.ch small{color:var(--dim)}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border:1px solid var(--line);padding:5px 8px;vertical-align:top;text-align:left}
+th{background:var(--panel2);color:var(--dim)}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+nav a{color:var(--accent);text-decoration:none;margin-right:12px;font-size:13px}nav a.on{color:var(--fg);font-weight:700}
+pre{white-space:pre-wrap;background:#0f141b;border:1px solid var(--line);border-radius:8px;padding:10px;font-size:13px;max-height:70vh;overflow:auto}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:900px){.two{grid-template-columns:1fr}}
+.muted{color:var(--dim)}
+.pipe{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+</style></head><body>
+<header>
+  <div class="brand">LLM看板 <small id="bk">—</small></div>
+  <select id="booksel" onchange="document.getElementById('book').value=this.value;load()"></select>
+  <input id="book" placeholder="book 名" style="width:150px">
+  <button onclick="load()">加载项目</button>
+  <button onclick="llmUp()">启动 LLM</button>
+  <button onclick="llmDown()">停止 LLM</button>
+  <button class="primary" onclick="startScript()">启动标注</button>
+  <span id="llmState" class="muted" style="font-size:12px">LLM: ?</span>
+  <div class="chips" id="stages"></div>
+  <span style="flex:1"></span>
+  <nav>
+    <a class="on" href="/dashboard">看板</a>
+    <a id="navPrompt" href="/prompt">提示词测试</a>
+    <a id="navLive" href="/live">实时标记</a>
+    <a id="navRaw" href="/raw">LLM原始IO</a>
+    <a id="navTts" href="/tts">TTS测试</a>
+  </nav>
+</header>
+<div style="max-width:1280px;margin:0 auto;padding:14px 16px 0">
+  <div style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:14px">
+    <div style="font-size:14px;color:#9fd0ff;font-weight:700;margin-bottom:10px">准备书籍</div>
+    <div class="pipe">
+      <label style="color:var(--dim);font-size:12px">选择 txt</label>
+      <select id="prepTxt" onchange="autoBookName()" style="flex:1"></select>
+      <label style="color:var(--dim);font-size:12px">书名</label>
+      <input id="prepBook" placeholder="书名" style="width:120px">
+      <button onclick="prepareBook()">准备（切章）</button>
+      <span id="prepMsg" class="muted" style="font-size:12px"></span>
+    </div>
+  </div>
+  <div class="tabs">
+    <div class="tab on" data-t="ch">章节进度</div>
+    <div class="tab" data-t="dict">人物词典</div>
+    <div class="tab" data-t="sum">每章摘要</div>
+    <div class="tab" data-t="res">成果</div>
+  </div>
+  <main>
+    <section id="ch" class="on"><div id="chgrid" class="grid"></div></section>
+    <section id="dict"><div id="dictbox" class="muted">加载中…</div></section>
+    <section id="sum"><div id="sumbox" class="muted">加载中…</div></section>
+    <section id="res"><div id="resbox" class="muted">加载中…</div></section>
+    <section id="viewer"><pre id="view"></pre></section>
+  </main>
+</div>
+<script>
+const BASE = "/";
+const qs = new URLSearchParams(location.search);
+let book = qs.get("book") || "";
+document.getElementById("book").value = book;
+
+async function jget(p){ try{ const sep = p.indexOf("?") >= 0 ? "&" : "?"; const r = await fetch(BASE + p + sep + "t=" + Date.now(), {cache:"no-store"}); if(!r.ok) return null; const t = await r.text(); try{ return JSON.parse(t); }catch(e){ return null; } }catch(e){ return null; } }
+
+async function load(){
+  book = document.getElementById("book").value.trim() || document.getElementById("booksel").value;
+  if(!book){ return; }
+  document.getElementById("book").value = book;
+  history.replaceState(null,"", "?book=" + encodeURIComponent(book));
+  document.getElementById("bk").textContent = "— " + book;
+  const b = "?book=" + encodeURIComponent(book);
+  document.getElementById("navPrompt").href = "/prompt" + b;
+  document.getElementById("navLive").href = "/live" + b;
+  document.getElementById("navRaw").href = "/raw" + b;
+  document.getElementById("navTts").href = "/tts" + b;
+  const root = "outputs/" + book + "/";
+  const [pipe, idx, roles, sums, manifest, chap] = await Promise.all([
+    jget(root + "pipeline.json"), jget(root + "script/live_index.json"),
+    jget(root + "script/roles.json"), jget(root + "script/summaries.json"),
+    jget(root + "render/render_manifest.json"),
+    jget("chapters.json?book=" + encodeURIComponent(book)),
+  ]);
+  renderStages(pipe);
+  renderChapters(idx, root, (chap && chap.chapters) || []);
+  renderDict(roles);
+  renderSummaries(sums);
+  renderResults(manifest, root);
+}
+
+function renderStages(pipe){
+  const order = ["prepare","global","script","convert","voicebank","render"];
+  const st = (pipe && pipe.stages) || {};
+  document.getElementById("stages").innerHTML = order.map(s=>{
+    const v = st[s]; const cls = !v ? "pending" : (v.status === "done" ? "ok" : "run");
+    const note = v && v.note ? " " + v.note : "";
+    return `<span class="chip ${cls}">${s}${note}</span>`;
+  }).join("");
+}
+
+function renderChapters(idx, root, allIds){
+  const box = document.getElementById("chgrid");
+  const known = (idx && idx.chapters) || {};
+  const ids = (allIds && allIds.length ? allIds.slice() : Object.keys(known).map(Number)).sort((a,b)=>a-b);
+  if(!ids.length){ box.innerHTML = '<span class="muted">暂无章节</span>'; return; }
+  const cur = idx && idx.current;
+  box.innerHTML = ids.map(c=>{
+    const e = known[c] || {}; const done = e.done;
+    const cls = done ? "done" : (c===cur ? "cur" : "");
+    return `<div class="ch ${cls}" onclick="view(${c},'${root}')"><b>第 ${c} 章 ${done?"✔":""}</b><small>${e.chars||0} 字</small></div>`;
+  }).join("");
+}
+
+async function view(c, root){
+  const txt = await (await fetch(BASE + root + "script/ch" + String(c).padStart(3,"0") + ".marked.txt?t=" + Date.now(), {cache:"no-store"})).text();
+  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("on"));
+  document.querySelectorAll("section").forEach(s=>s.classList.remove("on"));
+  document.getElementById("viewer").classList.add("on");
+  document.getElementById("view").textContent = txt || "(空)";
+  const tab = document.createElement("div"); // allow going back
+  document.getElementById("viewer").scrollIntoView();
+}
+
+function renderDict(roles){
+  const box = document.getElementById("dictbox");
+  if(!roles){ box.textContent = "暂无词典"; return; }
+  const rows = Object.entries(roles).map(([n,ls])=>`<tr><td>${esc(n)}</td><td>${(ls||[]).map(esc).join("、")}</td></tr>`).join("");
+  box.innerHTML = rows ? `<table><thead><tr><th>规范名</th><th>别名/称谓</th></tr></thead><tbody>${rows}</tbody></table>` : '<span class="muted">空</span>';
+}
+
+function renderSummaries(sums){
+  const box = document.getElementById("sumbox");
+  if(!sums){ box.textContent = "暂无摘要"; return; }
+  const ids = Object.keys(sums).map(Number).sort((a,b)=>a-b);
+  box.innerHTML = `<table><thead><tr><th>章</th><th>摘要</th></tr></thead><tbody>` +
+    ids.map(c=>`<tr><td>${c}</td><td>${esc(sums[String(c)])}</td></tr>`).join("") + "</tbody></table>";
+}
+
+function renderResults(manifest, root){
+  const box = document.getElementById("resbox");
+  const parts = [];
+  if(manifest){ parts.push(`<p>渲染：${manifest.rows||0} 行 · ${manifest.audio_seconds||0}s 音频 · ${manifest.chapters||0} 章 · <a href="${BASE}outputs/${book}/render/" target="_blank">打开渲染目录</a></p>`); }
+  else { parts.push('<p class="muted">尚无渲染产物。</p>'); }
+  parts.push('<p><a href="/live?book=' + encodeURIComponent(book) + '" target="_blank">打开实时标记（聊天 + 就地标注）</a></p>');
+  box.innerHTML = parts.join("");
+}
+
+function esc(s){ return String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+
+async function loadTxtList(){
+  try{
+    const d = await (await fetch("/txt/list")).json();
+    const sel = document.getElementById("prepTxt");
+    sel.innerHTML = '<option value="">— 选择 txt 文件 —</option>' +
+      d.files.map(f => '<option value="'+f+'">'+f+'</option>').join("");
+    if(d.files.length) sel.selectedIndex = 1;
+    autoBookName();
+  }catch(e){}
+}
+function autoBookName(){
+  const sel = document.getElementById("prepTxt");
+  const name = sel.value.replace(/\.txt$/i, "") || "";
+  document.getElementById("prepBook").value = name;
+}
+async function prepareBook(){
+  const sel = document.getElementById("prepTxt");
+  const txt = sel.value ? "assets/txt/" + sel.value : "";
+  const book = document.getElementById("prepBook").value.trim();
+  if(!txt||!book){ document.getElementById("prepMsg").textContent = "请选择 txt 并填写书名"; return; }
+  document.getElementById("prepMsg").textContent = "准备中…";
+  try{
+    const r = await fetch("/prepare", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({txt, book})});
+    if(!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    document.getElementById("prepMsg").textContent = d.message;
+    loadBooks().then(()=>{ document.getElementById("booksel").value=book; load(); });
+  }catch(e){ document.getElementById("prepMsg").textContent = String(e); }
+}
+async function llmUp(){
+  document.getElementById("llmState").textContent = "LLM: 启动中…";
+  try{
+    const r = await fetch("/llm/up", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    if(!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    document.getElementById("llmState").textContent = d.message;
+  }catch(e){ document.getElementById("llmState").textContent = String(e); }
+  tickLLM();
+}
+async function llmDown(){
+  if(!confirm("停止 LLM？")) return;
+  document.getElementById("llmState").textContent = "LLM: 停止中…";
+  try{
+    const r = await fetch("/llm/down", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    if(!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    document.getElementById("llmState").textContent = d.message;
+  }catch(e){ document.getElementById("llmState").textContent = String(e); }
+  tickLLM();
+}
+async function tickLLM(){
+  try{
+    const d = await (await fetch("/llm/status.json?t="+Date.now(),{cache:"no-store"})).json();
+    document.getElementById("llmState").textContent = d.up ? "LLM: 已启动" : "LLM: 未启动";
+    document.getElementById("llmState").style.color = d.up ? "var(--ok)" : "var(--dim)";
+  }catch(e){}
+}
+async function startScript(){
+  const btn = document.querySelector('[onclick="startScript()"]');
+  const b = book || document.getElementById("booksel").value;
+  if(!b){ alert("请先选书"); return; }
+  if(!confirm("启动标注？需要 LLM 已启动。")) return;
+  btn.disabled = true; btn.textContent = "启动中…";
+  try{
+    const r = await fetch("/script", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({book:b})});
+    const d = await r.json();
+    if(!d.ok){ alert(d.message || "启动失败"); }
+    else { alert(d.message); }
+  }catch(e){ alert("失败: " + e.message); }
+  btn.disabled = false; btn.textContent = "启动标注";
+}
+
+document.querySelectorAll(".tab").forEach(t=>t.addEventListener("click",()=>{
+  document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));
+  document.querySelectorAll("section").forEach(s=>s.classList.remove("on"));
+  t.classList.add("on"); document.getElementById(t.dataset.t).classList.add("on");
+}));
+async function loadBooks(){
+  try{ const r = await fetch("/books.json?t=" + Date.now(), {cache:"no-store"}); const list = await r.json();
+    const sel = document.getElementById("booksel");
+    sel.innerHTML = list.map(x=>`<option value="${x.book}">${x.book}</option>`).join("");
+    if(!book && list.length){ book = list[0].book; document.getElementById("book").value = book; }
+  }catch(e){}
+}
+loadBooks().then(()=>{ if(book){ document.getElementById("booksel").value=book; load(); } });
+loadTxtList();
+tickLLM();
+setInterval(()=>{ if(book) load(); }, 5000);
+</script></body></html>

@@ -31,9 +31,12 @@ from pathlib import Path
 APP_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_ROOT))
 
-THINK = os.environ.get("AUDIOBOOK_THINK", "1").lower() not in ("0", "off", "false", "no")
+THINK = True  # 标注/检查/词典均开思考
+REASONING_BUDGET = int(os.environ.get("AUDIOBOOK_REASONING_BUDGET", "4096"))  # 思考上限
+OUTPUT_TOKENS = int(os.environ.get("AUDIOBOOK_OUTPUT_TOKENS", "2048"))  # 思考之外的输出上限
+MAX_TOKENS = REASONING_BUDGET + OUTPUT_TOKENS  # max_tokens = 思考 + 输出
 
-from audiobook.llm import LLMClient, config_from_env, raw_log, reasoning_of  # noqa: E402
+from audiobook.llm import config_from_env, raw_log, reasoning_of  # noqa: E402
 from audiobook.marks import (  # noqa: E402
     NARRATOR,
     live_fragments,
@@ -44,123 +47,55 @@ from audiobook.marks import (  # noqa: E402
 from audiobook.schema import Cast  # noqa: E402
 
 
-_CLAUSE_RE = re.compile(r"[0-9A-Za-z\u3400-\u4dbf\u4e00-\u9fff]+")
-# Structural markers never count as sub-clauses: mark tags, chapter/section markers, labels.
-_MARKER_RE = re.compile(r"<[^<>\n]*>|【[^】\n]*】|\[[^\]\n]*\]")
+OPEN = "“『「"
+CLOSE = "”』」"
 
 
-def _visible_view(line: str) -> tuple[str, list[int]]:
-    """The line with markers/mark tags stripped, plus ``visible index -> original index``."""
-    stripped: list[str] = []
-    mapping: list[int] = []
-    position = 0
-    for match in _MARKER_RE.finditer(line):
-        for index in range(position, match.start()):
-            stripped.append(line[index])
-            mapping.append(index)
-        position = match.end()
-    for index in range(position, len(line)):
-        stripped.append(line[index])
-        mapping.append(index)
-    return "".join(stripped), mapping
-
-
-def split_clauses(line: str) -> list[tuple[int, int]]:
-    """``(start, end)`` of every sub-clause in one line (markers are transparent).
-
-    A sub-clause is a maximal run of Chinese characters / letters / digits: punctuation and
-    spaces break it, so the model can address ANY piece of the text (quotes are not special).
-    """
-    plain, mapping = _visible_view(line)
-    return [(mapping[m.start()], mapping[m.end() - 1] + 1) for m in _CLAUSE_RE.finditer(plain)]
-
-
-def clause_cuts(line: str) -> list[int]:
-    """Cut positions on the sentence axis: one before each sentence (binding its leading
-    quotes/opening tags) plus a final cut after the last visible char (trailing tags excluded).
-    Selecting sentence k means begin=k, end=k+1."""
-    plain, mapping = _visible_view(line)
-    cuts: list[int] = []
-    for match in _CLAUSE_RE.finditer(plain):
-        position = mapping[match.start()]
-        while position > 0:
-            if line[position - 1] in OPEN:
-                position -= 1
+def quote_spans(text: str) -> list[tuple[int, int]]:
+    """Absolute ``(start, stop)`` of every quoted run, in reading order (``<role>`` tags
+    transparent). A run is an opening quote up to its matching closing quote."""
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "<":  # skip a mark tag
+            close = text.find(">", index)
+            if close != -1 and "\n" not in text[index:close]:
+                index = close + 1
                 continue
-            if line[position - 1] == ">":
-                open_at = line.rfind("<", 0, position - 1)
-                if open_at >= 0 and not line.startswith("</", open_at):
-                    position = open_at
-                    continue
-            break
-        cuts.append(position)
-    cuts.append(mapping[-1] + 1 if mapping else len(line))
-    return cuts
-
-
-def clause_label(index: int) -> str:
-    """1 -> A, 26 -> Z, 27 -> AA, ... (sub-clause labels as code-like letters)."""
-    label = ""
-    while index > 0:
-        index, remainder = divmod(index - 1, 26)
-        label = chr(ord("A") + remainder) + label
-    return label
-
-
-def label_number(label: str) -> int:
-    """A -> 1, Z -> 26, AA -> 27, ... ; plain digits are accepted too."""
-    label = (label or "").strip()
-    if label.isdigit():
-        return int(label)
-    value = 0
-    for char in label.upper():
-        if not ("A" <= char <= "Z"):
-            return 0
-        value = value * 26 + (ord(char) - ord("A") + 1)
-    return value
-
-
-def render_numbered_line(line_no: int, line: str) -> str:
-    """One paragraph with its cut labels: ``[3A]他叹道：[3B]“你终于来了。”[3C]``."""
-    cuts = clause_cuts(line)
-    if len(cuts) <= 1:
-        return f"[{line_no}] {line}"
-    pieces: list[str] = []
-    cursor = 0
-    for cut_index, position in enumerate(cuts[:-1], start=1):
-        pieces.append(line[cursor:position])
-        pieces.append(f"[{line_no}{clause_label(cut_index)}]")
-        cursor = position
-    pieces.append(line[cursor:])
-    pieces.append(f"[{line_no}{clause_label(len(cuts))}]")
-    return "".join(pieces)
+        if char in OPEN:
+            close = next((j for j in range(index + 1, len(text)) if text[j] in CLOSE), -1)
+            if close != -1:
+                spans.append((index, close + 1))
+                index = close + 1
+                continue
+        index += 1
+    return spans
 
 
 def number_text(text: str) -> str:
-    """The text as the model sees it: plain original text (no labels, nothing added)."""
-    return text
+    """The text as the model sees it: a number in front of every opening quote (``[1]“…”``).
+
+    The number is the handle the model references; not every numbered quote is dialogue."""
+    spans = quote_spans(text)
+    if not spans:
+        return text
+    pieces: list[str] = []
+    cursor = 0
+    for number, (start, _stop) in enumerate(spans, start=1):
+        pieces.append(text[cursor:start])
+        pieces.append(f"[{number}]")
+        cursor = start
+    pieces.append(text[cursor:])
+    return "".join(pieces)
 
 
-def check_windows(text: str, sentences_per_window: int = 20) -> list[tuple[int, int]]:
-    """Split paragraphs into ``(first_line, last_line)`` windows of about N sentences each."""
-    lines = text.split("\n")
-    if lines and not lines[-1]:
-        lines.pop()  # a trailing newline is not a paragraph
-    windows: list[tuple[int, int]] = []
-    first = 1
-    sentences = 0
-    for line_no, line in enumerate(lines, start=1):
-        sentences += max(1, len(clause_cuts(line)) - 1)
-        if sentences >= sentences_per_window:
-            windows.append((first, line_no))
-            first, sentences = line_no + 1, 0
-    if first <= len(lines):
-        windows.append((first, len(lines)))
-    return windows
+def label_number(label) -> int:
+    """Parse a quote handle: ``1``, ``[1]``, ``q1``, ``第1处`` all -> 1; 0 when unparseable."""
+    raw = str(label or "").strip()
+    digits = "".join(char for char in raw if char.isdigit())
+    return int(digits) if digits else 0
 
-
-OPEN = "“『「"
-CLOSE = "”』」"
 
 # Search tolerance: straight and curly quotes are treated as equal (the model often
 # types ASCII quotes while the text uses “ ”). Length is preserved, so indices map.
@@ -181,10 +116,13 @@ class ScriptServer:
         self.text = ""
         self.edits: list[dict] = []
         self._refused_deletes: set[str] = set()
+        self.roster: dict[str, list[str]] = {}
+        self._roster_updates: list[tuple[str, int]] = []
 
     # ---- tools ---------------------------------------------------------------
     def set_text(self, text: str) -> dict:
         self.text = text or ""
+        self.original = self.text  # pristine, never marked
         self._refused_deletes = set()
         return {"chars": len(self.text)}
 
@@ -198,22 +136,28 @@ class ScriptServer:
         role: str = "",
         find: str = "",
         replace: str = "",
-        end: str | int = "",  # line mode: end split letter; no-line mode: legacy text anchor
-        line: int = 0,
-        begin=None,
+        end: str | int = "",  # legacy text anchor (no-line mode)
+        line: str | int = 0,  # quote number (the `[n]` in front of an opening quote)
+        begin=None,  # alias of `line`
+        n: str | int = 0,  # alias of `line`
+        roster: dict | None = None,  # roster update for op="roster"
     ) -> dict:
         """The one editing tool. ``op`` defaults to ``speak`` -- never to a text rewrite."""
         op = (op or "speak").strip() or "speak"
+        number = n or line or (begin if str(begin or "").strip() else 0)
         if op == "speak":
-            target = find if any(char in find for char in OPEN + CLOSE) else (text or find)
-            return self._mark_speaker(target, role, end, line, begin)
+            return self._mark_speaker(text or find, role, end, number, begin)
         if op == "unmark":
-            return self._unmark(text or find, end, line, begin)
+            return self._unmark(text or find, end, number, begin)
+        if op == "done":
+            return {"ok": True, "done": True}
         if op == "replace":
             return self._replace(find or text, replace)
         if op == "delete":
             return self._delete(text or find)
-        return {"ok": False, "reason": f"未知操作 {op}；只能用 speak（修正=覆盖重标）"}
+        if op == "roster":
+            return self._update_roster(roster or {})
+        return {"ok": False, "reason": f"未知操作 {op}；只能用 speak/unmark/done/roster"}
 
     # ---- primitives ----------------------------------------------------------
     def _enclosing_quotes(self, start: int, end: int) -> tuple[int, int] | None:
@@ -238,27 +182,6 @@ class ScriptServer:
                 return left, j + 1
         return None
 
-    def _find_short_in_quotes(self, needle: str) -> int:
-        """Exact search for a very short needle (1-2 chars) INSIDE quoted spans only.
-
-        Short needles are dangerous: ``text="不"`` would otherwise match the first 不 in the
-        narration and mark the wrong place. Returns the quote content start or -1."""
-        for opener, closer in zip(OPEN, CLOSE):
-            position = 0
-            while True:
-                start = self.text.find(opener, position)
-                if start < 0:
-                    break
-                end = self.text.find(closer, start + 1)
-                if end < 0:
-                    break
-                content = self.text[start + 1 : end]
-                found = content.find(needle)
-                if found >= 0:
-                    return start + 1 + found
-                position = end + 1
-        return -1
-
     def _find_quoted_fragment(self, needle: str) -> int:
         """Near-miss fallback: match the needle inside any quoted span with punctuation and
         quote marks ignored (e.g. model sends 「抱，抱歉」 for 「抱……抱歉……」). Returns the
@@ -282,63 +205,27 @@ class ScriptServer:
                 position = end + 1
         return -1
 
-    def _line_span(self, line: int) -> tuple[int, int] | None:
-        """``[start, end)`` of 1-based ``line`` in the current text (lines = natural paragraphs)."""
-        if line < 1:
+    def _quote_span(self, number) -> tuple[int, int] | None:
+        """Absolute ``(start, stop)`` of quote number ``number`` (1-based, in reading order)."""
+        index = label_number(number)
+        spans = quote_spans(self.text)
+        if index < 1 or index > len(spans):
             return None
-        position = 0
-        for index, part in enumerate(self.text.split("\n"), start=1):
-            if index == line:
-                return position, position + len(part)
-            position += len(part) + 1
-        return None
+        return spans[index - 1]
 
-    def _quoted_expand_in(self, start: int, stop: int, low: int, high: int) -> tuple[int, int] | None:
-        """Expand ``[start, stop)`` to its enclosing quote pair, bounded to ``[low, high)``."""
-        left = -1
-        for i in range(start - 1, low - 1, -1):
-            if self.text[i] in CLOSE:
-                return None
-            if self.text[i] in OPEN:
-                left = i
-                break
-        if left < 0:
-            return None
-        for j in range(stop, high):
-            if self.text[j] in OPEN:
-                return None
-            if self.text[j] in CLOSE:
-                return left, j + 1
-        return None
-
-    def _clauses_in_line(self, low: int, high: int) -> list[tuple[int, int]]:
-        """Absolute ``(start, end)`` of every sub-clause in ``[low, high)`` (same numbering as
-        :func:`number_text`; existing marks are transparent, so numbers stay stable)."""
-        return [(low + start, low + end) for start, end in split_clauses(self.text[low:high])]
-
-    @staticmethod
-    def _split_label(label) -> tuple[int, str]:
-        """``"22D" -> (22, "D")``; bare ``"D"`` -> (0, "D"); pure digits stay the legacy cut index."""
-        raw = str(label or "").strip().upper()
-        raw = re.sub(r"[\[\]()（）【】<>《》\s_.\-—~·]+", "", raw)
-        raw = raw.replace("第", "").replace("段", "").replace("句", "").replace("标记", "").replace("切割", "")
-        digits = "".join(char for char in raw if char.isdigit())
-        letters = "".join(char for char in raw if not char.isdigit())
-        if digits and letters:
-            return int(digits), letters
-        return 0, (letters or digits)
-
-    def _clause_span(self, begin, end, low: int, high: int) -> tuple[int, int] | None:
-        """Resolve axis cuts: begin=k, end=k+1 selects sentence k; end=N+1 is the line end."""
-        cuts = [low + position for position in clause_cuts(self.text[low:high])]
-        first = label_number(self._split_label(begin)[1])
-        end_letter = self._split_label(end)[1] if str(end or "").strip() else ""
-        last = label_number(end_letter) if end_letter else first + 1
-        if first < 1 or first >= len(cuts):
-            return None
-        if last <= first or last > len(cuts):
-            last = len(cuts)  # lenient: a wild end still covers up to the line end
-        return cuts[first - 1], cuts[last - 1]
+    def _sentence_span(self, start: int, stop: int) -> tuple[int, int]:
+        """Grow an UNQUOTED speech fragment to its sentence: stop left at a cue colon / sentence
+        end, stop right at the next 。！？ (or newline). Already-terminated fragments stay as-is."""
+        left = start
+        while left > 0 and self.text[left - 1] not in "。！？\n：；;：":
+            left -= 1
+        right = stop
+        if not (stop > start and self.text[stop - 1] in "。！？"):
+            while right < len(self.text) and self.text[right] not in "。！？\n":
+                right += 1
+            if right < len(self.text) and self.text[right] in "。！？":
+                right += 1  # include the closing punctuation
+        return left, right
 
     def _enclosing_tag(self, start: int, stop: int, strict_stop: bool = True):
         """The ``<role>…</role>`` tag whose content contains ``start`` (or ``None``).
@@ -361,45 +248,31 @@ class ScriptServer:
             return None
         return open_lt, open_gt, close_lt, role
 
-    _QUOTE_RUN_RE = re.compile(r"[“『「][^”』」]*[”』」]")
-
     def unmarked_quotes(self) -> list[dict]:
-        """Quoted runs not covered by any mark tag (candidate misses), with axis labels.
+        """Every numbered quote not covered by any mark tag (candidate misses), in order.
 
         The check pass gets this list so the model only has to say WHO speaks each run."""
         found: list[dict] = []
-        offset = 0
-        for line_no, line in enumerate(self.text.split("\n"), start=1):
-            if line:
-                plain, mapping = _visible_view(line)
-                cuts = [offset + position for position in clause_cuts(line)]
-                for match in self._QUOTE_RUN_RE.finditer(plain):
-                    run_start = offset + mapping[match.start()]
-                    run_end = offset + mapping[match.end() - 1] + 1
-                    if self._enclosing_tag(run_start, run_end, strict_stop=False) is not None:
-                        continue
-                    begin_label = end_label = ""
-                    for cut_index in range(1, len(cuts)):
-                        if cuts[cut_index - 1] <= run_start < cuts[cut_index]:
-                            begin_label = f"{line_no}{clause_label(cut_index)}"
-                        if cuts[cut_index - 1] < run_end <= cuts[cut_index]:
-                            end_label = f"{line_no}{clause_label(cut_index + 1)}"
-                            break
-                    snippet = plain[max(0, match.start() - 24) : match.end() + 24].strip()
-                    found.append(
-                        {
-                            "line": line_no,
-                            "begin": begin_label or f"{line_no}A",
-                            "end": end_label or f"{line_no}{clause_label(max(1, len(cuts) - 1))}",
-                            "text": match.group(0),
-                            "snippet": snippet,
-                            "partial": "<" in self.text[run_start:run_end],
-                        }
-                    )
-            offset += len(line) + 1
+        for number, (run_start, run_end) in enumerate(quote_spans(self.text), start=1):
+            if self._enclosing_tag(run_start, run_end, strict_stop=False) is not None:
+                continue
+            line_no = self.text.count("\n", 0, run_start) + 1
+            visible_text = self._visible_tags(self.text[run_start:run_end])[0]
+            snippet = self._visible_tags(self.text[max(0, run_start - 24) : run_end + 24])[0].strip()
+            found.append(
+                {
+                    "line": line_no,
+                    "begin": str(number),
+                    "end": str(number),
+                    "number": number,
+                    "text": visible_text,
+                    "snippet": snippet,
+                    "partial": "<" in self.text[run_start:run_end],
+                }
+            )
         return found
 
-    def _unmark(self, text: str = "", end: str | int = "", line: int = 0, begin=None) -> dict:
+    def _unmark(self, text: str = "", end: str | int = "", line: str | int | None = 0, begin=None) -> dict:
         """Remove a wrong mark (unwrap its tag); original text is never touched."""
         resolved = self._resolve_span(text, end, line, begin)
         if isinstance(resolved, dict):
@@ -411,82 +284,41 @@ class ScriptServer:
         open_lt, open_gt, close_lt, role = tag
         inner = self.text[open_gt + 1 : close_lt]
         self.text = self.text[:open_lt] + inner + self.text[close_lt + len(role) + 3 :]
-        self.edits.append({"op": "unmark", "role": role, "text": text, "line": line, "begin": begin, "end": end})
+        self.edits.append({"op": "unmark", "role": role, "text": text, "n": line, "begin": begin, "end": end})
         return {
             "ok": True,
             "unmarked": role,
             "text": inner[:24],
             "marked": inner[:400],
-            "range": f"{begin}-{end or begin}" if begin else "",
+            "n": line,
         }
 
-    def _resolve_span(self, text: str, end: str | int = "", line: int = 0, begin=None):
-        """Resolve the target span; returns (start, stop, low, high, exact) or an error dict."""
+    def _resolve_span(self, text: str, end: str | int = "", line: str | int | None = 0, begin=None):
+        """Resolve the target span; returns (start, stop, low, high, exact) or an error dict.
+
+        Preferred handle: the quote number in ``line`` (``begin``/``end`` are aliases).
+        ``text`` is the fallback (exact, then anchor matching for long needles)."""
         low, high = (0, len(self.text))
-        exact = False
-        start, stop = 0, 0
-        begin_line = self._split_label(begin)[0] if begin not in (None, "") else 0
-        if not line and begin_line:
-            line = begin_line
-        if line:
-            span = self._line_span(line)
-            if span is None:
+        number = label_number(line) or label_number(begin) or label_number(end)
+        if number:
+            span = self._quote_span(number)
+            if span is not None:
+                return span[0], span[1], low, high, True
+            if not text:
+                total = len(quote_spans(self.text))
                 return {
                     "ok": False,
-                    "reason": f"段落号 {line} 不存在；段落号写在切割标记里（形如 `[3A]`）",
-                    "text": text[:24],
+                    "reason": f"没有第 {number} 处引号（本章共 {total} 处）",
+                    "text": str(number)[:24],
                 }
-            low, high = span
-            if begin:
-                span = self._clause_span(begin, end, low, high)
-                if span is not None:
-                    start, stop = span
-                    exact = True
-                elif not text:
-                    count = len(self._clauses_in_line(low, high))
-                    return {
-                        "ok": False,
-                        "reason": f"第 {line} 段没有这个分割号（该段共 {count} 段）",
-                        "text": str(begin)[:24],
-                    }
-            if not exact and text:
-                # text fallback: strip axis labels, locate inside the line, snap to its sentence
-                cleaned = re.sub(r"\[[A-Za-z0-9]+\]", "", text).strip()
-                index = self._find_index_in(self.text[low:high], cleaned)
-                if index < 0:
-                    index = self._find_index_in(self.text[low:high], cleaned.strip("“”「」‘’\"'"))
-                if index >= 0:
-                    position = low + index
-                    cuts = [low + cut for cut in clause_cuts(self.text[low:high])]
-                    for cut_index in range(1, len(cuts)):
-                        if cuts[cut_index - 1] <= position < cuts[cut_index]:
-                            start, stop = cuts[cut_index - 1], cuts[cut_index]
-                            exact = True
-                            break
-                    if not exact:
-                        start, stop = position, position + len(cleaned)
-                        exact = True
-            if not exact and not begin:
-                cuts = [low + position for position in clause_cuts(self.text[low:high])]
-                if len(cuts) == 2:
-                    start, stop = cuts[0], cuts[1]
-                    exact = True
-                elif len(cuts) > 2:
-                    return {
-                        "ok": False,
-                        "reason": f"第 {line} 段有 {len(cuts) - 1} 句，请给 begin（首句的起始切割）+ end（下一句的切割）",
-                        "text": text[:24],
-                    }
-                else:
-                    return {"ok": False, "reason": f"第 {line} 段没有可标的文字", "text": text[:24]}
-            if not exact:
-                return {"ok": False, "reason": f"第 {line} 段里找不到这段正文；请核对 text 或 begin/end", "text": text[:24]}
-        else:
+        if text:
             located = self._locate_span(text)
-            if located is None:
-                return {"ok": False, "reason": "找不到这段原文；请逐字照抄这段发言的完整内容", "text": text[:24]}
-            start, stop = located
-        return start, stop, low, high, exact
+            if located is not None:
+                return located[0], located[1], low, high, False
+            return {"ok": False, "reason": "找不到这段原文；请给引号序号（或逐字照抄完整发言）", "text": text[:24]}
+        if not number:
+            return {"ok": False, "reason": "请给引号序号（行首方括号里的数字）", "text": text[:24]}
+        return {"ok": False, "reason": "定位失败", "text": text[:24]}
 
     @staticmethod
     def _visible_tags(region: str) -> tuple[str, list[int]]:
@@ -534,99 +366,39 @@ class ScriptServer:
         self.text = self.text[:region_start] + "".join(pieces) + self.text[region_end:]
         return texts
 
-    def _mark_speaker(self, text: str, role: str, end: str | int = "", line: int = 0, begin=None) -> dict:
+    def _mark_speaker(self, text: str, role: str, end: str | int = "", line: str | int | None = 0, begin=None) -> dict:
         resolved = self._resolve_span(text, end, line, begin)
         if isinstance(resolved, dict):
             return resolved
         start, stop, low, high, exact = resolved
         requested_role = self._canonical_role(role) or (role or "").strip()
-        tag = self._enclosing_tag(start, stop)
-        if tag is not None and requested_role and requested_role == tag[3]:
-            _open_lt, open_gt, close_lt, _existing = tag
-            if start <= open_gt + 1 and stop >= close_lt:  # same role, same span: nothing to do
+        canonical = requested_role
+        if not canonical:
+            return {"ok": False, "reason": "role 不能为空"}
+        # one or more quoted runs inside the requested span -> one mark per run (narration between
+        # them stays outside). A bare quote number resolves to exactly one run.
+        runs = quote_spans(self.text)
+        inside = [(run_start, run_stop) for run_start, run_stop in runs if run_start >= start and run_stop <= stop]
+        if not inside:
+            enclosing = self._enclosing_quotes(start, stop)  # text landing inside a quote -> whole quote
+            inside = [enclosing] if enclosing else [self._sentence_span(start, stop)]
+        tag = self._enclosing_tag(inside[0][0], inside[-1][1], strict_stop=False)
+        if tag is not None and tag[3] == canonical:
+            open_gt, close_lt = tag[1], tag[2]
+            if inside[0][0] <= open_gt + 1 and inside[-1][1] >= close_lt:
                 return {"ok": True, "already": True, "role": tag[3], "text": text[:24]}
-        anchored = False
-        clamped = False
-        expanded = False
-        if not exact:
-            if isinstance(end, str) and end and end != text and not line:
-                search_from = start + 1
-                while True:
-                    tail = self._find_index_after(end, search_from)
-                    if tail < 0:
-                        break
-                    if tail + len(end) >= stop:  # closing anchor must lie at/after the opening one
-                        stop = tail + len(end)
-                        anchored = True
-                        break
-                    search_from = tail + 1
-            # One speech never covers two separate quoted spans: if the model's text spans a
-            # closing quote, narration, then another opening quote, keep only the FIRST span.
-            for opener, closer in (("“", "”"), ("「", "」"), ("『", "』")):
-                close_at = self.text.find(closer, start, stop)
-                if close_at >= 0 and self.text.find(opener, close_at + 1, stop) >= 0:
-                    stop = close_at + 1
-                    clamped = True
-                    break
-            if clamped:  # expand to the opening quote of THIS span (the next quote must stay out)
-                for i in range(start - 1, max(low - 1, start - 400), -1):
-                    if self.text[i] in CLOSE or self.text[i] == "\n":
-                        break
-                    if self.text[i] in OPEN:
-                        start = i
-                        break
-                expanded = True
-            else:
-                enclosing = self._quoted_expand_in(start, stop, low, high) if line else self._enclosing_quotes(start, stop)
-                if enclosing is not None:  # expand to the two quotes: quotes stay INSIDE the mark
-                    start, stop = enclosing
-                    expanded = True
-        body = self.text[start:stop]
-        # A mark only wraps the spoken words: narration/attribution stays OUTSIDE. Trim a wide
-        # span to its quoted run; several quoted runs ("…" 他说，"…") become one mark each,
-        # mechanically, so the narration between them stays unmarked.
-        runs = [(start + match.start(), start + match.end()) for match in self._QUOTE_RUN_RE.finditer(body)]
-        if not runs and not any(char in body for char in OPEN + CLOSE):
-            # a piece INSIDE a quoted speech: expand to the whole quote, then treat it as one run
-            enclosing = self._quoted_expand_in(start, stop, low, high) if line else self._enclosing_quotes(start, stop)
-            if enclosing is not None:
-                start, stop = enclosing
-                body = self.text[start:stop]
-                runs = [(start + match.start(), start + match.end()) for match in self._QUOTE_RUN_RE.finditer(body)]
-        if not runs:
-            # half a quote: pull the span onto the matching quote before judging
-            if any(char in body for char in CLOSE) and not any(char in body for char in OPEN):
-                left = start - 1
-                while left > max(low - 1, start - 400):
-                    if self.text[left] in OPEN:
-                        start = left
-                        break
-                    if self.text[left] in CLOSE or self.text[left] == "\n":
-                        break
-                    left -= 1
-            elif any(char in body for char in OPEN) and not any(char in body for char in CLOSE):
-                right = stop
-                while right < min(high, stop + 400):
-                    if self.text[right] in CLOSE:
-                        stop = right + 1
-                        break
-                    if self.text[right] in OPEN or self.text[right] == "\n":
-                        break
-                    right += 1
-            body = self.text[start:stop]
-            runs = [(start + match.start(), start + match.end()) for match in self._QUOTE_RUN_RE.finditer(body)]
-        if runs:
-            start, stop = runs[0][0], runs[-1][1]
-            body = self.text[start:stop]
-        if not runs and not any(char in body for char in OPEN + CLOSE):
-            context = self.text[max(0, start - 20) : start]
+        body_start, body_stop = inside[0][0], inside[-1][1]
+        if not any(char.isalnum() for char in self.text[body_start:body_stop]):
+            return {"ok": False, "reason": "这段不是人物直接对话；只标人物直接说的话"}
+        if not any(char in self.text[body_start:body_stop] for char in OPEN + CLOSE):
+            context = self.text[max(0, body_start - 20) : body_start]
             if not self._SPEECH_CUE_RE.search(context):
                 return {
                     "ok": False,
                     "reason": "这看起来是旁白/描写，不是人物直接说的话；只标台词或明确标记的心声",
                     "text": text[:24],
                 }
-        cut = start
+        cut = body_start
         role_override = ""
         if cut >= 1 and self.text[cut - 1] == "：":
             k = cut - 1
@@ -635,73 +407,36 @@ class ScriptServer:
             attribution = self.text[k : cut - 1]
             attr_canonical = self._name_index().get(attribution)
             if attr_canonical and attr_canonical != NARRATOR:
-                if attr_canonical != self._canonical_role(role):
+                if attr_canonical != canonical:
                     role_override = attr_canonical  # the quote says who is speaking: trust it
                 cut = k  # a bare 「人名：」 is consumed either way
-        if not any(char.isalnum() for char in body):
-            return {"ok": False, "reason": "这段不是人物直接对话；只标人物直接说的话"}
-        canonical = role_override or self._canonical_role(role) or (role or "").strip()
-        if not canonical:
-            return {"ok": False, "reason": "role 不能为空"}
-        if len(runs) >= 2:  # several quoted runs in one request -> one mark per run
-            texts = self._overwrite(cut, runs, canonical)
-            self.edits.append(
-                {
-                    "op": "speak",
-                    "role": canonical,
-                    "text": text,
-                    "end": end,
-                    "split": len(runs),
-                    "attribution": cut < start,
-                    "expanded": expanded,
-                    "anchored": anchored,
-                }
-            )
-            result = {
-                "ok": True,
-                "role": canonical,
-                "split": True,
-                "count": len(runs),
-                "marked": " / ".join(texts)[:400],
-            }
-            if begin:
-                result["begin"] = begin
-                result["end"] = end or begin
-                result["range"] = f"{begin}-{end or begin}"
-            if role_override:
-                result["role_note"] = f"按文中的归属「{role_override}」判定说话人"
-                result["role_corrected_from"] = role
-            return result
+        canonical = role_override or canonical
         previous = ""
-        tag_before = self._enclosing_tag(start, stop, strict_stop=False)
+        tag_before = self._enclosing_tag(inside[0][0], inside[-1][1], strict_stop=False)
         if tag_before is not None:
             previous = tag_before[3]
-        texts = self._overwrite(cut, [(start, stop)], canonical)
-        body = texts[0]
+        texts = self._overwrite(cut, inside, canonical)
+        body = " / ".join(texts)
         self.edits.append(
             {
                 "op": "speak",
                 "role": canonical,
                 "text": text,
                 "end": end,
-                "attribution": cut < start,
-                "expanded": expanded,
-                "anchored": anchored,
+                "n": line,
+                "split": len(inside) if len(inside) > 1 else 0,
+                "attribution": cut < body_start,
             }
         )
-        result = {"ok": True, "role": canonical, "text": body[:24], "marked": body[:400]}
+        result = {"ok": True, "role": canonical, "text": texts[0][:24], "marked": body[:400]}
+        if line:
+            result["n"] = line
+        if len(inside) > 1:
+            result["split"] = True
+            result["count"] = len(inside)
         if previous and previous != canonical:
             result["replaced"] = True
             result["previous"] = previous
-        if begin:
-            result["begin"] = begin
-            result["end"] = end or begin
-            result["range"] = f"{begin}-{end or begin}"
-        if anchored:
-            result["anchored"] = True
-        if expanded:
-            result["expanded"] = True
-            result["note"] = "已按子句范围标记整段"
         if role_override:
             result["role_note"] = f"按文中的归属「{role_override}」判定说话人"
             result["role_corrected_from"] = role
@@ -810,6 +545,27 @@ class ScriptServer:
         self.edits.append({"op": "replace", "find": find, "replace": replace})
         return {"ok": True}
 
+    def _update_roster(self, updates: dict) -> dict:
+        """Merge character roster updates; stores for later retrieval by main()."""
+        if not isinstance(updates, dict):
+            return {"ok": False, "reason": "roster must be a dict"}
+        added = 0
+        for name, entry in updates.items():
+            name = str(name).strip()
+            if not name or name.lower() in ROSTER_STRUCT_KEYS:
+                continue
+            if isinstance(entry, dict):
+                labels = [str(label).strip() for label in entry.get("aliases") or [] if str(label).strip()]
+            elif isinstance(entry, list):
+                labels = [str(label).strip() for label in entry if str(label).strip()]
+            else:
+                labels = []
+            before = sum(len(v) for v in self.roster.values())
+            _absorb_entry(self.roster, name, labels)
+            added += sum(len(v) for v in self.roster.values()) - before
+        self._roster_updates.append((str(updates), added))
+        return {"ok": True, "added": added, "total": len(self.roster)}
+
     # ---- helpers -------------------------------------------------------------
     def _name_index(self) -> dict[str, str]:
         """label/alias -> canonical name (from roles.json)."""
@@ -882,43 +638,52 @@ class ScriptServer:
         return plain_map[pos] if pos >= 0 else -1
 
     def _locate_span(self, needle: str) -> tuple[int, int] | None:
-        """Locate a quoted speech by its text: exact first; for long needles match the head and
-        the tail separately (one match each) and take the span between them. Short needles
-        (<= FUZZY_MIN_CHARS) are exact-only -- no fuzzy matching at all."""
+        """Locate a speech by its text (mark tags are transparent): exact first; for long needles
+        match the head and the tail separately (one match each) and take the span between them.
+        Short needles (<= FUZZY_MIN_CHARS) are exact-only -- no fuzzy matching at all."""
         needle = (needle or "").strip()
         if not needle:
             return None
+        visible, mapping = self._visible_tags(self.text)
+
+        def to_original(visible_index: int) -> int:
+            if visible_index < len(mapping):
+                return mapping[visible_index]
+            return mapping[-1] + 1 if mapping else len(self.text)
+
         plain_len = sum(1 for char in needle if not unicodedata.category(char).startswith("P"))
         if plain_len <= self.FUZZY_MIN_CHARS:
-            # short: no fuzzy; prefer the occurrence inside quotes, else the exact one
-            index = self._find_short_in_quotes(needle)
-            if index < 0:
-                index = self.text.find(needle)
-            return (index, index + len(needle)) if index >= 0 else None
-        index = self.text.find(needle)
+            # short: exact only, no fuzzy; an occurrence INSIDE a quoted run wins over narration
+            for run_start, run_stop in quote_spans(visible):
+                inside = visible.find(needle, run_start, run_stop)
+                if inside >= 0:
+                    return to_original(inside), to_original(inside + len(needle))
+            index = visible.find(needle)
+            return (to_original(index), to_original(index + len(needle))) if index >= 0 else None
+        index = visible.find(needle)
         if index >= 0:
-            return index, index + len(needle)
-        if plain_len <= 2 * self.ANCHOR_CHARS:
-            found = self._find_anchor_in(self.text, needle)
-            return (found, found + len(needle)) if found >= 0 else None
+            return to_original(index), to_original(index + len(needle))
+        found = self._find_anchor_in(visible, needle)  # whole sentence, tolerant
+        if found >= 0:
+            return to_original(found), to_original(found + len(needle))
         head, tail = needle[: self.ANCHOR_CHARS], needle[-self.ANCHOR_CHARS :]
-        head_at = self._find_anchor_in(self.text, head)
-        if head_at < 0:
-            return None
-        tail_at = self._find_anchor_in(self.text[head_at + 1 :], tail)
-        if tail_at < 0:
-            return None
-        return head_at, head_at + 1 + tail_at + len(tail)
+        head_at = self._find_anchor_in(visible, head)
+        tail_at = -1
+        search_from = head_at + 1 if head_at >= 0 else 0
+        if search_from < len(visible):
+            tail_found = self._find_anchor_in(visible[search_from:], tail)
+            if tail_found >= 0:
+                tail_at = search_from + tail_found
+        if head_at >= 0 and tail_at >= 0 and tail_at >= head_at:
+            return to_original(head_at), to_original(tail_at + len(tail))
+        if head_at >= 0:  # prefix alone is enough
+            return to_original(head_at), to_original(min(len(visible), head_at + len(needle)))
+        if tail_at >= 0:  # suffix alone is enough
+            return to_original(max(0, tail_at - (len(needle) - len(tail)))), to_original(tail_at + len(tail))
+        return None
 
     def _find_index(self, needle: str) -> int:
         return self._find_index_in(self.text, needle)
-
-    def _find_index_after(self, needle: str, pos: int) -> int:
-        """Same fuzzy finder, but only at/after ``pos`` (for the closing anchor)."""
-        if pos < 0:
-            pos = 0
-        found = self._find_index_in(self.text[pos:], needle)
-        return pos + found if found >= 0 else -1
 
     FUZZY_MIN_CHARS = 10  # needles of <=10 chars must match exactly; fuzzy only above that
 
@@ -1006,25 +771,31 @@ class ScriptServer:
                 "name": "edit",
                 "description": (
                     "标注工具（一次一处，只标**人物直接说的话**）。"
-                    "**铁律：text、role 两个参数缺一不可**——text 是这段发言的**完整原文**"
-                    "（逐字照抄，引号和标点一个不差，禁止只抄一半、禁止改写、禁止带旁白），"
-                    "role 是人物表里的规范名。旁白/描写/叙述一律禁止标；标记只包说话内容"
-                    "（「某某说道/淡淡地说道」留在标记外）。修正只有一种方式：同一处再 speak 一次，"
-                    "覆盖旧标记（可改角色、可改正范围）。"
-                    '示例：{"op":"speak","text":"“你终于来了。”","role":"角色名"}'
+                    "正文每个开引号前都有序号，形如 `[12]“…”`；**用序号定位**（n=第 n 处引号）。"
+                    "**铁律：n、role 两个参数缺一不可**——n 是引号序号，role 是人物表里的规范名。"
+                    "旁白/描写/叙述一律禁止标；引号里是术语/名词/标语/书名/强调（没有人在说话）时跳过不标。"
+                    "修正只有一种方式：同一处再 speak 一次，覆盖旧标记（可改角色）。"
+                    '检查完毕用 edit(op="done") 立刻结束。示例：{"op":"speak","n":12,"role":"角色名"}'
                 ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "op": {
                             "type": "string",
-                            "enum": ["speak"],
-                            "description": "speak=标出说话人（同一处再 speak 会覆盖旧标记）",
+                            "enum": ["speak", "unmark", "done", "roster"],
+                            "description": "speak=标出说话人（同一处再 speak 会覆盖旧标记）；"
+                            "unmark=特殊含义的引号被误标时去掉标记（只去标记，不改原文）；"
+                            "done=检查完毕、没有别的要改了，立刻结束；"
+                            "roster=维护人物词典（注册新人物或添加别名）",
                         },
-                        "text": {"type": "string", "description": "这段发言的完整原文（逐字照抄，必填）"},
-                        "role": {"type": "string", "description": "说话人规范名（必填）；判断不出时填「未知」"},
+                        "n": {"type": "integer", "description": "引号序号（开引号前 `[n]` 的数字）"},
+                        "role": {"type": "string", "description": "说话人规范名（speak 必填）；判断不出时填「未知」"},
+                        "roster": {
+                            "type": "object",
+                            "description": '人物词典更新，格式 {"规范名": {"aliases": ["别名1", "别名2"]}}',
+                        },
                     },
-                    "required": ["op", "text", "role"],
+                    "required": ["op"],
                 },
             }
         ]
@@ -1054,13 +825,15 @@ class MCPClient:
 
 HTML = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>mark_script · live</title>
+<title>实时标记 · live</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1017;--panel:#151a23;--panel2:#1b2230;--line:#26303f;--fg:#e6ecf3;--dim:#8b97a8;
   --accent:#5aa9ff;--ok:#43c785;--warn:#ffb454}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;overflow:hidden}
-header{height:46px;display:flex;gap:12px;align-items:center;padding:0 18px;border-bottom:1px solid var(--line)}
+header{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#101319;z-index:5}
+.brand{font-weight:700}.brand small{color:var(--dim);font-weight:400;margin-left:6px}
+nav a{color:var(--accent);text-decoration:none;margin-right:12px;font-size:13px}nav a.on{color:var(--fg);font-weight:700}
 .brand{font-weight:700}.brand small{color:var(--dim);font-weight:400;margin-left:8px}
 header .grow{flex:1}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}
@@ -1109,14 +882,14 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d1219;border
 }
 </style></head><body>
 <header>
-  <div class="brand">mark_script <small id="book">· live</small></div>
+  <div class="brand">实时标记 <small id="book">· live</small></div>
   <span class="grow"></span>
-  <nav style="display:flex;gap:12px;align-items:center;font-size:13px">
-    <a href="live.html" style="color:#e6ecf3;font-weight:700;text-decoration:none">台本实时</a>
-    <a href="llm_raw.html" target="_blank" style="color:#5aa9ff;text-decoration:none">原始 I/O ↗</a>
-    <a href="/dashboard" target="_blank" style="color:#5aa9ff;text-decoration:none">看板 ↗</a>
-    <a href="/" target="_blank" style="color:#5aa9ff;text-decoration:none">文件库 ↗</a>
-    <a id="breeze" href="#" target="_blank" style="color:#5aa9ff;text-decoration:none">Breeze ↗</a>
+  <nav>
+    <a href="/dashboard">看板</a>
+    <a id="promptlink" href="/prompt">提示词测试</a>
+    <a id="selfpage" href="#" class="on">实时标记</a>
+    <a id="rawpage" href="#">LLM原始IO</a>
+    <a id="ttslink" href="/tts">TTS测试</a>
   </nav>
   <span class="dot"></span>
 </header>
@@ -1133,7 +906,12 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d1219;border
 </div>
 <script>
 const BASE='__LIVE_BASE__', MAXCHAT=500;
-document.getElementById('breeze').href='http://'+location.hostname+':8137/';
+function bookFromBase(){const m=BASE.match(/^\/outputs\/(.+)\/script\/$/);return m?m[1]:'';}
+const BOOK=bookFromBase(), BOOKQ=BOOK?'?book='+encodeURIComponent(BOOK):'';
+document.getElementById('promptlink').href='/prompt'+BOOKQ;
+document.getElementById('selfpage').href='/live'+BOOKQ;
+document.getElementById('rawpage').href='/raw'+BOOKQ;
+document.getElementById('ttslink').href='/tts'+BOOKQ;
 const article=document.getElementById('article'), chat=document.getElementById('chat'), chs=document.getElementById('chs');
 const book=document.getElementById('book'), followBtn=document.getElementById('follow'), finfo=document.getElementById('finfo');
 let offset=0, follow=true, selected=null, current=null, prevSig='', idxSig='', seen=new Set();
@@ -1190,12 +968,13 @@ function flushChat(){
   let extra=chat.childElementCount-MAXCHAT;
   while(extra-->0)chat.removeChild(chat.firstChild);
 }
-function fmtRange(x){return (x&&(x.begin||x.end))?'<code>'+esc(x.begin||'?')+'~'+esc(x.end||'?')+'</code> ':'';}
-function fmtCall(a){const x=a&&a.args||{};const keys=Object.keys(x);
+function fmtRange(x){const n=x&&(x.n||x.line||x.begin);return n?'<code>['+esc(n)+']</code> ':'';}
+function fmtCall(a, name){const x=a&&a.args||{};const keys=Object.keys(x);
   if(!keys.length)return '<span class="badge b-other">空调用</span><span class="sp">旧版记录没有参数</span>';
   const op=x.op||'speak';
   if(op==='speak')return '<span class="badge b-speak">标注</span>'+fmtRange(x)+'<span class="role">'+esc(x.role||'?')+'</span> <code>'+esc(x.text||'')+'</code>';
   if(op==='unmark')return '<span class="badge b-unmark">取消标记</span>'+fmtRange(x)+'<code>'+esc(x.text||'')+'</code>';
+  if(op==='done')return '<span class="badge b-ok">✓ 完成</span><span class="sp">检查结束</span>';
   if(op==='replace')return '<span class="badge b-other">替换</span><code>'+esc(x.find||'')+'</code> <span class="sp">→</span> <code>'+esc(x.replace||'')+'</code>';
   if(op==='delete')return '<span class="badge b-other">旧版·删除</span>'+(x.text||x.find?'<code>'+esc(x.text||x.find)+'</code>':'<span class="sp">（旧记录无参数）</span>');
   if(op==='reassign')return '<span class="badge b-other">旧版·改标</span>'+(x.role?'<span class="role">'+esc(x.role)+'</span> ':'')+'<code>'+esc(x.text||x.find||'')+'</code>';
@@ -1216,7 +995,7 @@ function handle(e){
   if(e.type==='assistant'){const c=e.content||'';pushChat({cls:'think',icon:'🧠',chapter:e.chapter,html:'<details><summary>思考 '+c.length+' 字 · '+esc(c.slice(0,42))+'</summary>'+esc(c)+'</details>'});return;}
   if(e.type==='tool'){const x=e.args||{};
     if(!Object.keys(x).length){emptyTool=true;return;} emptyTool=false;
-    pushChat({cls:'call',chapter:e.chapter,html:fmtCall(e.args)});return;}
+    pushChat({cls:'call',chapter:e.chapter,html:fmtCall(e.args, e.call)});return;}
   if(e.type==='result'){  // every change keeps its own card: no merging, no erasing
     emptyTool=false;
     const verdict=resultClass(e.result);
@@ -1244,14 +1023,21 @@ async function tickChat(){
   flushChat();
   setTimeout(tickChat,1200);
 }
+let allChapters=null;  // full chapter list (chapters dir), fetched once
 async function tickIndex(){
-  try{const r=await fetch(BASE+'live_index.json?t='+Date.now(),{cache:'no-store'});
+  try{
+    if(allChapters===null&&BOOK){
+      try{const c=await (await fetch('/chapters.json?book='+encodeURIComponent(BOOK),{cache:'no-store'})).json();
+        allChapters=(c.chapters||[]);}catch(e){allChapters=[];}
+    }
+    const r=await fetch(BASE+'live_index.json?t='+Date.now(),{cache:'no-store'});
     if(!r.ok)return; const idx=await r.json();
     const cur=idx.current; if(cur&&follow)selected=cur;
-    const ids=Object.keys(idx.chapters||{}).map(Number).sort((a,b)=>a-b);
-    const listKey=ids.join(',');
+    const done=new Set(Object.keys(idx.chapters||{}).filter(c=>idx.chapters[c]&&idx.chapters[c].done).map(Number));
+    const ids=(allChapters&&allChapters.length?allChapters:Object.keys(idx.chapters||{}).map(Number)).sort((a,b)=>a-b);
+    const listKey=ids.join(',')+'|'+[...done].sort((a,b)=>a-b).join(',');
     if(listKey!==idxSig){idxSig=listKey;                  // rebuild only when the set changes
-      chs.innerHTML=ids.map(function(c){var d=idx.chapters[c]&&idx.chapters[c].done?' ✔':'';return '<option value="'+c+'">第 '+c+' 章'+d+'</option>';}).join('');}
+      chs.innerHTML=ids.map(function(c){return '<option value="'+c+'">第 '+c+' 章'+(done.has(c)?' ✔':'')+'</option>';}).join('');}
     const want=String(selected||cur||''); if(chs.value!==want)chs.value=want;
   }catch(err){}
   setTimeout(tickIndex,1500);
@@ -1271,21 +1057,28 @@ tickChat();tickIndex();tickState();
 
 RAW_HTML = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>mark_script · 原始 LLM I/O</title>
+<title>LLM原始IO · raw</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1017;--panel:#151a23;--line:#26303f;--fg:#e6ecf3;--dim:#8b97a8;--accent:#5aa9ff;--bad:#ff7b7b}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.65 system-ui,-apple-system,"Noto Sans CJK SC","Microsoft YaHei",sans-serif}
-header{position:sticky;top:0;z-index:6;display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:8px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
-header b{font-size:14px}
+header{position:sticky;top:0;z-index:6;display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:8px 16px;background:#101319;border-bottom:1px solid var(--line)}
+.brand{font-weight:700}.brand small{color:var(--dim);font-weight:400;margin-left:6px}
+header .brand{font-size:14px}
 nav{display:flex;gap:12px;font-size:13px}
 nav a{color:var(--accent);text-decoration:none}nav a.on{color:var(--fg);font-weight:700}
 header .grow{flex:1}.dim{color:var(--dim)}
 header input{background:#0f141b;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:4px 9px;font-size:12.5px}
 header button{background:#1b2230;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:4px 10px;font-size:12.5px;cursor:pointer}
 header button.on{background:var(--accent);border-color:var(--accent);color:#0b0f15;font-weight:700}
-#feed{padding:12px 16px 80px;display:flex;flex-direction:column;gap:10px;max-width:1080px;margin:0 auto}
+#feed{padding:12px 16px 80px;display:flex;flex-direction:column;gap:14px;max-width:1080px;margin:0 auto}
+.chanhd{position:sticky;top:44px;z-index:4;color:var(--accent);font-weight:700;font-size:13px;padding:4px 2px;background:var(--bg);border-bottom:1px solid var(--line)}
+.chan .cards{display:flex;flex-direction:column;gap:10px;padding-top:8px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+.in{border-left:2px solid #2b4a72;padding-left:8px}
+.reason{border-left:2px solid #3a4252;padding-left:8px}
+.out{border-left:2px solid #1f4a33;padding-left:8px}
+.toolbox{border-left:2px solid #5c4620;padding-left:8px}
 .card.fail{border-color:#6b2b2b;background:#1a1212}
 .hd{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;color:#9fd0ff}
 .tool{color:#9fe6c1;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
@@ -1296,26 +1089,57 @@ pre{white-space:pre-wrap;word-break:break-word;background:#0f141b;border:1px sol
 .role{color:#ffb454}.reason{color:var(--dim)}.msg{border-left:2px solid #2b4a72;padding-left:8px;margin:4px 0}
 </style></head><body>
 <header>
-  <b>原始 LLM I/O</b>
-  <nav>
-    <a href="live.html">台本实时</a>
-    <a class="on" href="llm_raw.html">原始 I/O</a>
-    <a href="/dashboard" target="_blank">看板</a>
-    <a href="/" target="_blank">文件库</a>
-    <a id="breeze" href="#" target="_blank">Breeze</a>
-  </nav>
-  <span class="grow"></span>
-  <input id="q" placeholder="过滤…（ch/step/正文/失败）">
+  <div class="brand">LLM原始IO</div>
+  <select id="chp"></select>
+  <input id="q" placeholder="过滤…（step/正文/失败）">
   <button id="follow" class="on">跟随最新</button>
   <span class="dim" id="meta"></span>
+  <span class="grow"></span>
+  <nav>
+    <a href="/dashboard">看板</a>
+    <a id="promptlink" href="/prompt">提示词测试</a>
+    <a id="livelink" href="/live">实时标记</a>
+    <a class="on" href="/raw">LLM原始IO</a>
+    <a id="ttslink" href="/tts">TTS测试</a>
+  </nav>
 </header>
 <div id="feed"></div>
 <script>
 const BASE='__LIVE_BASE__';
-document.getElementById('breeze').href='http://'+location.hostname+':8137/';
+function bookFromBase(){const m=BASE.match(/^\/outputs\/(.+)\/script\/$/);return m?m[1]:'';}
+const BOOK=bookFromBase();
+const bookq=BOOK?'?book='+encodeURIComponent(BOOK):'';
+document.getElementById('promptlink').href='/prompt'+bookq;
+document.getElementById('livelink').href='/live'+bookq;
+document.getElementById('ttslink').href='/tts'+bookq;
 const feed=document.getElementById('feed'), meta=document.getElementById('meta');
-const q=document.getElementById('q'), followBtn=document.getElementById('follow');
+const q=document.getElementById('q'), followBtn=document.getElementById('follow'), chp=document.getElementById('chp');
 let offset=0, pending=null, follow=true, shown=0, lastCards=[];
+const chans=new Map();  // chapter -> section element (all chapters are kept)
+let selectedCh='all';
+function chanKey(res){return res.chapter!=null?String(res.chapter):'llm';}
+function chanSection(key){
+  let sec=chans.get(key);
+  if(!sec){
+    sec=document.createElement('section'); sec.className='chan';
+    sec.innerHTML='<div class="chanhd">'+(key==='llm'?'LLM（词典/摘要）':'ch'+key)+' <span class="dim"></span></div><div class="cards"></div>';
+    chans.set(key,sec); feed.appendChild(sec);
+    refreshChanPicker();
+  }
+  return sec;
+}
+function refreshChanPicker(){
+  const keys=[...chans.keys()].filter(k=>k!=='llm');
+  keys.sort((a,b)=>Number(a)-Number(b));
+  const cur=chp.value||'all';
+  chp.innerHTML='<option value="all">全部章节</option>'+keys.map(k=>'<option value="'+esc(k)+'">ch'+esc(k)+'</option>').join('');
+  chp.value=keys.includes(cur)?cur:(follow&&keys.length?keys[keys.length-1]:'all');
+  selectedCh=chp.value||'all';
+}
+function applyChapter(){
+  chans.forEach((sec,key)=>{sec.style.display=(selectedCh==='all'||selectedCh===key)?'':'none';});
+}
+chp.addEventListener('change',function(){selectedCh=chp.value;follow=false;followBtn.classList.remove('on');applyChapter();});
 function esc(s){return (s==null?'':String(s)).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
 function msgSummary(m){return '<span class="role">'+esc(m.role||'?')+'</span> <span class="dim">'+((m.content||'').length)+' 字'+(m.tool_calls?(' · 工具调用×'+m.tool_calls.length):'')+(m.tool_call_id?' · 工具结果':'')+'</span>';}
 function pairCard(req,res){
@@ -1323,23 +1147,23 @@ function pairCard(req,res){
   const where=(res.chapter!=null?'ch'+res.chapter+' · step'+res.step:(res.source||'llm'));
   const tc=(res.tool_calls||[]).map(function(t){return '<div class="tool">'+esc(t.name)+' '+esc(t.arguments)+'</div>';}).join('');
   card.innerHTML='<div class="hd"><b>'+esc(where)+'</b><span class="dim">'+esc(res.duration_s||'')+'s · finish='+esc(res.finish_reason||'')+(res.tool_calls?(' · 工具×'+res.tool_calls.length):'')+'</span></div>'
+    +'<details class="in" open><summary>输入 · '+(req&&req.messages?req.messages.length:0)+' 条消息</summary><div class="msgs"></div></details>'
+    +(res.reasoning?('<details class="reason" open><summary>思考 '+res.reasoning.length+' 字</summary><pre class="rpre">'+esc(res.reasoning)+'</pre></details>'):'')
     +'<details class="out" open><summary>输出</summary>'
-    +(res.reasoning?('<details class="reason"><summary>思考 '+res.reasoning.length+' 字</summary><pre class="rpre"></pre></details>'):'')
-    +'<pre>'+esc(res.content||'')+'</pre>'+tc+'</details>'
-    +'<details class="in"><summary>输入 · '+(req&&req.messages?req.messages.length:0)+' 条消息</summary><div class="msgs"></div></details>';
-  const reason=card.querySelector('.reason');
-  if(reason){const pre=reason.querySelector('pre');
-    reason.addEventListener('toggle',function(){if(this.open&&!pre.textContent)pre.textContent=res.reasoning;});}
+    +'<pre>'+esc(res.content||'')+'</pre></details>'
+    +(tc?'<details class="toolbox" open><summary>工具调用（打印）</summary>'+tc+'</details>':'');
   card.dataset.text=(where+' '+(res.content||'')+' '+(res.reasoning||'')+' '+tc).toLowerCase();
   const msgs=card.querySelector('.msgs');
-  card.querySelector('.in').addEventListener('toggle',function(){
-    if(this.open&&!msgs.childElementCount&&req){
+  const fillMsgs=function(){
+    if(!msgs.childElementCount&&req){
       req.messages.forEach(function(m){
         const d=document.createElement('details'); d.className='msg';
         d.innerHTML='<summary>'+msgSummary(m)+'</summary><pre>'+esc(m.content||'')+'</pre>';
         msgs.appendChild(d);});
     }
-  });
+  };
+  fillMsgs();  // input is open by default: populate right away
+  card.querySelector('.in').addEventListener('toggle',function(){if(this.open)fillMsgs();});
   return card;
 }
 function tailResults(e,n){
@@ -1358,8 +1182,17 @@ function markFail(card,message){
     card.dataset.text+=' fail '+String(result.reason||'').toLowerCase();
   }catch(err){}
 }
-function prune(){while(feed.childElementCount>30)feed.removeChild(feed.firstChild);}
-function applyFilter(){const v=q.value.trim().toLowerCase();feed.querySelectorAll('.card').forEach(function(c){c.style.display=(!v||c.dataset.text.indexOf(v)>=0)?'':'none';});}
+function applyFilter(){const v=q.value.trim().toLowerCase();
+  feed.querySelectorAll('.chan').forEach(function(sec){
+    const inCh=selectedCh==='all'||sec===chans.get(selectedCh);
+    sec.style.display=inCh?'':'none';
+    if(!inCh)return;
+    let visible=0;
+    sec.querySelectorAll('.card').forEach(function(c){
+      const ok=!v||c.dataset.text.indexOf(v)>=0; c.style.display=ok?'':'none'; if(ok)visible++;});
+    sec.querySelector('.chanhd .dim').textContent='('+visible+'/'+sec.querySelectorAll('.card').length+')';
+  });
+}
 function scrollBottom(){if(follow)window.scrollTo(0,document.body.scrollHeight);}
 function handle(e){
   if(e.kind==='request'){
@@ -1367,10 +1200,13 @@ function handle(e){
     pending=e; return;
   }
   if(e.kind==='response'){
-    const card=pairCard(pending,e); pending=null; feed.appendChild(card); shown++;
+    const card=pairCard(pending,e); pending=null; shown++;
+    const key=chanKey(e), sec=chanSection(key);
+    if(follow){chp.value=key;selectedCh=key;}
+    sec.querySelector('.cards').appendChild(card);
     lastCards=(e.tool_calls||[]).map(function(){return card;});
-    prune(); applyFilter(); scrollBottom();
-    meta.textContent='已记录 '+shown+' 组 · 显示 '+feed.childElementCount;
+    applyChapter(); applyFilter(); scrollBottom();
+    meta.textContent='已记录 '+shown+' 组 · 章节 '+chans.size;
   }
 }
 function handleText(txt){for(const line of txt.split('\n')){if(!line.trim())continue;let e;try{e=JSON.parse(line);}catch(_){continue;}handle(e);}}
@@ -1379,7 +1215,7 @@ async function tick(){
     if(r.status===416){
       const h=await fetch(BASE+'llm_raw.jsonl',{method:'HEAD',cache:'no-store'});
       const size=+(h.headers.get('Content-Length')||0);
-      if(size<offset){const fb=await (await fetch(BASE+'llm_raw.jsonl',{cache:'no-store'})).arrayBuffer();offset=0;feed.innerHTML='';shown=0;handleText(new TextDecoder().decode(fb));offset=fb.byteLength;}
+      if(size<offset){const fb=await (await fetch(BASE+'llm_raw.jsonl',{cache:'no-store'})).arrayBuffer();offset=0;feed.innerHTML='';shown=0;chans.clear();handleText(new TextDecoder().decode(fb));offset=fb.byteLength;}
       else offset=size;
     } else if(r.status===206||offset===0){const buf=await r.arrayBuffer();offset+=buf.byteLength;
       handleText(new TextDecoder().decode(buf));}
@@ -1474,53 +1310,61 @@ def ensure_live_server(port: int = LIVE_PORT) -> None:
     print(f"[live] serving http://127.0.0.1:{port}/live", flush=True)
 
 
-LOCAL_SYSTEM = """你只做一件事：找出这段小说文字里**人物直接说的话**，为每一处标出说话人。
-- 这只是一段连续的文字（没有章节概念），结合上下文判断谁在说话。
-- **连续对话常常没有「某某说道」提示、两人交替**：必须逐句判断，
-  谁说的算谁的，**正确识别双方转换**，不要把不同人的话拼到一起。
-- **说一句 → 旁白/动作描写 → 同一个人接着说（可能不止两段）**：任意一段都要分别标全
-  （一段一个 speak），不要合并成一段、也不要漏掉任何一段。
-- **标记只包说话内容**：旁白、动作、描写、叙述都不是台词（没有引号、也没有「说道/忽然想」
-  这类提示的就不要标）；「某某说道/淡淡地说道」这类旁白一律留在标记外。
-- 标一处就用一次 edit(op="speak", text=这段发言的完整原文, role=说话人规范名)。
-  **text 必须逐字照抄原文里这一段发言的完整内容**（引号、标点一个不差，不能只抄一半、不能改写、
-  不能省略；也不要抄旁白）。**只给 text 和 role 两个参数，缺一不可。**
-  说话人用人物表里的规范名（没有就按原文写法），判断不出填「未知」。
- 只管抓对话；原文的文字和标点一个字都不要改。处理完停下，不要解释。"""
+LOCAL_SYSTEM = """你的唯一任务：从这段小说正文里找出所有人物，维护人物词典。
+
+## 输入
+- 【人物词典全集】：已有的人物规范名和别名列表
+- 【正文】：原始小说文本（未经任何处理）
+
+## 你要做的
+逐句通读正文，找出所有有姓名、有明确称呼的人物（连别名/绰号/称谓一起），
+然后用 edit(op="roster", roster={"规范名": {"aliases": ["别名1", "别名2"]}})
+注册新人物或给已有人物添加新别名。
+
+## 规则
+- **规范名**：此人最完整/最正式的姓名（如"高文·塞西尔"）；同一人只留一条。
+- **已有词典里能对上的必须沿用已有规范名**，禁止新增重复条目。
+- aliases 见到多少收多少（模糊名称 + 能唯一定位的称谓/绰号/特征指代），不限数量。
+  例如「红发」「独臂将军」「那个瞎子」这种用特征指代一个人的，都可以收。
+- **绝不收**代词/整句/泛称（大人/老爷/小姐/先生/骑士/众人）；不收地名/组织/物品/种族/群体。
+- 已有条目只增补，不改名、不删除。
+
+只用工具操作；处理完停下，不要解释。"""
+
 
 # Few-shot as REAL tool calls (the model learns the tool protocol directly); dialogue only.
 FEW_SHOT_CASES: list[tuple[str, list[str], list[str]]] = [
     (
-        "正文：\n他叹道：“你终于来了。”",
+        "正文：\n他叹道：[1]“你终于来了。”",
         [
-            '{"op":"speak","text":"“你终于来了。”","role":"角色名"}',
+            '{"op":"speak","n":1,"role":"角色名"}',
         ],
         [
-            '{"ok": true, "role": "角色名", "text": "“你终于来了。”", "marked": "“你终于来了。”"}',
+            '{"ok": true, "role": "角色名", "text": "“你终于来了。”", "marked": "“你终于来了。”", "n": 1}',
         ],
     ),
     (
-        "正文：\n“这件事要从很久以前说起，中间经过了很多波折，最后我们还是在城南住下了。”",
+        "正文：\n[1]“这件事要从很久以前说起，中间经过了很多波折，最后我们还是在城南住下了。”",
         [
-            '{"op":"speak","text":"“这件事要从很久以前说起，中间经过了很多波折，最后我们还是在城南住下了。”","role":"角色名"}',
+            '{"op":"speak","n":1,"role":"角色名"}',
         ],
         [
             '{"ok": true, "role": "角色名", "text": "“这件事要从很久以前说起，中间经过了很多波折，最后我们还是在城南住下了。”"}',
         ],
     ),
     (
-        "正文：\n“快走！”他高声提醒，“别管我！”",
+        "正文：\n[1]“快走！”他高声提醒，[2]“别管我！”",
         [
-            '{"op":"speak","text":"“快走！”","role":"角色名"}',
-            '{"op":"speak","text":"“别管我！”","role":"角色名"}',
+            '{"op":"speak","n":1,"role":"角色名"}',
+            '{"op":"speak","n":2,"role":"角色名"}',
         ],
         [
-            '{"ok": true, "role": "角色名", "text": "“快走！”", "marked": "“快走！”"}',
-            '{"ok": true, "role": "角色名", "text": "“别管我！”", "marked": "“别管我！”"}',
+            '{"ok": true, "role": "角色名", "text": "“快走！”", "marked": "“快走！”", "n": 1}',
+            '{"ok": true, "role": "角色名", "text": "“别管我！”", "marked": "“别管我！”", "n": 2}',
         ],
     ),
     (
-        "正文：\n他坐下，忽然想：她又熬夜了吧。",
+        "正文：\n[1]“传送法术”只是传说。他坐下，忽然想：她又熬夜了吧。",
         [
             '{"op":"speak","text":"她又熬夜了吧。","role":"角色名"}',
         ],
@@ -1575,66 +1419,48 @@ FEW_SHOT: list[dict] = few_shot_messages(FEW_SHOT_CASES)
 
 STEP_MARK = (
     "现在只做一件事：从下面【要处理的正文】里抓出**人物直接说的话**。"
-    '唯一允许的操作：edit(op="speak", text=这段发言的完整原文, role=说话人规范名)。'
-    "**铁律**：text 必须逐字照抄这段发言的**完整内容**——引号、标点一个不差，禁止只抄一半、禁止改写、"
-    "禁止省略、禁止把旁白抄进来；role 必须是人物表里的规范名。两个参数缺一不可。"
-    "只标人物直接说的话：旁白、动作、描写、叙述一律禁止标；「某某说道/淡淡地说道」这类话留在标记外。"
+    "正文每个开引号前有序号 `[n]`；唯一允许的操作："
+    'edit(op="speak", n=引号序号, role=说话人规范名)，n 就是那个数字。'
+    "**铁律**：n、role 两个参数缺一不可；序号必须取自正文，不许自己编。"
+    "**逐个序号都要过一遍**，用思考判断这一处是不是人物直接说的话："
+    "术语、名词、标语/口号、书名/篇名、强调/反语（没有人在说话）就跳过不标；"
+    "是台词就标，并判断谁说。"
+    "**有些对话作者忘了打引号**（紧跟「某某说道/问道」等提示）：这种没有序号，改用 "
+    'edit(op="speak", text=这段发言的完整原文, role=…) 标出。'
+    "旁白、动作、描写、叙述一律禁止标；「某某说道/淡淡地说道」这类话留在标记外。"
     "连续对话必须逐句分清双方；说一句接一段旁白再接着说，必须分开标全。"
-    "严禁没说完就结束、严禁把中间旁白包进标记。"
     "不要输出解释或 JSON 文本，只用工具，一次一处，标完立刻停下。"
 )
 
 CHECK_MARK = (
-    "现在是检查环节：上面这一批（窗口）的完整标记里，`<角色>…</角色>` 包住的句子就是「角色」说的。\n"
-    "**第一步：处理【机械扫描】列出的疑似漏标。**逐处判断：确实是人物直接说的话就必须 speak 补上"
-    "（text 照抄完整原文 + role，缺一不可）；明显是术语/标语/书名/引用（不是人在说话）就跳过不标。\n"
-    "**第二步：只允许改确实错的地方，禁止重标任何没问题的段落。**逐处核查以下三类错误：\n"
-    "1) 漏标：人物直接说的话没标（连续对话的每一段、旁白隔开的续话、无「某某说道」的交替）；\n"
+    "现在是检查环节：上面【本章完整标记】里，`[n]“…”` 的序号就是引号编号，"
+    "`<角色>…</角色>` 包住的句子就是「角色」说的。\n"
+    "**逐个编号过一遍**（这是硬要求）：每一处带序号的引号都要确认——是台词且标对了就跳过；"
+    "漏标的补、标错的改、误标的删。\n"
+    "1) 漏标：人物直接说的话没标（连续对话的每一段、旁白隔开的续话、无「某某说道」的交替；"
+    "以及作者忘了打引号的直接发言，用 text 补标）；\n"
     "2) 多标/标错：旁白、描写、叙述被标进来，或说话人认错；\n"
-    "3) 范围错：多裹了旁白/动作，或没说完就结束。\n"
-    "**铁律**：旁白、描写、叙述不是台词，禁止标（尤其严禁把整段叙述标成「未知」）；"
-    "标记只能包说话内容，「某某说道/淡淡地说道」这类旁白必须留在标记外。"
-    "修正一律用 edit，每处必须给 text（完整原文）和 role，缺一不可：\n"
-    "- 说话人错 或 范围错 → op=speak 重标：给正确的 role 和正确的完整原文；role 没变也要重标改正范围；\n"
-    "- 漏标 → op=speak 补上；\n"
-    "一次只改 1~2 处，只改真有问题的。改完立刻停下，不要解释。"
+    "3) 特殊含义的引号被误打：术语、名词、标语/口号、书名/篇名、强调/反语里没有人在说话，"
+    "若被标成台词就是错的。\n"
+    "**铁律**：旁白、描写、叙述不是台词，禁止标；标记只能包说话内容。"
+    "修正一律用 edit：\n"
+    "- 说话人错 → op=speak 重标：同一序号再 speak 一次，给正确的 role；\n"
+    "- 漏标（有引号）→ op=speak 补上（给 n + role）；漏标（无引号）→ op=speak + text + role；\n"
+    "- 特殊含义的引号被误标 → op=unmark 去掉这条标记（只去标记，不动原文）；\n"
+    "一次只改 1~2 处，只改真有问题的，不要反复确认已经标对的地方。"
+    '**全部编号都过完时，必须调用 edit(op="done") 立刻结束检查**；不要空转。'
 )
 
 DEFAULT_CHECK_STEPS = 100  # tool-step budget for the whole check pass (0 = no check at all)
-CHECK_WINDOW_SENTENCES = 20  # the check walks the chapter window by window (~N sentences each)
+CHECK_IDLE_STEPS = 2  # stop the check pass after N consecutive steps with no real change
 
-ROSTER_SYSTEM = """你在维护一部小说的「人物词典」。输入是「已有词典」和「这段文本」。
-把这段文本里出现、能指向具体人物的人整理进词典。
-
-- 规范名：此人最完整/最正式的姓名（如"高文·塞西尔"）；同一人只留一条。
-- **输出 JSON 的键必须全部是人物规范名**；禁止出现 aliases/name 这类字段名当键。
-- **主词（规范名）必须是全名/全称**：简称/称谓/绰号都放进 aliases。就算先见到简称、后见到全名，
-  也用全名当主词（同一人只留一条，旧的简称并进去）。
-- aliases 见到多少收多少（模糊名称 + 能唯一定位的称谓/绰号），**不限数量**。
-- **已有词典里能对上的就是同一人，必须沿用已有规范名**：已有「高文·塞西尔」就把「高文/老祖宗」并进去，
-  禁止新增「高文」；已有「瑞贝卡·塞西尔」就不要新增「瑞贝卡」。
-- **绝不收**代词/描述性短语/整句/泛称（大人/老爷/小姐/先生/骑士）；不收地名/组织/物品/种族/群体
-  （混血精灵/士兵/众人这类一律不收，只收有名有姓的个人）。
-- 已有条目只增补，不改名、不删除；**不要写声线/年龄/性别**（声线在造音色时按人物书重新设计）。
-
-只输出 JSON：
-{"规范名": {"aliases": ["高文", "老祖宗"]}}
-"""
 
 TOOLS = ["edit"]
 # 上下文只给「前后各一章」放在 system 里（当前章是任务文本，不再额外注入前情全文）：
-#   AUDIOBOOK_INJECT_NEIGHBORS=0 关掉前后文
-#   AUDIOBOOK_MAINTAIN_ROSTER=1  每章维护人物词典（convert 需要 roles.json）
+#   AUDIOBOOK_INJECT_NEIGHBORS=0 关掉前文参考
 INJECT_NEIGHBORS = os.environ.get("AUDIOBOOK_INJECT_NEIGHBORS", "1") == "1"
-NEIGHBOR_CHAPTERS = 1  # how many chapters before/after are shown as reference
-MAINTAIN_ROSTER = os.environ.get("AUDIOBOOK_MAINTAIN_ROSTER", "0") == "1"
-
-SUMMARY_SYSTEM = """你在维护一部长篇小说的「前情摘要」，供后续章节判断「谁在说话」时做背景。
-输入：上一版摘要、新增章节的出场角色与正文（可能多章）。输出新摘要（≤400 字），只保留判断说话人需要的信息：
-- 人物关系/身份、当前地点与处境、正在发生的事件；新出现的称呼点明归属。
-- 上一版里已经过时或无关的信息删掉；不要文学赏析，不要剧透后文。
-只输出 JSON：{"summary": "……"}"""
-
+OPENING_CHAPTERS = 5  # chapters 1-5 are marked with the whole 1..5 block as context
+PREV_CHAPTERS = 4  # from chapter 6 on: a rolling window of the previous 4 chapters
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -1645,7 +1471,7 @@ def parse_args() -> argparse.Namespace:
         "--batch",
         type=int,
         default=10,
-        help="rolling context window in chapters: first N chapters are fed in full, then a rolling summary takes over",
+        help="context window: first N chapters are fed in full as prior context",
     )
     parser.add_argument("--max-steps", type=int, default=1000, help="tool steps per chapter")
     parser.add_argument(
@@ -1680,53 +1506,9 @@ def load_roster(book: str) -> dict[str, list[str]]:
     return clean
 
 
-def load_summary(book: str) -> str:
-    path = APP_ROOT / "outputs" / book / "script" / "summary.txt"
-    return path.read_text(encoding="utf-8").strip() if path.is_file() else ""
-
-
-def save_summary(book: str, summary: str) -> None:
-    path = APP_ROOT / "outputs" / book / "script" / "summary.txt"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(summary.strip() + "\n", encoding="utf-8")
-
-
-def load_summary_upto(book: str) -> int:
-    path = APP_ROOT / "outputs" / book / "script" / "summary_upto.txt"
-    try:
-        return int(path.read_text(encoding="utf-8").strip()) if path.is_file() else 0
-    except ValueError:
-        return 0
-
-
-def save_summary_upto(book: str, chapter: int) -> None:
-    path = APP_ROOT / "outputs" / book / "script" / "summary_upto.txt"
-    path.write_text(str(chapter), encoding="utf-8")
-
-
-def compress(llm: LLMClient, chapter_text: str, roles: list[str], previous: str) -> str:
-    """One small call per chapter: fold this chapter into the rolling summary (≤400 chars)."""
-    try:
-        result = llm.chat_json(
-            SUMMARY_SYSTEM,
-            f"【上一版摘要】\n{previous or '（无）'}\n\n【本章出场角色】\n{'、'.join(dict.fromkeys(roles)) or '（无）'}\n\n"
-            f"【本章正文】\n{chapter_text}",
-            max_tokens=1024,
-            thinking=False,
-        )
-    except Exception as error:  # noqa: BLE001 - summary is best-effort, keep the old one
-        print(f"  [summary] 压缩失败：{str(error)[:120]}", flush=True)
-        return previous
-    if isinstance(result, dict):
-        summary = str(result.get("summary") or result.get("摘要") or "").strip()
-    else:
-        summary = str(result).strip()
-    return summary or previous
-
-
 # Keys the model sometimes emits as if they were character names; never roster entries.
 ROSTER_STRUCT_KEYS = frozenset(
-    {"aliases", "alias", "voice", "name", "age", "gender", "sample", "规范名", "别名", "声线", "人物", "词典"}
+    {"aliases", "alias", "name", "规范名", "别名", "人物", "词典"}
 )
 
 
@@ -1753,51 +1535,6 @@ def _absorb_entry(roster: dict[str, list[str]], name: str, labels: list[str]) ->
         bucket.extend(roster.pop(existing))
     roster[canonical] = [canonical] + [item for item in dict.fromkeys(bucket) if item and item != canonical]
     return canonical
-
-
-def maintain_roster(llm, roster: dict[str, list[str]], text: str) -> int:
-    """Fold the people seen in this piece of text into the dictionary (no chapters, no voice)."""
-    existing = "\n".join(f"{name}: {'、'.join(labels)}" for name, labels in roster.items())
-    try:
-        result = llm.chat_json(
-            ROSTER_SYSTEM,
-            f"【已有词典】\n{existing or '（空）'}\n\n【这段文本】\n{text}",
-            thinking=False,  # extraction task: thinking only risks echoing the prompt / truncating JSON
-        )
-    except Exception as error:  # noqa: BLE001 - dictionary is best-effort
-        print(f"  [roster] 维护失败：{str(error)[:120]}", flush=True)
-        return 0
-    if isinstance(result, dict):  # tolerate wrapper keys the model likes to add
-        for key in ("人物词典", "roles", "人物", "characters", "roster"):
-            if key in result and isinstance(result[key], (dict, list)):
-                result = result[key]
-                break
-        items = list(result.items())
-    elif isinstance(result, list):  # tolerate [{"规范名": ..., "aliases": [...]}, ...]
-        items = [
-            (item.get("规范名") or item.get("name") or item.get("canonical") or "", item)
-            for item in result
-            if isinstance(item, dict)
-        ]
-    else:
-        return 0
-    added = 0
-    for name, entry in items:
-        name = str(name).strip()
-        if not name or name.lower() in ROSTER_STRUCT_KEYS:
-            continue
-        if isinstance(entry, dict):
-            labels = [str(label).strip() for label in entry.get("aliases") or [] if str(label).strip()]
-        elif isinstance(entry, list):  # tolerate the older {"name": [labels]} shape
-            labels = [str(label).strip() for label in entry if str(label).strip()]
-        else:
-            labels = []
-        before_labels = {item for bucket in roster.values() for item in bucket}
-        _absorb_entry(roster, name, labels)
-        added += len({item for bucket in roster.values() for item in bucket} - before_labels)
-    if added:
-        print(f"  [roster] +{added} 标签 · 词条 {len(roster)}", flush=True)
-    return added
 
 
 def resolve_label(roster: dict[str, list[str]], name: str) -> str:
@@ -1840,16 +1577,48 @@ def _extract_edit(content: str) -> dict | None:
     return None
 
 
+def _result_changed(raw: str) -> bool:
+    """True only when a tool result really changed the text (not ``already``/refused)."""
+    try:
+        data = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        return False
+    return not data.get("already")
+
+
 def run_turn(
-    client, config, tools, mcp, messages, max_steps, counters, live: Live | None = None, chapter: int = 0, original: str = ""
+    client,
+    config,
+    tools,
+    mcp,
+    messages,
+    max_steps,
+    counters,
+    live: Live | None = None,
+    chapter: int = 0,
+    original: str = "",
+    idle_limit: int = 0,
 ) -> int:
     """Tool loop until the model stops calling tools. Guards against a failing retry loop.
 
+    ``idle_limit`` > 0 stops the pass after that many consecutive steps with no real change
+    (the check pass uses it to bail out once it is only re-confirming existing marks).
     Returns the number of successful edits (0 = nothing changed)."""
     errors = 0
     edits_ok = 0
     last_sig, repeats, fail_total = "", 0, 0
     ok_sig, ok_repeats = "", 0
+    idle_steps = 0
+
+    def idle_now(changed: bool) -> bool:
+        nonlocal idle_steps
+        if not idle_limit:
+            return False
+        idle_steps = 0 if changed else idle_steps + 1
+        return idle_steps >= idle_limit
+
     for _step in range(1, max_steps + 1):
         started = time.perf_counter()
         raw_log(
@@ -1872,8 +1641,12 @@ def run_turn(
                 tool_choice="auto" if tools else None,
                 temperature=config.temperature,
                 top_p=config.top_p,
-                max_tokens=4096,
-                extra_body={"top_k": config.top_k, "chat_template_kwargs": {"enable_thinking": THINK}},
+                max_tokens=MAX_TOKENS,
+                extra_body={
+                    "top_k": config.top_k,
+                    "chat_template_kwargs": {"enable_thinking": THINK},
+                    "reasoning_budget_tokens": REASONING_BUDGET,
+                },
             )
         except Exception as error:  # noqa: BLE001 - malformed tool-call JSON -> retry
             errors += 1
@@ -1969,7 +1742,12 @@ def run_turn(
             else:
                 edits_ok += 1
                 last_sig, repeats = "", 0
+            if '"done": true' in result:
+                return edits_ok
+            if idle_now(_result_changed(result)):
+                return edits_ok
             continue
+        step_changed = False
         for call in tool_calls:
             arguments = _parse_args(call["function"]["arguments"])
             if not arguments:  # malformed or empty: tell the model and move on (never crash)
@@ -2002,6 +1780,8 @@ def run_turn(
                 current = json.loads(mcp.call("get_marked", {}))["text"]
                 live.set_state(chapter, len(current), live_fragments(original, current))
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+            if '"done": true' in result:  # model says it is finished: stop right away
+                return edits_ok
             if '"ok": false' in result or "not found" in result:
                 fail_total += 1
                 repeats = repeats + 1 if sig == last_sig else 0
@@ -2023,6 +1803,9 @@ def run_turn(
                 messages.append({"role": "user", "content": "这处已经处理过，不要重复；继续找还没标出的对话。"})
             else:
                 edits_ok += 1
+                step_changed = True
+        if idle_now(step_changed):
+            return edits_ok
     return edits_ok
 
 
@@ -2060,16 +1843,12 @@ def apply_workflow_overrides(args: argparse.Namespace) -> dict:
         if isinstance(value, int) and not isinstance(value, bool):
             setattr(args, target, max(0 if target == "check_steps" else 1, value))
             applied[target] = getattr(args, target)
-    if isinstance(params.get("think"), bool):
-        globals()["THINK"] = params["think"]
-        applied["THINK"] = params["think"]
     prompts = data.get("prompts")
     if not isinstance(prompts, dict):
         prompts = {}
     for key, name in (
         ("local_system", "LOCAL_SYSTEM"),
         ("step_mark", "STEP_MARK"),
-        ("roster_system", "ROSTER_SYSTEM"),
         ("check_mark", "CHECK_MARK"),
     ):
         value = prompts.get(key)
@@ -2124,7 +1903,6 @@ def main() -> None:
     from openai import OpenAI  # type: ignore
 
     client = OpenAI(base_url=config.base_url, api_key=config.api_key, timeout=900)
-    llm = LLMClient(config)
     mcp = MCPClient()
     mcp.initialize()
     all_tools = {t["function"]["name"]: t for t in mcp.openai_tools()}
@@ -2161,12 +1939,6 @@ def main() -> None:
     started = time.perf_counter()
     phases: list[dict] = []
 
-    window = max(1, args.batch)  # first `window` chapters are fed in full, then the summary rolls
-    summary = load_summary(args.book)
-    summary_upto = load_summary_upto(args.book)
-    if summary:
-        print(f"[resume] 前情摘要 {len(summary)} 字（已含至第 {summary_upto} 章）", flush=True)
-
     def chapter_path(cid: int) -> Path:
         return chapters / f"ch{cid:03d}.txt"
 
@@ -2176,52 +1948,20 @@ def main() -> None:
             return []
         return [seg["role_name"] for seg in parse_marks(marked.read_text(encoding="utf-8")) if seg["kind"] == "speech"]
 
-    def seed_summary() -> None:
-        """First summary, built from the whole accumulated window in one call."""
-        nonlocal summary, summary_upto
-        block = "\n\n".join(f"【第 {k} 章】\n{chapter_path(k).read_text(encoding='utf-8')}" for k in range(1, window + 1))
-        summary = compress(llm, block, [role for k in range(1, window + 1) for role in roles_in(k)], "")
-        summary_upto = window
-        save_summary(args.book, summary)
-        save_summary_upto(args.book, summary_upto)
-        print(f"  [summary] 窗口前 {window} 章 -> {len(summary)} 字", flush=True)
-
-    def fold_through(cid: int) -> None:
-        """Make the summary cover chapters 1..cid; no-op while the window is still filling."""
-        nonlocal summary, summary_upto
-        if cid < window:
-            return
-        if summary_upto < window:
-            seed_summary()
-        while summary_upto < cid:
-            k = summary_upto + 1
-            summary = compress(llm, chapter_path(k).read_text(encoding="utf-8"), roles_in(k), summary)
-            summary_upto = k
-            save_summary(args.book, summary)
-            save_summary_upto(args.book, summary_upto)
-            print(f"  [summary] +第 {k} 章 -> {len(summary)} 字", flush=True)
-
-    def prior_context(cid: int) -> str:
-        """Full previous chapters while the window fills; the rolling summary afterwards."""
-        if cid <= window:
-            prior = "\n\n".join(f"【第 {k} 章】\n{chapter_path(k).read_text(encoding='utf-8')}" for k in range(1, cid))
-            return (
-                f"【前情（第 1..{cid - 1} 章原文，仅用于判断说话人；这些章节都已处理，不要处理）】\n{prior}"
-                if prior
-                else "（本章是开头）"
-            )
-        return f"【前情摘要】\n{summary or '（无）'}"
-
     def neighbor_context(cid: int) -> str:
-        """One chapter before + one after, reference only: helps name characters not introduced
-        in the current chapter. Never includes the current chapter itself."""
+        """Reference chapters only (never the current chapter): chapters 1-5 see the whole opening
+        block 1..5; from chapter 6 on a rolling window of the previous 4 (the oldest drops out)."""
         if not INJECT_NEIGHBORS:
             return ""
+        if cid <= OPENING_CHAPTERS:
+            others = [k for k in range(1, OPENING_CHAPTERS + 1) if k != cid]
+        else:
+            others = list(range(max(1, cid - PREV_CHAPTERS), cid))
         parts = []
-        for label, other in (("前文", cid - NEIGHBOR_CHAPTERS), ("后文", cid + NEIGHBOR_CHAPTERS)):
+        for other in others:
             path = chapter_path(other)
             if path.is_file():
-                parts.append(f"【{label}·第 {other} 章（仅供判断人物/称呼，不要标注）】\n{path.read_text(encoding='utf-8')}")
+                parts.append(f"【前文·第 {other} 章（仅供判断人物/称呼，不要标注）】\n{path.read_text(encoding='utf-8')}")
         return "\n\n".join(parts)
 
     for cid in ids:
@@ -2234,19 +1974,11 @@ def main() -> None:
                 live.set_state(cid, len(snapshot), live_fragments(raw_text, snapshot), done=True)
             print(f"[skip] ch{cid:03d} 已存在", flush=True)
         else:
-            # Dictionary = side product of the text flowing through: fold this piece of text in,
-            # then mark it. No chapters, no voice profiles here (voice is designed from the
-            # dictionary at the voicebank stage).
-            if MAINTAIN_ROSTER:
-                added = maintain_roster(llm, roster, raw_text)
-                (out_dir / "roles.json").write_text(json.dumps(roster, ensure_ascii=False, indent=2), encoding="utf-8")
-                live.emit("roster", chapter=cid, added=added, roles=len(roster))
             names = "、".join(roster)  # consistency hint, not a gate: new names are registered as seen
             hint = f"已有人物（尽量沿用这些名字）：{names}\n\n" if names else ""
             live.emit("chapter", chapter=cid, chars=len(raw_text))
             live.set_state(cid, len(raw_text), live_fragments(raw_text, raw_text))
             mcp.call("set_text", {"text": raw_text})
-            fold_through(cid - 1)  # summary must cover everything before this chapter
             think = config.thinking_system_token if THINK else ""  # profile-driven (Gemma: "<|think|>", Qwen: none)
             # The model sees the plain chapter text and must quote the COMPLETE speech text;
             # the MCP locates it (fuzzy only for long needles) -- nothing about that is in the prompt.
@@ -2256,44 +1988,50 @@ def main() -> None:
             messages = [
                 {"role": "system", "content": f"{think}{LOCAL_SYSTEM}\n\n{hint}" + (f"\n\n{neighbors}" if neighbors else "")},
                 *FEW_SHOT,
-                {"role": "user", "content": f"【要处理的正文】\n{raw_text}"},
+                {"role": "user", "content": f"【要处理的正文】\n{number_text(raw_text)}"},
                 {"role": "user", "content": STEP_MARK},
             ]
             run_turn(client, config, tools, mcp, messages, args.max_steps, counters, live, cid, raw_text)
             checks = 0
-            if args.check_steps:
-                check_prior = f"【前情摘要（只作背景参考，不要处理）】\n{summary or '（无）'}"
+            if args.check_steps:  # one whole-chapter check pass
                 current = json.loads(mcp.call("get_marked", {}))["text"]
-                windows = check_windows(current, CHECK_WINDOW_SENTENCES)
-                total = len(windows)
-                per_window = max(4, args.check_steps // max(1, total))
-                for index, (first, last) in enumerate(windows, start=1):
-                    current = json.loads(mcp.call("get_marked", {}))["text"]
-                    lines = current.split("\n")
-                    window_text = "\n".join(lines[first - 1 : last])
-                    missing = [item for item in mcp.server.unmarked_quotes() if first <= item["line"] <= last]
-                    if not missing and "<" not in window_text:  # pure narration, nothing to check
-                        continue
-                    view = "\n".join(lines[first - 1 : last])
-                    if missing:
-                        listed = "\n".join(
-                            f"- {item['text']}"
-                            + ("（含旧标记，请整段重标）" if item.get("partial") else "")
-                            + f" ｜ 出处：{item['snippet']}"
-                            for item in missing[:40]
-                        )
-                        scan = f"【机械扫描：本批以下 {len(missing)} 处引号尚未标记】\n{listed}"
-                    else:
-                        scan = "【机械扫描：本批没有未标记的引号内容】"
-                    batch_note = f"这是第 {index}/{total} 批检查（第 {first}~{last} 段）。"
-                    check_messages = [
-                        {"role": "system", "content": f"{think}{LOCAL_SYSTEM}\n\n{hint}"},
-                        {"role": "user", "content": f"{check_prior}\n\n【本章第 {first}~{last} 段的完整标记】\n{view}"},
-                        {"role": "user", "content": scan},
-                        {"role": "user", "content": batch_note + CHECK_MARK},
-                    ]
-                    run_turn(client, config, tools, mcp, check_messages, per_window, counters, live, cid, raw_text)
-                    checks += 1
+                missing = mcp.server.unmarked_quotes()
+                if missing:
+                    listed = "\n".join(
+                        f"- [{item['number']}] {item['text']}"
+                        + ("（含旧标记，请整段重标）" if item.get("partial") else "")
+                        + f" ｜ 出处：{item['snippet']}"
+                        for item in missing[:120]
+                    )
+                    scan = f"【机械扫描：全章以下 {len(missing)} 处引号尚未标记】\n{listed}"
+                else:
+                    scan = "【机械扫描：全章没有未标记的引号内容】"
+                check_messages = [
+                    {
+                        "role": "system",
+                        "content": f"{think}{LOCAL_SYSTEM}\n\n{hint}" + (f"\n\n{neighbors}" if neighbors else ""),
+                    },
+                    {
+                        "role": "user",
+                        "content": f'【本章完整标记（`[n]"…"` 的 n 是引号编号，`<角色>…</角色>` 表示这段是「角色」说的）】\n{number_text(current)}',
+                    },
+                    {"role": "user", "content": scan},
+                    {"role": "user", "content": f"这是全章检查。{CHECK_MARK}"},
+                ]
+                run_turn(
+                    client,
+                    config,
+                    tools,
+                    mcp,
+                    check_messages,
+                    args.check_steps,
+                    counters,
+                    live,
+                    cid,
+                    raw_text,
+                    idle_limit=CHECK_IDLE_STEPS,  # fallback: stop when it only re-confirms
+                )
+                checks = 1
             snapshot = json.loads(mcp.call("get_marked", {}))["text"]
             # No end-of-chapter fill-in pass: whatever the edit loop produced stands; only the
             # mechanical cleanup below runs.
@@ -2307,8 +2045,7 @@ def main() -> None:
             live.emit("missed", chapter=cid, count=len(missed), samples=[item["text"][:20] for item in missed[:5]])
             _stage_note(args.book, "run", f"{len(phases)}/{len(ids)}")
             live.set_state(cid, len(snapshot), live_fragments(raw_text, snapshot), done=True)
-        fold_through(cid)  # skipped or marked: keep the rolling summary current
-        live.emit("done", chapter=cid, roles=len(roster), summary=summary[:200])
+        live.emit("done", chapter=cid, roles=len(roster))
 
     marked = "\n".join((out_dir / f"ch{cid:03d}.marked.txt").read_text(encoding="utf-8") for cid in ids)
     (out_dir / "roles.json").write_text(json.dumps(roster, ensure_ascii=False, indent=2), encoding="utf-8")

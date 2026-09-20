@@ -24,8 +24,8 @@
 - **声线**：旁白**固化**在 `voices/narrator.json` + `narrator_m/f.wav`（git 追踪；`scripts/build_narrator.py` 复现；青年男/女，seed58，讲故事）。角色声线在 voicebank 阶段按**人物书（roles.json）**用 LLM 只定**性别+年龄**（`voice_profiles.json`），描述固定 `一位{年龄}{性别}性，日常说话，语气自然。`；同角色用确定性 seed（`role_seed`），设计 cfg=4、克隆 cfg=1。
 - **标记约定**：台词 = `<角色名>朗读内容</角色名>`（`audiobook/marks.py` 的 `MARK_RE`，可用 `AUDIOBOOK_MARK_RE` 覆盖），标记外一律旁白；vocal events 写在内容里如 `<高文>[叹气]好吧。</高文>`。
 - **剧本标注（`mark_script.py`）**：
-  - 模型只当「阅读文本→舞台剧台本」的编剧，工具只有 `edit`：`edit(op="speak", text=这段发言的完整原文, role=规范名)`。**正文不再加任何标记/编号**，注入的就是纯原文；**text 必须逐字照抄完整发言**（引号标点一不差，不许半截/改写/带旁白），提示词对这一点要求极严；**MCP 的模糊匹配不在提示词里说**。
-  - **定位规则**：先精确匹配；整段 **≤10 字（`FUZZY_MIN_CHARS`）绝不开模糊**（只能逐字对上）；长于 10 字才做**两次锚点匹配**——取开头 10 字（`ANCHOR_CHARS`）匹配一次、结尾 10 字匹配一次，中间允许差异，span=头锚到尾锚。定位后仍自动裁到引号内、**跨多引号自动拆成每段一个标记**（旁白留在外）、半截引号自动配对；span 内旧标记被撤掉重包（覆盖，无嵌套）。无引号 span 必须有「说道/想」类提示，否则按旁白拒绝。只做别名归一；**原文一个字不改、不清理引号、不加气口**。
+  - 模型只当「阅读文本→舞台剧台本」的编剧，工具只有 `edit`：**正文每个开引号前加数字序号**（`number_text` 渲染成 `[12]“…”`），模型用 `edit(op="speak", n=引号序号, role=规范名)` 定位。**提示词说明：编号覆盖所有引号，但不代表都在说话**（术语/名词/标语/书名/强调要思考后跳过）；**作者忘打引号的直接发言**改用 `edit(op="speak", text=完整原文, role=…)` 定位。分支编号（第几次说）一律数字。
+  - **定位规则（不在提示词里说）**：`n` 直接取第 n 处引号段；`text` 先精确匹配、再容忍两种引号、再去标点；整段 **≤10 字（`FUZZY_MIN_CHARS`）绝不开模糊**，长于 10 字做**两次锚点匹配**（开头/结尾各 10 字，中间允许差异）。定位后自动裁到引号内、**跨多引号自动拆成每段一个标记**（旁白留在外）、span 内旧标记被撤掉重包（覆盖，无嵌套）；无引号的发言靠「说道/想」提示自动扩成整句。只做别名归一；**原文一个字不改、不清理引号、不加气口**。
   - **1 次标注 + 1 轮分窗检查（每窗 ~20 句，`CHECK_WINDOW_SENTENCES=20`；`--check-steps` 总步数默认 100，0=关闭）**：标注后按当前标记重扫，机械列出**未被任何标记包住的引号内容**（`unmarked_quotes`，带 `[3B]~[3C]` 和出处片段）喂给模型定点补标；检查只改确有问题的（漏标补、标错重标、整段误标 unmark），并把 `漏标引号=N` 打进日志/live。
   - **人物词典（没有章节概念）**：文本流到哪，词典维护到哪——`maintain_roster` 对**每段文本**增量维护，`speak` 一律写规范名。**主词必须是全名/全称**（后出现的全名会把旧简称提升为主词，同一人只留一条）；aliases **不限数量**；**绝不收**指代/代词/整句/泛称/地名/组织/种族。**不写声线**（voicebank 阶段按人物书定）。
   - **窗口 + 滚动摘要（`--batch N`）**：前 N 章喂全文（`前情`），之后每章 `compress()` 产 ≤400 字摘要写 `summary.txt`；每章上下文 = `system`（提示词 + 词典）+ `user`（前情原文/摘要 + 本章正文）+ `STEP_MARK`。
@@ -36,8 +36,14 @@
 - **Vocal events（渲染器遗留支持）**：`audiobook/tts.py` 仍能识别内容里的 `[笑]/[叹气]`（检测到自动提 cfg），但**标注不再产出 tag**。
 - **速度**：Breeze 无时长/语速参数（自己决定停）；快慢用 direction 指令（`语速放慢`）、参考音语速，或后处理 `tts.atempo`（`row.speed` / `--speed`，保音高）。
 - 后端**单文件** `audiobook/tts.py`：Breeze HTTP 渲染（可续跑）+ 拼接/响度（-16 LUFS）+ `encode_lossy`（MP3 64k）+ `atempo` 变速 + vocal events。参考音准备：`scripts/prepare_refs.py`。
-- 局域网浏览/试听：`scripts/serve_files.py`（`:8899`）。
-- **流水线可视化（web）**：`http://<host>:8899/workflow`（看板有入口）。产品 = **文本（段落流）**，章节/台词/事件都只是标记，所有阶段读写同一段文本；结构定义在 `scripts/workflow_store.py::PIPELINE`。页面可改 `batch / max_steps / check_steps / think` 与四个提示词（含 `CHECK_MARK`）、few-shot 示例、一键保存覆盖并运行例章 ch003（输入/输出对照），保存到 `outputs/<book>/workflow.json` 并写 `workflow_changelog.jsonl`（双向留痕）；`mark_script.py` 启动时应用覆盖（覆盖优先于 CLI），同一本书有 `script/run.pid` 并发锁。
+- 局域网服务：`scripts/serve_files.py`（`:8899`），统一路由（都带 `?book=`）：
+  - `/`、`/dashboard` = 看板（章节进度/词典/摘要/成果）
+  - `/prompt` = 提示词测试（原 workflow 页；产品=文本，改参数/提示词/few-shot 并跑例章）
+  - `/live` = 实时标记（live 页：正文 + 聊天 + 就地标记）
+  - `/raw` = LLM原始IO（按章节分组的请求/响应，输入→思考→输出→工具调用）
+  - `/tts` = TTS 测试（选章、挑一行手动合成、捏说话人 Voice Design；`/tts/{rows,voices,health}.json`、`POST /tts/{say,design,up}`）
+  目录 URL 一律 302 回看板（文件库已删）。
+- **提示词测试页**：`/prompt?book=<book>`。结构定义在 `scripts/workflow_store.py::PIPELINE`；可改 `batch / max_steps / check_steps` 与四个提示词（含 `CHECK_MARK`）、few-shot 示例、一键保存覆盖并运行例章（输入/输出对照），保存到 `outputs/<book>/workflow.json` 并写 `workflow_changelog.jsonl`（双向留痕）；`mark_script.py` 启动时应用覆盖（覆盖优先于 CLI），同一本书有 `script/run.pid` 并发锁。
 
 ## Breeze TTS 2（C++/GGUF，唯一推理路径）
 

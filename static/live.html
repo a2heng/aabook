@@ -1,0 +1,232 @@
+<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>实时标记 · live</title>
+<style>
+:root{color-scheme:dark;--bg:#0d1017;--panel:#151a23;--panel2:#1b2230;--line:#26303f;--fg:#e6ecf3;--dim:#8b97a8;
+  --accent:#5aa9ff;--ok:#43c785;--warn:#ffb454}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;overflow:hidden}
+header{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#101319;z-index:5}
+.brand{font-weight:700}.brand small{color:var(--dim);font-weight:400;margin-left:6px}
+nav a{color:var(--accent);text-decoration:none;margin-right:12px;font-size:13px}nav a.on{color:var(--fg);font-weight:700}
+header .grow{flex:1}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}
+#main{display:grid;grid-template-columns:1fr 340px;height:calc(100dvh - 46px)}
+#left{display:flex;flex-direction:column;min-width:0;min-height:0;border-right:1px solid var(--line)}
+#chbar{display:flex;gap:10px;align-items:center;padding:7px 16px;border-bottom:1px solid var(--line);font-size:12.5px;color:var(--dim)}
+#chbar select{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:3px 8px;font-size:13px}
+#chbar button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:3px 10px;cursor:pointer;font-size:12.5px}
+#chbar button.on{background:var(--accent);color:#0b0f15;border-color:var(--accent);font-weight:700}
+#article{overflow:auto;min-height:0;padding:20px 30px 60px;flex:1;font-size:15.5px;line-height:2.05;word-break:break-word}
+#article p{margin:0 0 .55em;text-indent:2em}
+#article p:empty{display:none}
+.who{display:inline-block;font-size:11.5px;font-weight:700;color:#9fd0ff;background:#16314f;border-radius:6px;padding:0 7px;margin:0 3px 0 2px;vertical-align:1px;line-height:1.7}
+.speech{background:#152238;border-radius:8px;padding:2px 6px;box-shadow:inset 0 0 0 1px #2b4a72}
+del{color:#ff9d9d;background:#2a1414;text-decoration:line-through;border-radius:5px;padding:1px 3px}
+ins{color:#9fe6c1;background:#122a1c;text-decoration:none;border-radius:5px;padding:1px 5px}
+.new{animation:appear .65s cubic-bezier(.2,.9,.3,1.1) both}
+@keyframes appear{0%{opacity:0;filter:blur(4px)}55%{opacity:1}100%{opacity:1;filter:blur(0)}}
+#chat{overflow:hidden;min-height:0;padding:7px 9px;display:flex;flex-direction:column;justify-content:flex-end;gap:3px}
+.ev{background:var(--panel);border:1px solid var(--line);border-left:3px solid #2b4a72;border-radius:8px;padding:3px 8px;font-size:12px;line-height:1.4;word-break:break-word}
+.ico{display:inline-block;width:14px;margin-right:4px;text-align:center;opacity:.9}
+.think{color:var(--dim);background:#12161d;border-left-color:#3a4252}.think summary{cursor:pointer;font-size:11.5px}
+.call{border-color:#25415f;border-left-color:#3f74b0;background:#101a26;font-size:12.5px}
+.dict{border-color:#5c4620;border-left-color:#b8860b;background:#241d10;font-size:12px}
+.res{border-color:#234;border-left-color:#2e3d52;background:#111720;color:var(--dim);font-size:11px}
+.res.ok{border-color:#1f4a33;border-left-color:var(--ok);color:#c9f0da;background:#111d16}
+.res.warn{border-color:#5c4620;border-left-color:#e0a545;color:#ffe1b0;background:#1d190e}
+.res.bad{border-color:#5a2626;border-left-color:#ff7b7b;color:#ffc9c9;background:#1d1212}
+.miss{border-color:#5c4620;border-left-color:#b8860b;background:#1d1a10;color:#ffdba8}
+.sum{border-color:#3b3560;border-left-color:#8f7fe8;background:linear-gradient(180deg,#1b1830,#151a23)}
+.ev code{font-size:11px;padding:0 3px}
+.badge{display:inline-block;font-size:10px;font-weight:700;padding:0 4px;border-radius:5px;margin-right:4px}
+.b-speak{background:#17345a;color:#8fc4ff}.b-unmark{background:#4a2a12;color:#ffba75}.b-ok{background:#12351f;color:#7ee2a8}
+.b-warn{background:#3a2f12;color:#ffd08a}.b-bad{background:#3a1616;color:#ff9d9d}.b-other{background:#232a36;color:#b8c4d4}
+code{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d1219;border:1px solid var(--line);border-radius:5px;padding:0 4px;font-size:12px}
+.role{color:var(--accent);font-weight:600}.sp{color:var(--dim)}.chap{color:var(--accent);font-weight:700;font-size:11.5px;margin-right:6px}
+@media (max-width:820px){
+  #main{grid-template-columns:1fr;grid-template-rows:1fr minmax(28dvh,38dvh)}
+  #left{border-right:none;border-bottom:1px solid var(--line)}
+  #article{padding:14px 16px 40px;font-size:16px;line-height:1.95}
+  #chat{padding:8px 10px;gap:4px}
+  .ev{font-size:12px;padding:4px 8px}
+  #chbar{gap:8px;padding:6px 12px;font-size:12px;overflow-x:auto;white-space:nowrap}
+  header{padding:0 12px}.brand{font-size:14px}
+}
+</style></head><body>
+<header>
+  <div class="brand">实时标记 <small id="book">· live</small></div>
+  <span class="grow"></span>
+  <nav>
+    <a href="/dashboard">看板</a>
+    <a id="promptlink" href="/prompt">提示词测试</a>
+    <a id="selfpage" href="#" class="on">实时标记</a>
+    <a id="rawpage" href="#">LLM原始IO</a>
+    <a id="ttslink" href="/tts">TTS测试</a>
+  </nav>
+  <span class="dot"></span>
+</header>
+<div id="main">
+  <div id="left">
+    <div id="chbar">
+      <select id="chs"></select>
+      <button id="follow" class="on">跟随最新</button>
+      <span id="finfo"></span>
+    </div>
+    <div id="article"><span class="sp">等待正文……</span></div>
+  </div>
+  <div id="chat"></div>
+</div>
+<script>
+const BOOK=new URLSearchParams(location.search).get('book')||'';
+const API=BOOK?'/api/'+encodeURIComponent(BOOK)+'/':'';
+const BOOKQ=BOOK?'?book='+encodeURIComponent(BOOK):'';
+document.getElementById('promptlink').href='/prompt'+BOOKQ;
+document.getElementById('selfpage').href='/live'+BOOKQ;
+document.getElementById('rawpage').href='/raw'+BOOKQ;
+document.getElementById('ttslink').href='/tts'+BOOKQ;
+if(!BOOK){document.getElementById('book').textContent='· 请从看板选书';}
+const MAXCHAT=500;
+const article=document.getElementById('article'), chat=document.getElementById('chat'), chs=document.getElementById('chs');
+const bookEl=document.getElementById('book'), followBtn=document.getElementById('follow'), finfo=document.getElementById('finfo');
+let offset=0, follow=true, selected=null, current=null, prevSig='', idxSig='', seen=new Set();
+const wantCh=(new URLSearchParams(location.search).get('ch')||'').trim();
+if(wantCh){selected=+wantCh;follow=false;followBtn.classList.remove('on');}
+function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function fragHTML(f,isNew){const c=isNew?' new':'';
+  if(f.kind==='speech')return '<span class="speech'+c+'"><span class="who">'+esc(f.role||'?')+'</span>'+esc(f.text)+'</span>';
+  if(f.kind==='deleted')return '<del'+c+'>'+esc(f.text)+'</del>';
+  if(f.kind==='inserted')return '<ins'+c+'>'+esc(f.text)+'</ins>';
+  return '<span'+c+'>'+esc(f.text)+'</span>';}
+function renderArticle(s){
+  if(!s||!s.fragments||document.hidden)return;
+  const sig=JSON.stringify(s.fragments); if(sig===prevSig)return;
+  if(seen.chapter!==s.chapter){seen=new Set();seen.chapter=s.chapter;}
+  const top=article.scrollTop; let html='<p>';
+  for(const f of s.fragments){
+    const parts=String(f.text).split(/\n+/);
+    for(let i=0;i<parts.length;i++){
+      if(i>0)html+='</p><p>';
+      const txt=(i>0||html==='<p>')?parts[i].replace(/^[ \t\u3000]+/,''):parts[i];
+      if(!txt)continue;
+      const key=f.kind+'|'+(f.role||'')+'|'+parts[i];
+      const isNew=!seen.has(parts[i])&&!seen.has(key); seen.add(parts[i]); seen.add(key);
+      html+=fragHTML({...f,text:txt},isNew);
+    }
+  }
+  html+='</p>';
+  article.innerHTML=html; article.scrollTop=top; prevSig=sig;
+  finfo.textContent=(s.chars||0)+' 字 · '+s.fragments.length+' 片段';
+}
+let pending=[], emptyTool=false;
+function pushChat(e){
+  const row=document.createElement('div'); row.className='ev '+e.cls;
+  row.innerHTML=(e.icon?'<span class="ico">'+e.icon+'</span>':'')+(e.chapter?'<span class="chap">ch'+e.chapter+'</span>':'')+e.html;
+  pending.push(row); return row;
+}
+function resultClass(raw){
+  let r=null;try{r=JSON.parse(raw);}catch(_){return 'bad';}
+  if(!r||typeof r!=='object')return 'bad';
+  if(r.ok===false)return 'bad';
+  if(r.already||r.replaced||r.unmarked||r.split)return 'warn';
+  return 'ok';
+}
+function resultIcon(raw){
+  const c=resultClass(raw);
+  return c==='ok'?'✓':c==='warn'?'⟳':'✗';
+}
+function flushChat(){
+  if(!pending.length)return;
+  const frag=document.createDocumentFragment();
+  for(const row of pending)frag.appendChild(row);
+  pending=[]; chat.appendChild(frag);
+  let extra=chat.childElementCount-MAXCHAT;
+  while(extra-->0)chat.removeChild(chat.firstChild);
+}
+function fmtRange(x){const n=x&&(x.n||x.line||x.begin);return n?'<code>['+esc(n)+']</code> ':'';}
+function fmtCall(a, name){const x=a&&a.args||{};const keys=Object.keys(x);
+  if(!keys.length)return '<span class="badge b-other">空调用</span><span class="sp">旧版记录没有参数</span>';
+  const op=x.op||'speak';
+  if(op==='speak')return '<span class="badge b-speak">标注</span>'+fmtRange(x)+'<span class="role">'+esc(x.role||'?')+'</span> <code>'+esc(x.text||'')+'</code>';
+  if(op==='unmark')return '<span class="badge b-unmark">取消标记</span>'+fmtRange(x)+'<code>'+esc(x.text||'')+'</code>';
+  if(op==='done')return '<span class="badge b-ok">✓ 完成</span><span class="sp">检查结束</span>';
+  if(op==='replace')return '<span class="badge b-other">替换</span><code>'+esc(x.find||'')+'</code> <span class="sp">→</span> <code>'+esc(x.replace||'')+'</code>';
+  if(op==='delete')return '<span class="badge b-other">旧版·删除</span>'+(x.text||x.find?'<code>'+esc(x.text||x.find)+'</code>':'<span class="sp">（旧记录无参数）</span>');
+  if(op==='reassign')return '<span class="badge b-other">旧版·改标</span>'+(x.role?'<span class="role">'+esc(x.role)+'</span> ':'')+'<code>'+esc(x.text||x.find||'')+'</code>';
+  return '<span class="badge b-other">旧版·'+esc(op)+'</span><code>'+esc(JSON.stringify(x))+'</code>';}
+function fmtResult(raw){let r=null;try{r=JSON.parse(raw);}catch(_){return esc(raw);}
+  if(!r||typeof r!=='object')return esc(raw);
+  if(r.ok===false)return '<span class="badge b-bad">✗ 拒绝</span>'+esc(r.reason||'')+(r.text?' · <code>'+esc(r.text)+'</code>':'');
+  if(r.split)return '<span class="badge b-ok">✓ 拆成 '+r.count+' 处</span>'+fmtRange(r)+'<span class="role">'+esc(r.role||'')+'</span> <code>'+esc(r.marked||'')+'</code>';
+  if(r.unmarked)return '<span class="badge b-warn">已取消标记</span>'+fmtRange(r)+'<span class="role">'+esc(r.unmarked)+'</span> <code>'+esc(r.marked||'')+'</code>';
+  if(r.already)return '<span class="badge b-warn">已标过</span>'+fmtRange(r)+'<span class="role">'+esc(r.role||'')+'</span> <span class="sp">未改动</span>';
+  if(r.replaced)return '<span class="badge b-warn">⟳ 覆盖</span>'+fmtRange(r)+'<span class="role">'+esc(r.previous||'')+'</span> <span class="sp">→</span> <span class="role">'+esc(r.role||'')+'</span> <code>'+esc(r.marked||'')+'</code>';
+  if(r.ok)return '<span class="badge b-ok">✓ 标注</span>'+fmtRange(r)+'<span class="role">'+esc(r.role||'')+'</span> <code>'+esc(r.marked||'')+'</code>';
+  return esc(raw);}
+function handle(e){
+  if(e.type==='start'){bookEl.textContent='· '+(e.book||'live');return;}
+  if(e.type==='chapter'){current=e.chapter;if(follow)selected=e.chapter;return;}
+  if(e.type==='roster'){pushChat({cls:'dict',icon:'✦',chapter:e.chapter,html:'词典 <b>+'+e.added+'</b> 标签 · 词条 '+e.roles});return;}
+  if(e.type==='assistant'){const c=e.content||'';pushChat({cls:'think',icon:'🧠',chapter:e.chapter,html:'<details><summary>思考 '+c.length+' 字 · '+esc(c.slice(0,42))+'</summary>'+esc(c)+'</details>'});return;}
+  if(e.type==='tool'){const x=e.args||{};
+    if(!Object.keys(x).length){emptyTool=true;return;} emptyTool=false;
+    pushChat({cls:'call',chapter:e.chapter,html:fmtCall(e.args, e.call)});return;}
+  if(e.type==='result'){
+    emptyTool=false;
+    const verdict=resultClass(e.result);
+    pushChat({cls:'res '+verdict,icon:resultIcon(e.result),chapter:e.chapter,html:fmtResult(e.result)});
+    return;}
+  if(e.type==='missed'){pushChat({cls:'miss',icon:'🔍',chapter:e.chapter,html:'漏标扫描 <b>'+e.count+'</b> 处'+(e.samples&&e.samples.length?' <span class="sp">'+esc(e.samples.join(' / '))+'</span>':'')});return;}
+  if(e.type==='done'){pushChat({cls:'sum',icon:'📝',chapter:e.chapter,html:'<b>本章完成</b>'});return;}}
+function handleText(txt){
+  for(const line of txt.split('\n')){if(!line.trim())continue;let e;try{e=JSON.parse(line);}catch(_){continue;}handle(e);}
+}
+async function tickChat(){
+  if(!API){setTimeout(tickChat,3000);return;}
+  try{const r=await fetch(API+'live.jsonl',{headers:{'Range':'bytes='+offset+'-'},cache:'no-store'});
+    if(r.status===416){
+      const h=await fetch(API+'live.jsonl',{method:'HEAD',cache:'no-store'});
+      const size=+(h.headers.get('Content-Length')||0);
+      if(size<offset){
+        const fb=await (await fetch(API+'live.jsonl',{cache:'no-store'})).arrayBuffer();
+        offset=0;chat.innerHTML='';pending=[];
+        handleText(new TextDecoder().decode(fb)); offset=fb.byteLength;
+      } else { offset=size; }
+    }
+    else if(r.status===206||offset===0){const buf=await r.arrayBuffer();offset+=buf.byteLength;
+      handleText(new TextDecoder().decode(buf));}
+  }catch(err){}
+  flushChat();
+  setTimeout(tickChat,1200);
+}
+let allChapters=null;
+async function tickIndex(){
+  if(!API){setTimeout(tickIndex,3000);return;}
+  try{
+    if(allChapters===null&&BOOK){
+      try{const c=await (await fetch('/chapters.json?book='+encodeURIComponent(BOOK),{cache:'no-store'})).json();
+        allChapters=(c.chapters||[]);}catch(e){allChapters=[];}
+    }
+    const r=await fetch(API+'live_index.json?t='+Date.now(),{cache:'no-store'});
+    if(!r.ok)return; const idx=await r.json();
+    const cur=idx.current; if(cur&&follow)selected=cur;
+    const done=new Set(Object.keys(idx.chapters||{}).filter(c=>idx.chapters[c]&&idx.chapters[c].done).map(Number));
+    const ids=(allChapters&&allChapters.length?allChapters:Object.keys(idx.chapters||{}).map(Number)).sort((a,b)=>a-b);
+    const listKey=ids.join(',')+'|'+[...done].sort((a,b)=>a-b).join(',');
+    if(listKey!==idxSig){idxSig=listKey;
+      chs.innerHTML=ids.map(function(c){return '<option value="'+c+'">第 '+c+' 章'+(done.has(c)?' ✔':'')+'</option>';}).join('');}
+    const want=String(selected||cur||''); if(chs.value!==want)chs.value=want;
+  }catch(err){}
+  setTimeout(tickIndex,1500);
+}
+async function tickState(){
+  if(!API){setTimeout(tickState,1000);return;}
+  const cid=selected||current; if(!cid){setTimeout(tickState,800);return;}
+  try{const r=await fetch(API+'ch'+String(cid).padStart(3,'0')+'.json?t='+Date.now(),{cache:'no-store'});
+    if(r.ok)renderArticle(await r.json());}catch(err){}
+  setTimeout(tickState,800);
+}
+chs.addEventListener('change',function(){selected=+chs.value;follow=false;followBtn.classList.remove('on');prevSig='';});
+followBtn.addEventListener('click',function(){follow=true;followBtn.classList.add('on');if(current)selected=current;prevSig='';});
+tickChat();tickIndex();tickState();
+</script></body></html>

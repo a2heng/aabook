@@ -196,6 +196,8 @@ def raw_log(record: dict) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
     except OSError:
         pass
 
@@ -230,7 +232,7 @@ class LLMClient:
     @property
     def client(self):
         if self._client is None:
-            from openai import OpenAI
+            from openai import OpenAI  # type: ignore
 
             self._client = OpenAI(
                 base_url=self.config.base_url,
@@ -249,6 +251,7 @@ class LLMClient:
         max_tokens: int | None = None,
         thinking: bool | None = None,
         json_mode: bool = False,
+        reasoning_budget: int | None = None,
     ) -> str:
         config = self.config
         key = prompt_hash(
@@ -258,6 +261,7 @@ class LLMClient:
             str(config.presence_penalty),
             str(thinking),
             str(json_mode),
+            str(reasoning_budget),
             json.dumps(messages, ensure_ascii=False),
         )
         cache_path = Path(os.environ.get("AUDIOBOOK_LLM_CACHE", ".cache/llm")) / f"{key}.json"
@@ -270,6 +274,8 @@ class LLMClient:
         }
         if thinking is not None:
             extra_body["chat_template_kwargs"] = {"enable_thinking": thinking}
+        if reasoning_budget is not None:
+            extra_body["reasoning_budget_tokens"] = int(reasoning_budget)
         extra: dict = {}
         if json_mode:
             extra["response_format"] = {"type": "json_object"}
@@ -281,6 +287,7 @@ class LLMClient:
                 "messages": messages,
                 "thinking": thinking,
                 "json_mode": json_mode,
+                "reasoning_budget": reasoning_budget,
                 "max_tokens": max_tokens or config.max_tokens,
             }
         )
@@ -323,9 +330,12 @@ class LLMClient:
         max_tokens: int | None = None,
         thinking: bool | None = None,
         json_mode: bool = True,
+        reasoning_budget: int | None = None,
     ) -> dict | list:
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        return extract_json(self.chat(messages, max_tokens, thinking=thinking, json_mode=json_mode))
+        return extract_json(
+            self.chat(messages, max_tokens, thinking=thinking, json_mode=json_mode, reasoning_budget=reasoning_budget)
+        )
 
     def chat_json_messages(
         self,
@@ -333,5 +343,8 @@ class LLMClient:
         max_tokens: int | None = None,
         thinking: bool | None = None,
         json_mode: bool = True,
+        reasoning_budget: int | None = None,
     ) -> dict | list:
-        return extract_json(self.chat(messages, max_tokens, thinking=thinking, json_mode=json_mode))
+        return extract_json(
+            self.chat(messages, max_tokens, thinking=thinking, json_mode=json_mode, reasoning_budget=reasoning_budget)
+        )

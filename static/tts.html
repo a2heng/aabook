@@ -1,0 +1,493 @@
+<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>有声书 · TTS 测试</title>
+<style>
+:root{color-scheme:dark;--bg:#0d1017;--panel:#151a23;--panel2:#1b2230;--line:#26303f;--fg:#e6ecf3;--dim:#8b97a8;
+  --accent:#5aa9ff;--ok:#43c785;--warn:#ffb454;--bad:#ff7b7b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+header{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#101319;z-index:5}
+.brand{font-weight:700}.brand small{color:var(--dim);font-weight:400;margin-left:6px}
+input,button,select,textarea{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:5px 9px;font-size:13px}
+button{cursor:pointer}button:hover{border-color:var(--accent)}button.primary{background:var(--accent);color:#0b0f15;font-weight:700}
+button.start{background:var(--ok);color:#08130c;font-weight:700;font-size:14px;padding:10px 16px;white-space:nowrap}
+button.start.done{background:var(--panel2);color:var(--ok);border-color:var(--ok)}
+button.roll{padding:5px 8px}
+nav a{color:var(--accent);text-decoration:none;margin-right:12px;font-size:13px}nav a.on{color:var(--fg);font-weight:700}
+main{display:flex;flex-direction:column;gap:14px;padding:14px 16px 60px;max-width:1280px;margin:0 auto}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.panel h2{margin:0 0 10px;font-size:14px;color:#9fd0ff}
+.field{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
+.field label{color:var(--dim);font-size:12px;min-width:56px}
+.field input[type=text],.field select{flex:1;min-width:160px}
+.field input[type=number]{width:96px}
+textarea{width:100%;font:inherit}
+label.core{display:block;color:var(--accent);font-weight:700;font-size:13px;margin:10px 0 4px}
+textarea.core{min-height:84px;font-size:14.5px;line-height:1.6;border-color:var(--accent);box-shadow:0 0 0 1px rgba(90,169,255,.35)}
+label.sub{display:block;color:var(--dim);font-size:12px;margin:10px 0 4px}
+textarea.sub{min-height:60px;color:var(--dim);font-size:12.5px}
+.descrow{display:flex;gap:12px;align-items:flex-end}
+.desccol{flex:1;min-width:0}
+.hint{color:var(--dim);font-size:12px;line-height:1.6}
+audio{width:100%;margin-top:6px}
+.err{color:var(--bad);font-size:12px;white-space:pre-wrap}
+.ok{color:var(--ok);font-size:12px}
+.row{border:1px solid var(--line);border-radius:8px;padding:6px 8px;margin-bottom:6px;font-size:13px}
+.row.synth{border-color:#25415f;background:#101a26}
+.row.done{border-color:#1f4a33}
+.row.fail{border-color:#5a2626}
+.row .role{color:#ffb454;font-weight:600;margin-right:6px}.row.narration .text{color:var(--dim)}
+.row .status{float:right;font-size:11.5px;color:var(--dim)}
+.row.done .status{color:var(--ok)}.row.fail .status{color:var(--bad)}
+.row audio{width:100%;margin-top:5px}
+#rows{max-height:52vh;overflow:auto}
+#cands{max-height:64vh;overflow:auto;display:flex;flex-direction:column;gap:8px}
+.cand{border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:#101722}
+.cand.done{border-color:#1f4a33}.cand.fail{border-color:#5a2626}
+.candhd{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12.5px}
+.candhd b{color:#9fd0ff}
+.candhd button{margin-left:auto}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}
+@media(max-width:1000px){.two{grid-template-columns:1fr}}
+#rolemap{display:flex;flex-direction:column;gap:6px;margin-bottom:8px}
+.rolemap{display:flex;gap:8px;align-items:center;font-size:13px}
+.rolemap b{color:#ffb454;min-width:96px}
+.rolemap select{flex:1;max-width:260px}
+.rolemap .hint{margin-left:4px}
+.librow{display:flex;gap:12px;align-items:center;border:1px solid var(--line);border-radius:10px;padding:8px 10px;margin-bottom:8px;background:#101722}
+.librow audio{width:280px;margin:0;flex:0 0 280px}
+.libmeta{flex:1;min-width:0}
+.libname{width:200px}
+</style></head><body>
+<header>
+  <div class="brand">TTS 测试 <small id="bk">—</small></div>
+  <select id="booksel"></select>
+  <select id="chsel"></select>
+  <button onclick="loadAll()">加载</button>
+  <button class="primary" onclick="runRender()">渲染</button>
+  <span id="pipeMsg" class="hint" style="font-size:12px"></span>
+  <span id="breezeState" class="hint">Breeze: ?</span>
+  <button id="restartBtn" onclick="restartBreeze()">重启</button>
+  <button id="unloadBtn" onclick="unloadBreeze()">卸载</button>
+  <span class="hint">|</span>
+  <span id="llmState" class="hint">LLM: ?</span>
+  <button onclick="llmUp()">启动 LLM</button>
+  <button onclick="llmDown()">停止 LLM</button>
+  <span id="taskState" class="hint"></span>
+  <span style="flex:1"></span>
+  <nav>
+    <a href="/dashboard">看板</a>
+    <a href="/prompt" id="promptLink">提示词测试</a>
+    <a href="/live" id="liveLink">实时标记</a>
+    <a href="/raw" id="rawLink">LLM原始IO</a>
+    <a class="on" href="/tts">TTS测试</a>
+  </nav>
+</header>
+<main>
+  <section class="panel">
+    <h2>音色设计（全局音色库，所有书共用）</h2>
+    <div class="two">
+      <div>
+        <div class="field"><label>模板</label>
+          <select id="tpl" onchange="applyTemplate()"></select>
+        </div>
+        <div class="field"><label>名字</label><input id="dname" type="text" placeholder="如 低沉中年男声（保存时的基础名）"></div>
+        <div class="descrow">
+          <div class="desccol">
+            <label class="core" for="dinstruction">描述（核心：决定音色）</label>
+            <textarea id="dinstruction" class="core" placeholder="一位中年男性，嗓音低沉沙哑，语速偏慢，语气沉稳。"></textarea>
+          </div>
+          <button id="startBtn" class="start" onclick="ttsUp()">启动 Breeze 服务</button>
+        </div>
+        <label class="sub" for="dtext">测试文本（只用于试听/克隆转写；不要出现人名、身份词）</label>
+        <textarea id="dtext" class="sub">今天天气不错，风从窗外吹进来，带着一点青草的味道。路边的树影落在地上，慢慢移过去。</textarea>
+        <div class="field" style="margin-top:10px">
+          <label>cfg</label><input id="dcfg" type="number" step="0.5" value="4" style="width:80px">
+          <label>数量</label><input id="dcount" type="number" value="3" min="1" max="8" style="width:70px">
+          <button class="primary" onclick="roll()">🎲 随机生成多个</button>
+          <button onclick="generateOne()">用当前 seed 生成 1 个</button>
+          <span id="dmsg" class="hint"></span>
+        </div>
+      </div>
+      <div>
+        <div class="hint" style="margin-bottom:6px">候选（点每个的「保存到音色库」才会入库；与书无关，所有书共用）</div>
+        <div id="cands"></div>
+      </div>
+    </div>
+  </section>
+  <section class="panel">
+    <h2>章节试听（选章节 → 给本章每个角色配声线 → 合成整章，逐段可视化）</h2>
+    <div id="rolemap" class="hint">选择书和章后点「加载」…</div>
+    <div class="field" style="margin-top:8px">
+      <button id="renderBtn" class="primary" onclick="renderChapter()">合成整章</button>
+      <span id="rendermsg" class="hint"></span>
+    </div>
+    <div id="rows" class="hint">选择书和章后点「加载」…</div>
+    <div id="chapterfull" class="hint"></div>
+  </section>
+  <section class="panel">
+    <h2>已有音色库（可播放、可改名；参数只读）</h2>
+    <div id="lib" class="hint">加载中…</div>
+  </section>
+</main>
+<script>
+const qs = new URLSearchParams(location.search);
+let book = qs.get("book") || "";
+let chapter = parseInt(qs.get("ch") || "0", 10) || 0;
+const $ = id => document.getElementById(id);
+const PRESETS = [
+  {name:"青年男声", instruction:"一位青年男性，声音清朗，语速自然，语气平和。", text:"今天天气不错，风从窗外吹进来，带着一点青草的味道。"},
+  {name:"低沉中年男声", instruction:"一位中年男性，嗓音低沉沙哑，语速偏慢，语气沉稳。", text:"夜色慢慢沉下来，远处的灯一盏一盏亮起，街上安静了许多。"},
+  {name:"苍老男声", instruction:"一位老年男性，声音苍老沙哑，语速缓慢，气息略弱。", text:"很多年以前，这里还是一片荒地，如今已经认不出来了。"},
+  {name:"清亮女声", instruction:"一位青年女性，声音清亮柔和，语速自然，语气亲切。", text:"今天的风很舒服，树叶沙沙地响，走在路上心情也轻快起来。"},
+  {name:"温柔女声", instruction:"一位青年女性，声音温柔细腻，语速偏慢，语气舒缓。", text:"别着急，慢慢来，事情总会一件一件解决的。"},
+  {name:"少女声", instruction:"一位少女，声音清脆活泼，语速稍快，语气天真。", text:"你看那边，云好像一只小兔子，一下子又变成一条鱼了。"},
+];
+function esc(s){ return String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function syncLinks(){
+  const b = encodeURIComponent(book||"");
+  $("promptLink").href = "/prompt?book=" + b;
+  $("liveLink").href = "/live?book=" + b;
+  $("rawLink").href = "/raw?book=" + b;
+}
+async function loadBooks(){
+  try{ const list = await (await fetch("/books.json?t="+Date.now(),{cache:"no-store"})).json();
+    $("booksel").innerHTML = list.map(x=>`<option value="${esc(x.book)}">${esc(x.book)}</option>`).join("");
+    if(!book && list.length) book = list[0].book;
+    $("booksel").value = book;
+  }catch(e){}
+}
+async function loadChapters(){
+  if(!book) return;
+  try{ const data = await (await fetch("/chapters.json?book="+encodeURIComponent(book),{cache:"no-store"})).json();
+    const ids = data.chapters || [];
+    $("chsel").innerHTML = ids.map(c=>`<option value="${c}">第 ${c} 章</option>`).join("");
+    if(!ids.includes(chapter) && ids.length) chapter = ids[0];
+    $("chsel").value = String(chapter);
+  }catch(e){}
+}
+async function loadAll(){
+  book = $("booksel").value; chapter = parseInt($("chsel").value||"0",10)||0;
+  syncLinks();
+  history.replaceState(null,"", `?book=${encodeURIComponent(book)}&ch=${chapter}`);
+  $("bk").textContent = "— " + book;
+  await Promise.all([loadChapters(), loadVoices(), loadRows()]);
+}
+let VOICES = [];
+let ROWS = [];
+function roleVoiceMap(){
+  try{ return JSON.parse(localStorage.getItem("ttsRoleVoice")||"{}"); }catch(e){ return {}; }
+}
+function roleVoiceKey(role){ return book + "::" + role; }
+function setRoleVoice(role, ref){
+  const m = roleVoiceMap(); m[roleVoiceKey(role)] = ref;
+  localStorage.setItem("ttsRoleVoice", JSON.stringify(m));
+}
+function voiceOptions(selected){
+  return '<option value="">（选声线）</option>' + VOICES.map(v=>
+    `<option value="${esc(v.ref)}"${v.ref===selected?" selected":""}>${esc(v.name)}</option>`).join("");
+}
+function renderRoleMap(){
+  const box = $("rolemap");
+  const roles = [];
+  if(ROWS.some(r=>r.kind!=="speech")) roles.push("旁白");
+  ROWS.forEach(r=>{ if(r.kind==="speech" && r.role && !roles.includes(r.role)) roles.push(r.role); });
+  if(!roles.length){ box.innerHTML = '<span class="hint">（本章没有可配音的角色）</span>'; return; }
+  const m = roleVoiceMap();
+  box.innerHTML = "";
+  roles.forEach(role=>{
+    const row = document.createElement("div"); row.className = "rolemap";
+    row.innerHTML = `<b>${esc(role)}</b>`;
+    const sel = document.createElement("select");
+    sel.innerHTML = voiceOptions(m[roleVoiceKey(role)] || "");
+    sel.addEventListener("change", ()=>setRoleVoice(role, sel.value));
+    row.appendChild(sel);
+    const note = document.createElement("span"); note.className = "hint";
+    note.textContent = "（选一次即可，合成整章时逐段用）";
+    row.appendChild(note);
+    box.appendChild(row);
+  });
+}
+function voiceForRole(role){
+  const ref = roleVoiceMap()[roleVoiceKey(role)] || "";
+  if(ref) return VOICES.find(v=>v.ref===ref) || {ref, ref_text:""};
+  const fallback = VOICES.find(v=>v.kind==="narrator") || VOICES[0];
+  return fallback ? {...fallback, fallback: true} : null;
+}
+async function loadVoices(){
+  try{ const data = await (await fetch("/tts/voices.json",{cache:"no-store"})).json();
+    VOICES = data.voices || [];
+    const designs = VOICES.filter(v=>v.kind==="design");
+    const tpl = $("tpl");
+    tpl.innerHTML = '<option value="preset:0">（自定义：直接写描述）</option>'
+      + PRESETS.map((p,i)=>`<option value="preset:${i+1}">预置·${esc(p.name)}</option>`).join("")
+      + designs.map((v,i)=>`<option value="design:${i}">已保存·${esc(v.name)}</option>`).join("");
+    tpl.dataset.presets = JSON.stringify(PRESETS);
+    tpl.dataset.designs = JSON.stringify(designs);
+    renderLibrary();
+    renderRoleMap();
+  }catch(e){}
+}
+function renderLibrary(){
+  const box = $("lib");
+  box.innerHTML = VOICES.map((v,i)=>{
+    const editable = v.kind === "design";
+    const nameCell = editable
+      ? `<input class="libname" data-i="${i}" type="text" value="${esc(v.name)}"> <button onclick="renameVoice(${i})">改名</button>`
+      : `<b>${esc(v.name)}</b> <span class="hint">（旁白固定，不能改名）</span>`;
+    return `<div class="librow">
+      <audio controls preload="none" src="/${esc(v.ref)}"></audio>
+      <div class="libmeta">${nameCell}
+        <div class="hint">${esc(v.kind||"")} · cfg ${esc(v.cfg||"")} · seed ${esc(v.seed||"")} ·
+          描述：${esc((v.instruction||"").slice(0,60))} · 测试文本：${esc((v.ref_text||"").slice(0,40))}</div>
+      </div></div>`;
+  }).join("") || '<span class="hint">（还没有保存过音色）</span>';
+}
+async function renameVoice(i){
+  const v = VOICES[i]; if(!v) return;
+  const input = document.querySelector('.libname[data-i="'+i+'"]');
+  const newName = (input?.value || "").trim();
+  if(!newName || newName === v.name) return;
+  try{
+    const r = await fetch("/tts/rename", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({name: v.name, new_name: newName})});
+    if(!r.ok) throw new Error(await r.text());
+    await loadVoices();
+  }catch(e){ alert(String(e)); }
+}
+function applyTemplate(){
+  const v = $("tpl").value;
+  if(v === "preset:0") return;  // 自定义：不动已填内容
+  const [kind, idx] = v.split(":");
+  const item = kind === "preset"
+    ? JSON.parse($("tpl").dataset.presets)[Number(idx)-1]
+    : JSON.parse($("tpl").dataset.designs)[Number(idx)];
+  if(!item) return;
+  $("dname").value = item.name || "";
+  $("dinstruction").value = item.instruction || "";
+  if(item.ref_text) $("dtext").value = item.ref_text;
+  if(item.cfg) $("dcfg").value = item.cfg;
+}
+async function loadRows(){
+  if(!book||!chapter) return;
+  try{
+    const r = await fetch("/tts/rows.json?book="+encodeURIComponent(book)+"&chapter="+chapter+"&t="+Date.now(),{cache:"no-store"});
+    if(!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    ROWS = data.rows||[];
+    $("rows").innerHTML = ROWS.length ? ROWS.map((row,i)=>{
+      const cls = row.kind==="speech" ? "row" : "row narration";
+      const role = row.role ? `<span class="role">${esc(row.role)}</span>` : "";
+      return `<div class="${cls}" id="line-${i}"><span class="status">待合成</span>${role}<span class="text">${esc(row.text)}</span></div>`;
+    }).join("") : '<span class="hint">（本章没有台词/正文）</span>';
+    renderRoleMap();
+  }catch(e){ $("rows").innerHTML = '<span class="err">'+esc(String(e))+'</span>'; }
+}
+async function renderChapter(){
+  if(!ROWS.length){ $("rendermsg").textContent = "先加载一章"; $("rendermsg").className = "err"; return; }
+  const btn = $("renderBtn"); btn.disabled = true;
+  const done = ROWS.filter(r=>r.text.trim()).length;
+  let ok = 0, failed = 0, usedFallback = false;
+  const parts = [];  // 成功段的音频 URL，按顺序，用于最后的整章拼接
+  $("chapterfull").innerHTML = "";
+  $("rendermsg").textContent = "合成整章：0/" + done; $("rendermsg").className = "hint";
+  for(let i=0;i<ROWS.length;i++){
+    const row = ROWS[i];
+    if(!row.text.trim()) continue;
+    const card = $("line-"+i);
+    const status = card.querySelector(".status");
+    const role = row.kind === "speech" ? (row.role || "") : "旁白";
+    const voice = voiceForRole(role);
+    if(!voice){ status.textContent = "没有可用声线"; card.classList.add("fail"); failed++; continue; }
+    if(voice.fallback) usedFallback = true;
+    card.classList.add("synth"); status.textContent = "合成中…";
+    try{
+      const r = await fetch("/tts/say", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({
+        book, text: row.text, ref: voice.ref, ref_text: voice.ref_text || "", cfg: 1,
+      })});
+      if(!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      card.classList.remove("synth"); card.classList.add("done");
+      status.textContent = "✓ " + data.seconds + "s";
+      const audio = document.createElement("audio");
+      audio.controls = true; audio.preload = "none"; audio.src = data.url + "?t=" + Date.now();
+      card.appendChild(audio);
+      parts.push(data.url);
+      ok++;
+    }catch(e){
+      card.classList.remove("synth"); card.classList.add("fail");
+      status.textContent = "✗ " + String(e).slice(0,60);
+      failed++;
+    }
+    $("rendermsg").textContent = "合成整章：" + (ok+failed) + "/" + done + (failed?("（失败 "+failed+"）"):"");
+  }
+  $("rendermsg").textContent = "完成：成功 " + ok + " 段" + (failed?("，失败 "+failed):"") + (usedFallback? "（有角色没配音，用了旁白声线）":"");
+  $("rendermsg").className = failed ? "err" : "ok";
+  if(parts.length){
+    $("chapterfull").innerHTML = '<div class="hint">整章拼接中…</div>';
+    try{
+      const r = await fetch("/tts/concat", {method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({book, chapter, urls: parts})});
+      if(!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      $("chapterfull").innerHTML = '<div class="hint" id="denoisemsg">整章降噪中…（PureVox，GPU；'+data.segments+' 段 · '+data.seconds+'s）</div>';
+      try{
+        const rd = await fetch("/tts/denoise", {method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({url: data.url})});
+        if(!rd.ok) throw new Error(await rd.text());
+        const dd = await rd.json();
+        $("denoisemsg").outerHTML = '<div class="librow"><audio controls preload="none" src="'+dd.url+'?t='+Date.now()+'"></audio>'
+          + '<div class="libmeta"><b>整章降噪</b> <span class="hint">'+dd.seconds+'s · 用时 '+dd.elapsed+'s · '+esc(dd.backend)+'</span> '
+          + '<a href="'+dd.url+'" download>下载 mp3</a>'
+          + (dd.wav ? ' <a href="'+dd.wav+'" download>wav</a>' : '') + '</div></div>';
+      }catch(e){ $("denoisemsg").innerHTML = '降噪失败：'+esc(String(e)); $("denoisemsg").className = "err"; }
+    }catch(e){ $("chapterfull").innerHTML = '<div class="err">整章拼接失败：'+esc(String(e))+'</div>'; }
+  }
+  btn.disabled = false;
+}
+function makeCand(seed, cfg){
+  const card = document.createElement("div");
+  card.className = "cand";
+  card.dataset.seed = seed; card.dataset.cfg = cfg;
+  card.innerHTML = '<div class="candhd"><b>seed '+seed+'</b><span class="hint">cfg '+cfg+'</span>'
+    + '<button class="primary" disabled onclick="saveCand(this)">保存到音色库</button></div>'
+    + '<div class="candmsg hint">排队中…</div>';
+  $("cands").appendChild(card);
+  return card;
+}
+async function genOne(card, seed){
+  const msg = card.querySelector(".candmsg");
+  msg.textContent = "生成中…"; msg.className = "candmsg hint";
+  try{
+    const r = await fetch("/tts/design", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({
+      save: false, seed, cfg: parseFloat(card.dataset.cfg),
+      text: $("dtext").value, instruction: $("dinstruction").value,
+    })});
+    if(!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    card.dataset.ref = data.url;
+    card.dataset.text = data.ref_text || "";
+    card.classList.add("done");
+    msg.textContent = "生成完成"; msg.className = "candmsg ok";
+    const audio = document.createElement("audio");
+    audio.controls = true; audio.src = data.url + "?t=" + Date.now();
+    card.appendChild(audio);
+    card.querySelector("button").disabled = false;
+  }catch(e){
+    card.classList.add("fail");
+    msg.textContent = String(e); msg.className = "candmsg err";
+  }
+}
+async function roll(){
+  const n = Math.max(1, Math.min(8, parseInt($("dcount").value||"3",10)));
+  const cfg = parseFloat($("dcfg").value||"4");
+  $("cands").innerHTML = "";
+  $("dmsg").textContent = "生成 " + n + " 个候选（逐个排队）…"; $("dmsg").className = "hint";
+  for(let i=0;i<n;i++){
+    const seed = Math.floor(Math.random()*100000);
+    const card = makeCand(seed, cfg);
+    await genOne(card, seed);  // Breeze 单并发：串行排队
+  }
+  $("dmsg").textContent = "完成，点每个候选的「保存到音色库」入库"; $("dmsg").className = "ok";
+}
+async function generateOne(){
+  const cfg = parseFloat($("dcfg").value||"4");
+  const card = makeCand(Math.floor(Math.random()*100000), cfg);
+  $("dmsg").textContent = "生成中…"; $("dmsg").className = "hint";
+  await genOne(card, Number(card.dataset.seed));
+  $("dmsg").textContent = "完成"; $("dmsg").className = "ok";
+}
+async function saveCand(btn){
+  const card = btn.closest(".cand");
+  if(!card.dataset.ref) return;
+  btn.disabled = true; btn.textContent = "保存中…";
+  try{
+    const r = await fetch("/tts/keep", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({
+      name: $("dname").value.trim() || "voice", ref: card.dataset.ref, ref_text: card.dataset.text,
+      instruction: $("dinstruction").value, seed: Number(card.dataset.seed), cfg: Number(card.dataset.cfg),
+    })});
+    if(!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    btn.textContent = "已保存：" + data.name;
+    await loadVoices();
+  }catch(e){ btn.textContent = "保存失败"; btn.title = String(e); btn.disabled = false; }
+}
+async function ttsUp(){
+  const btn = $("startBtn");
+  if(btn.classList.contains("done")){ $("dmsg").textContent = "Breeze 已经在运行"; $("dmsg").className = "ok"; return; }
+  btn.disabled = true; btn.textContent = "启动中…（首次加载模型要几十秒）";
+  try{
+    const r = await fetch("/tts/up", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    if(!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    $("dmsg").textContent = data.message || "Breeze 已启动";
+    $("dmsg").className = "ok";
+  }catch(e){ $("dmsg").textContent = String(e); $("dmsg").className = "err"; }
+  finally{ btn.disabled = false; tickHealth(); }
+}
+async function restartBreeze(){
+  if(!confirm("重启 Breeze？正在合成的任务会被中断。")) return;
+  $("taskState").textContent = "重启中…"; $("taskState").className = "hint";
+  try{
+    const r = await fetch("/tts/restart", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    if(!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    $("taskState").textContent = d.message || "已重启"; $("taskState").className = "ok";
+  }catch(e){ $("taskState").textContent = String(e); $("taskState").className = "err"; }
+  tickHealth();
+}
+async function unloadBreeze(){
+  if(!confirm("卸载 Breeze？释放 GPU 显存，之后需要重新启动才能合成。")) return;
+  $("taskState").textContent = "卸载中…"; $("taskState").className = "hint";
+  try{
+    const r = await fetch("/tts/down", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    if(!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    $("taskState").textContent = d.message || "已卸载"; $("taskState").className = "ok";
+  }catch(e){ $("taskState").textContent = String(e); $("taskState").className = "err"; }
+  tickHealth();
+}
+async function tickHealth(){
+  try{
+    const d = await (await fetch("/tts/status.json?t="+Date.now(),{cache:"no-store"})).json();
+    $("breezeState").textContent = d.up ? "Breeze: 已启动" : "Breeze: 未启动";
+    $("breezeState").className = d.up ? "ok" : "hint";
+    $("taskState").textContent = d.active ? ("⚙ 后台合成中 · " + (d.last||"")) : (d.up ? "· 空闲" : "");
+    $("taskState").className = d.active ? "ok" : "hint";
+    const btn = $("startBtn");
+    if(d.up){ btn.textContent = "Breeze 已启动"; btn.classList.add("done"); btn.disabled = false; }
+    else { btn.textContent = "启动 Breeze 服务"; btn.classList.remove("done"); }
+  }catch(e){ $("breezeState").textContent = "Breeze: ?"; }
+  try{
+    const d = await (await fetch("/llm/status.json?t="+Date.now(),{cache:"no-store"})).json();
+    $("llmState").textContent = d.up ? "LLM: 已启动" : "LLM: 未启动";
+    $("llmState").className = d.up ? "ok" : "hint";
+  }catch(e){ $("llmState").textContent = "LLM: ?"; }
+  setTimeout(tickHealth, 2000);
+}
+async function llmUp(){
+  $("llmState").textContent = "LLM: 启动中…"; $("llmState").className = "hint";
+  try{
+    const r = await fetch("/llm/up", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    if(!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    $("llmState").textContent = d.message; $("llmState").className = d.started ? "ok" : "hint";
+  }catch(e){ $("llmState").textContent = String(e); $("llmState").className = "err"; }
+  tickHealth();
+}
+async function llmDown(){
+  if(!confirm("停止 LLM？脚本标注等任务会中断。")) return;
+  $("llmState").textContent = "LLM: 停止中…"; $("llmState").className = "hint";
+  try{
+    const r = await fetch("/llm/down", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    if(!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    $("llmState").textContent = d.message; $("llmState").className = "ok";
+  }catch(e){ $("llmState").textContent = String(e); $("llmState").className = "err"; }
+  tickHealth();
+}
+$("booksel").addEventListener("change", ()=>{ book=$("booksel").value; chapter=0; loadAll(); });
+$("chsel").addEventListener("change", ()=>{ chapter=parseInt($("chsel").value,10)||0; loadRows(); syncLinks(); });
+loadBooks().then(()=>{ if(book){ $("booksel").value=book; loadChapters().then(()=>{ if(chapter) $("chsel").value=String(chapter); loadAll(); }); } });
+tickHealth();
+</script></body></html>

@@ -1,0 +1,173 @@
+<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM原始IO · raw</title>
+<style>
+:root{color-scheme:dark;--bg:#0d1017;--panel:#151a23;--line:#26303f;--fg:#e6ecf3;--dim:#8b97a8;--accent:#5aa9ff;--bad:#ff7b7b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.65 system-ui,-apple-system,"Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+header{position:sticky;top:0;z-index:6;display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:8px 16px;background:#101319;border-bottom:1px solid var(--line)}
+.brand{font-weight:700}.brand small{color:var(--dim);font-weight:400;margin-left:6px}
+header .brand{font-size:14px}
+nav{display:flex;gap:12px;font-size:13px}
+nav a{color:var(--accent);text-decoration:none}nav a.on{color:var(--fg);font-weight:700}
+header .grow{flex:1}.dim{color:var(--dim)}
+header input{background:#0f141b;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:4px 9px;font-size:12.5px}
+header button{background:#1b2230;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:4px 10px;font-size:12.5px;cursor:pointer}
+header button.on{background:var(--accent);border-color:var(--accent);color:#0b0f15;font-weight:700}
+#feed{padding:12px 16px 80px;display:flex;flex-direction:column;gap:14px;max-width:1080px;margin:0 auto}
+.chanhd{position:sticky;top:44px;z-index:4;color:var(--accent);font-weight:700;font-size:13px;padding:4px 2px;background:var(--bg);border-bottom:1px solid var(--line)}
+.chan .cards{display:flex;flex-direction:column;gap:10px;padding-top:8px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+.in{border-left:2px solid #2b4a72;padding-left:8px}
+.reason{border-left:2px solid #3a4252;padding-left:8px}
+.out{border-left:2px solid #1f4a33;padding-left:8px}
+.toolbox{border-left:2px solid #5c4620;padding-left:8px}
+.card.fail{border-color:#6b2b2b;background:#1a1212}
+.hd{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;color:#9fd0ff}
+.tool{color:#9fe6c1;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
+.failmsg{color:var(--bad);font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all}
+details{margin-top:4px}
+summary{cursor:pointer;color:var(--dim)}
+pre{white-space:pre-wrap;word-break:break-word;background:#0f141b;border:1px solid #1f2836;border-radius:8px;padding:8px 10px;margin:4px 0;font-size:12.5px}
+.role{color:#ffb454}.reason{color:var(--dim)}.msg{border-left:2px solid #2b4a72;padding-left:8px;margin:4px 0}
+</style></head><body>
+<header>
+  <div class="brand">LLM原始IO</div>
+  <select id="chp"></select>
+  <input id="q" placeholder="过滤…（step/正文/失败）">
+  <button id="follow" class="on">跟随最新</button>
+  <span class="dim" id="meta"></span>
+  <span class="grow"></span>
+  <nav>
+    <a href="/dashboard">看板</a>
+    <a id="promptlink" href="/prompt">提示词测试</a>
+    <a id="livelink" href="/live">实时标记</a>
+    <a class="on" href="/raw">LLM原始IO</a>
+    <a id="ttslink" href="/tts">TTS测试</a>
+  </nav>
+</header>
+<div id="feed"></div>
+<script>
+const BOOK=new URLSearchParams(location.search).get('book')||'';
+const API=BOOK?'/api/'+encodeURIComponent(BOOK)+'/':'';
+const BOOKQ=BOOK?'?book='+encodeURIComponent(BOOK):'';
+document.getElementById('promptlink').href='/prompt'+BOOKQ;
+document.getElementById('livelink').href='/live'+BOOKQ;
+document.getElementById('ttslink').href='/tts'+BOOKQ;
+if(!BOOK){document.querySelector('.brand').textContent+=' · 请从看板选书';}
+const feed=document.getElementById('feed'), meta=document.getElementById('meta');
+const q=document.getElementById('q'), followBtn=document.getElementById('follow'), chp=document.getElementById('chp');
+let offset=0, pending=null, follow=true, shown=0, lastCards=[];
+const chans=new Map();
+let selectedCh='all';
+function chanKey(res){return res.chapter!=null?String(res.chapter):'llm';}
+function chanSection(key){
+  let sec=chans.get(key);
+  if(!sec){
+    sec=document.createElement('section'); sec.className='chan';
+    sec.innerHTML='<div class="chanhd">'+(key==='llm'?'LLM':'ch'+key)+' <span class="dim"></span></div><div class="cards"></div>';
+    chans.set(key,sec); feed.appendChild(sec);
+    refreshChanPicker();
+  }
+  return sec;
+}
+function refreshChanPicker(){
+  const keys=[...chans.keys()].filter(k=>k!=='llm');
+  keys.sort((a,b)=>Number(a)-Number(b));
+  const cur=chp.value||'all';
+  chp.innerHTML='<option value="all">全部章节</option>'+keys.map(k=>'<option value="'+esc(k)+'">ch'+esc(k)+'</option>').join('');
+  chp.value=keys.includes(cur)?cur:(follow&&keys.length?keys[keys.length-1]:'all');
+  selectedCh=chp.value||'all';
+}
+function applyChapter(){
+  chans.forEach((sec,key)=>{sec.style.display=(selectedCh==='all'||selectedCh===key)?'':'none';});
+}
+chp.addEventListener('change',function(){selectedCh=chp.value;follow=false;followBtn.classList.remove('on');applyChapter();});
+function esc(s){return (s==null?'':String(s)).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+function msgSummary(m){return '<span class="role">'+esc(m.role||'?')+'</span> <span class="dim">'+((m.content||'').length)+' 字'+(m.tool_calls?(' · 工具调用×'+m.tool_calls.length):'')+(m.tool_call_id?' · 工具结果':'')+'</span>';}
+function pairCard(req,res){
+  const card=document.createElement('div'); card.className='card';
+  const where=(res.chapter!=null?'ch'+res.chapter+' · step'+res.step:(res.source||'llm'));
+  const tc=(res.tool_calls||[]).map(function(t){return '<div class="tool">'+esc(t.name)+' '+esc(t.arguments)+'</div>';}).join('');
+  card.innerHTML='<div class="hd"><b>'+esc(where)+'</b><span class="dim">'+esc(res.duration_s||'')+'s · finish='+esc(res.finish_reason||'')+(res.tool_calls?(' · 工具×'+res.tool_calls.length):'')+'</span></div>'
+    +'<details class="in" open><summary>输入 · '+(req&&req.messages?req.messages.length:0)+' 条消息</summary><div class="msgs"></div></details>'
+    +(res.reasoning?('<details class="reason" open><summary>思考 '+res.reasoning.length+' 字</summary><pre class="rpre">'+esc(res.reasoning)+'</pre></details>'):'')
+    +'<details class="out" open><summary>输出</summary>'
+    +'<pre>'+esc(res.content||'')+'</pre></details>'
+    +(tc?'<details class="toolbox" open><summary>工具调用（打印）</summary>'+tc+'</details>':'');
+  card.dataset.text=(where+' '+(res.content||'')+' '+(res.reasoning||'')+' '+tc).toLowerCase();
+  const msgs=card.querySelector('.msgs');
+  const fillMsgs=function(){
+    if(!msgs.childElementCount&&req){
+      req.messages.forEach(function(m){
+        const d=document.createElement('details'); d.className='msg';
+        d.innerHTML='<summary>'+msgSummary(m)+'</summary><pre>'+esc(m.content||'')+'</pre>';
+        msgs.appendChild(d);});
+    }
+  };
+  fillMsgs();
+  card.querySelector('.in').addEventListener('toggle',function(){if(this.open)fillMsgs();});
+  return card;
+}
+function tailResults(e,n){
+  const out=[], msgs=e.messages||[];
+  for(let i=msgs.length-1;i>=0&&out.length<n;i--){const m=msgs[i];
+    if(m.role==='tool'||(m.role==='user'&&(m.content||'').indexOf('工具结果：')===0))out.push(m);}
+  return out.reverse();
+}
+function markFail(card,message){
+  let raw=(message.content||''); if(raw.indexOf('工具结果：')===0)raw=raw.slice('工具结果：'.length);
+  try{const result=JSON.parse(raw||'{}'); if(result.ok!==false)return;
+    card.classList.add('fail');
+    const line=document.createElement('div'); line.className='failmsg';
+    line.textContent='✗ '+(result.reason||'')+' '+(result.text||result.find||'');
+    card.querySelector('.hd').appendChild(line);
+    card.dataset.text+=' fail '+String(result.reason||'').toLowerCase();
+  }catch(err){}
+}
+function applyFilter(){const v=q.value.trim().toLowerCase();
+  feed.querySelectorAll('.chan').forEach(function(sec){
+    const inCh=selectedCh==='all'||sec===chans.get(selectedCh);
+    sec.style.display=inCh?'':'none';
+    if(!inCh)return;
+    let visible=0;
+    sec.querySelectorAll('.card').forEach(function(c){
+      const ok=!v||c.dataset.text.indexOf(v)>=0; c.style.display=ok?'':'none'; if(ok)visible++;});
+    sec.querySelector('.chanhd .dim').textContent='('+visible+'/'+sec.querySelectorAll('.card').length+')';
+  });
+}
+function scrollBottom(){if(follow)window.scrollTo(0,document.body.scrollHeight);}
+function handle(e){
+  if(e.kind==='request'){
+    if(lastCards.length){tailResults(e,lastCards.length).forEach(function(m,i){if(lastCards[i])markFail(lastCards[i],m);});lastCards=[];}
+    pending=e; return;
+  }
+  if(e.kind==='response'){
+    const card=pairCard(pending,e); pending=null; shown++;
+    const key=chanKey(e), sec=chanSection(key);
+    if(follow){chp.value=key;selectedCh=key;}
+    sec.querySelector('.cards').appendChild(card);
+    lastCards=(e.tool_calls||[]).map(function(){return card;});
+    applyChapter(); applyFilter(); scrollBottom();
+    meta.textContent='已记录 '+shown+' 组 · 章节 '+chans.size;
+  }
+}
+function handleText(txt){for(const line of txt.split('\n')){if(!line.trim())continue;let e;try{e=JSON.parse(line);}catch(_){continue;}handle(e);}}
+async function tick(){
+  if(!API){setTimeout(tick,3000);return;}
+  try{const r=await fetch(API+'llm_raw.jsonl',{headers:{'Range':'bytes='+offset+'-'},cache:'no-store'});
+    if(r.status===416){
+      const h=await fetch(API+'llm_raw.jsonl',{method:'HEAD',cache:'no-store'});
+      const size=+(h.headers.get('Content-Length')||0);
+      if(size<offset){const fb=await (await fetch(API+'llm_raw.jsonl',{cache:'no-store'})).arrayBuffer();offset=0;feed.innerHTML='';shown=0;chans.clear();handleText(new TextDecoder().decode(fb));offset=fb.byteLength;}
+      else offset=size;
+    } else if(r.status===206||offset===0){const buf=await r.arrayBuffer();offset+=buf.byteLength;
+      handleText(new TextDecoder().decode(buf));}
+  }catch(err){}
+  setTimeout(tick,1500);
+}
+q.addEventListener('input',applyFilter);
+followBtn.addEventListener('click',function(){follow=!follow;followBtn.classList.toggle('on',follow);scrollBottom();});
+window.addEventListener('scroll',function(){if(!follow)return;if(document.documentElement.scrollHeight-window.scrollY-window.innerHeight>160){follow=false;followBtn.classList.remove('on');}});
+tick();
+</script></body></html>

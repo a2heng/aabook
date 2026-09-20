@@ -36,11 +36,11 @@ def strip_site_boilerplate(text: str) -> str:
 
 
 CHAPTER_PATTERNS = (
-    re.compile(r"^\s*(第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节回卷篇部])\s*(.*)$"),
+    re.compile(r"^\s*(第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节回卷篇部段])\s*(.*)$"),
     re.compile(r"^\s*(Chapter\s+[0-9IVXLC]+)\b\s*(.*)$", re.IGNORECASE),
     re.compile(r"^\s*([序楔]章|前言|序言|后记|尾声|终章|番外)\s*(.*)$"),
-    # fallback: short lines that embed a 第X卷/章/回 marker (e.g. "书名 第一卷 大厅(1)")
-    re.compile(r"^\s*(.{0,30}?第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节回卷篇部]\s*.{0,20})$"),
+    # fallback: short lines that embed the 第X marker (e.g. "书名 第一卷 大厅(1)")
+    re.compile(r"^\s*(.{0,30}?第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节回卷篇部段]\s*.{0,20})$"),
 )
 
 
@@ -103,12 +103,34 @@ def normalize_text(text: str) -> str:
 
 
 def split_chapters(text: str) -> list[Chapter]:
-    """Split normalized text into chapters; falls back to a single chapter."""
+    """Split normalized text into chapters; falls back to a single chapter.
+
+    Handles two formats:
+    - one chapter per line (title + body on the same line)
+    - one chapter per block (title on its own line, body follows)
+    """
+    # Pre-split: if lines are very long, split at chapter markers first
     lines = text.split("\n")
+    expanded: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or len(stripped) <= 40:
+            expanded.append(line)
+            continue
+        # Long line: split at chapter markers (第X段/章/回 etc.)
+        # Use regex to find all marker positions and extract title+body chunks
+        marker_re = re.compile(r"(?=第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节回卷篇部段])")
+        parts = marker_re.split(stripped)
+        for part in parts:
+            part = part.strip()
+            if part:
+                expanded.append(part)
+    lines = expanded
+
     starts: list[tuple[int, str]] = []
     for index, line in enumerate(lines):
         stripped = line.strip()
-        if not stripped or len(stripped) > 40:
+        if not stripped:
             continue
         for pattern in CHAPTER_PATTERNS:
             if pattern.match(stripped):
@@ -122,10 +144,22 @@ def split_chapters(text: str) -> list[Chapter]:
     preface = "\n".join(lines[: starts[0][0]]).strip()
     if preface and not _META_PREFACE_RE.search(preface):
         chapters.append(Chapter(chapter_id=1, title="前言", text=preface))
-    for order, (start, title) in enumerate(starts):
+    for order, (start, title_line) in enumerate(starts):
         end = starts[order + 1][0] if order + 1 < len(starts) else len(lines)
-        body = "\n".join(lines[start + 1 : end]).strip()
-        chapters.append(Chapter(chapter_id=len(chapters) + 1, title=title, text=body))
+        body_lines = lines[start + 1 : end]
+        body = "\n".join(body_lines).strip()
+        # If body is empty, the title line itself may contain the chapter text
+        # (common when each chapter is a single long line in the source txt)
+        if not body:
+            # Strip the chapter marker prefix from the title_line to get the text
+            m = CHAPTER_PATTERNS[0].match(title_line)
+            if m:
+                body = title_line[m.start(2) :].strip()
+                title_line = title_line[: m.start(2)].strip()
+            else:
+                body = title_line
+                title_line = title_line[:30]
+        chapters.append(Chapter(chapter_id=len(chapters) + 1, title=title_line, text=body))
     kept = [chapter for chapter in chapters if chapter.text]
     for index, chapter in enumerate(kept, start=1):  # renumber so ids stay contiguous
         chapter.chapter_id = index
